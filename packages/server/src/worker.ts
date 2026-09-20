@@ -30,9 +30,10 @@ export class AbyssalWorld {
   private app: ReturnType<typeof createApp> | null = null;
   private lastSave = 0;
 
-  constructor(private ctx: { storage: DoStorage }) {}
+  // Durable Objects receive their bindings through the constructor, not fetch.
+  constructor(private ctx: { storage: DoStorage }, private env: Env) {}
 
-  private async boot(token?: string): Promise<ReturnType<typeof createApp>> {
+  private async boot(): Promise<ReturnType<typeof createApp>> {
     if (!this.app) {
       const snapshot = await this.ctx.storage.get<string>(SNAP_KEY);
       let instance = await this.ctx.storage.get<string>(INSTANCE_KEY);
@@ -40,7 +41,7 @@ export class AbyssalWorld {
         instance = crypto.randomUUID();
         await this.ctx.storage.put(INSTANCE_KEY, instance);
       }
-      this.app = createApp({ snapshot: snapshot ?? undefined, instance, token });
+      this.app = createApp({ snapshot: snapshot ?? undefined, instance, token: this.env.ABYS_TOKEN_ADDRESS });
     }
     return this.app;
   }
@@ -52,8 +53,8 @@ export class AbyssalWorld {
     await this.ctx.storage.put(SNAP_KEY, toJSON(app.world));
   }
 
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const app = await this.boot(env.ABYS_TOKEN_ADDRESS);
+  async fetch(request: Request): Promise<Response> {
+    const app = await this.boot();
     await app.catchUp();
     const response = await app.fetch(request);
     await this.persist(app);
