@@ -172,6 +172,16 @@ registrar) and then Workers → Custom domains, or a `routes` entry in
 zone automatically and the custom domain terminates on it; there is no
 certificate management anywhere in this repo.
 
+### One tank per deployment
+
+The ecosystem is a single world, not a per-visitor copy: on Workers it lives in
+one Durable Object, so every isolate and every visitor shares it, and a
+one-minute cron keeps it ticking with zero viewers. The node adapter is a local
+mirror with its own world (snapshotted to `.data/world.json`), which is what
+you want for development but is a different tank from production. `/state`
+carries `instance`, a stable id per world, so a client can always tell which
+tank it is looking at.
+
 ## API
 
 | Method | Path | Description |

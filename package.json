@@ -2,6 +2,19 @@
   "name": "abyssal",
   "version": "0.1.0",
   "private": true,
+  "homepage": "https://abyssal-arc.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abyssal-arc/abyssal.git"
+  },
+  "keywords": [
+    "x402",
+    "arc",
+    "usdc",
+    "observatory",
+    "artificial-life",
+    "canvas"
+  ],
   "type": "module",
   "description": "Abyssal — the x402 observatory: an on-chain evolution arena on Arc (Circle L1, chainId 5042)",
   "engines": {
@@ -13,7 +26,7 @@
   "scripts": {
     "build": "npm run build -w @abyssal/sim && npm run build -w @abyssal/server",
     "dev": "npm run build && node packages/server/dist/src/dev.js",
-    "test": "npm test -w @abyssal/sim && npm test -w @abyssal/server",
+    "test": "npm test -w @abyssal/sim && npm test -w @abyssal/server && npm test -w @abyssal/web",
     "typecheck": "npm run build -w @abyssal/sim && tsc -p packages/sim/tsconfig.json --noEmit && tsc -p packages/server/tsconfig.json --noEmit"
   },
   "devDependencies": {

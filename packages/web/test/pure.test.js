@@ -1,0 +1,50 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  mulberry32, hashSeed, mixSeed, unitNoise, buildFrameGeometry,
+} from '../src/geom.js';
+import { fmtUsd, shortAddr, hsla } from '../src/format.js';
+
+test('mulberry32 is deterministic and stays in [0,1)', () => {
+  const a = mulberry32(7);
+  const b = mulberry32(7);
+  for (let i = 0; i < 50; i++) {
+    const x = a();
+    assert.equal(x, b());
+    assert.ok(x >= 0 && x < 1);
+  }
+});
+
+test('hash seeds are stable and discriminating', () => {
+  assert.equal(hashSeed('0xabc'), hashSeed('0xabc'));
+  assert.notEqual(hashSeed('0xabc'), hashSeed('0xabd'));
+  assert.equal(mixSeed(1.4, 2.6), mixSeed(1.4, 2.6));
+  const n = unitNoise(42);
+  assert.ok(n >= 0 && n <= 1);
+  assert.equal(n, unitNoise(42));
+});
+
+test('trench geometry is seeded, bounded and non-degenerate', () => {
+  const g = buildFrameGeometry(0xab155a1);
+  assert.deepEqual(g, buildFrameGeometry(0xab155a1), 'same seed, same trench');
+  assert.notDeepEqual(g, buildFrameGeometry(1), 'different seed, different trench');
+  for (const w of [...g.canyonL, ...g.canyonR]) assert.ok(w > 0 && w < 0.2);
+  for (const c of g.rainCols) {
+    assert.ok(c.fx > 0.4 && c.fx < 0.75);
+    assert.ok(c.speed > 0 && c.w >= 1 && c.w <= 3);
+  }
+  for (const n of g.nodes) {
+    assert.ok(n.fx >= 0.72 && n.fx <= 0.98);
+    assert.ok(n.fy >= 0.25 && n.fy <= 0.91);
+  }
+  for (const j of g.jellies) assert.ok(j.s >= 6 && j.s <= 16);
+});
+
+test('format helpers', () => {
+  assert.equal(fmtUsd(0.05), '$0.05');
+  assert.equal(fmtUsd(1500), '$1.5k');
+  assert.equal(fmtUsd(2_500_000), '$2.50M');
+  assert.equal(fmtUsd(3_000_000_000), '$3.00B');
+  assert.equal(shortAddr('0x1234567890abcdef'), '0x1234…cdef');
+  assert.equal(hsla(180, 50, 50, 0.5), 'hsla(180, 50%, 50%, 0.5)');
+});

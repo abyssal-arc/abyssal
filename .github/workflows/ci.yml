@@ -16,4 +16,13 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - run: npm run typecheck
+      # The web client is dependency-free ES modules; parse it as ESM so a
+      # syntax slip (or a stray top-level await) fails here, not in a browser.
+      - name: web esm syntax gate
+        run: |
+          node --input-type=module --check < packages/web/app.js
+          node --input-type=module --check < packages/web/i18n.js
+          node --input-type=module --check < packages/web/src/geom.js
+          node --input-type=module --check < packages/web/src/format.js
       - run: npm test

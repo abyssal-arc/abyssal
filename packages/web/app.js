@@ -19,6 +19,8 @@
  * is capped at 2; per-snapshot preprocessing runs once per poll.
  */
 import { t, initI18n } from './i18n.js';
+import { mulberry32, hashSeed, mixSeed, unitNoise, buildFrameGeometry } from './src/geom.js';
+import { hsla, shortAddr, fmtUsd } from './src/format.js';
 
 initI18n();
 
@@ -125,10 +127,6 @@ const HUE_BUCKETS = 24;
 // Kept small on purpose. Big sprites just read as blobs.
 const CREATURE_VISUAL_SCALE = 1.3;
 const spriteCache = new Map();
-
-function hsla(h, s, l, a = 1) {
-  return `hsla(${h}, ${s}%, ${l}%, ${a})`;
-}
 
 /* ---------- procedural creature sprites (v6 "biodiversity") ---------- */
 /**
@@ -1252,16 +1250,6 @@ setInterval(() => { if (!document.hidden) pollAux(); }, 10000);
 
 /* ---------- OBSERVE: Arc USDC flow observatory ---------- */
 
-function shortAddr(a) {
-  return `${a.slice(0, 6)}…${a.slice(-4)}`;
-}
-
-function fmtUsd(v) {
-  if (v >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
-  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
-  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}k`;
-  return `$${v.toFixed(2)}`;
-}
 
 /** Deterministic address -> angle on the flow-map ring (FNV-1a). */
 function addrAngle(a) {
@@ -1919,39 +1907,6 @@ const BEAM_SPRITE = (() => {
 
 // Ambient layers are seeded, not random, so every viewer and every refresh
 // gets the same starfield and mote layout instead of a fresh roll.
-function mulberry32(seed) {
-  let s = seed >>> 0;
-  return () => {
-    s = (s + 0x6d2b79f5) | 0;
-    let t = s;
-    t = Math.imul(t ^ (t >>> 15), 1 | t);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** FNV-1a over a string → 32-bit seed (tx hashes, event keys). */
-function hashSeed(str) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h >>> 0;
-}
-
-/** Fallback seed from world coordinates when no id/hash is at hand. */
-function mixSeed(x, y, extra = 0) {
-  return hashSeed(`${Math.round(x)}:${Math.round(y)}:${extra}`);
-}
-
-/** Deterministic 0..1 noise from an integer key (shared screen-shake jitter). */
-function unitNoise(key) {
-  let t = (key ^ 0x9e3779b9) >>> 0;
-  t = Math.imul(t ^ (t >>> 16), 0x21f0aaad);
-  t = Math.imul(t ^ (t >>> 15), 0x735a2d97);
-  return ((t ^ (t >>> 15)) >>> 0) / 4294967296;
-}
 const ambientRnd = mulberry32(0x5eed1337);
 
 // Ambient motes: density follows chain temperature (sparse at night, thick
@@ -2089,33 +2044,12 @@ function render() {
 
 /* ---------- abyss frame: trench walls, portal ring, gold data rain ---------- */
 
-const frameRnd = mulberry32(0xab155a1);
-const CANYON_L = [];
-const CANYON_R = [];
-for (let i = 0; i <= 14; i++) {
-  CANYON_L.push(0.035 + 0.05 * Math.sin(i * 1.7) ** 2 + frameRnd() * 0.03);
-  CANYON_R.push(0.035 + 0.05 * Math.cos(i * 1.3) ** 2 + frameRnd() * 0.03);
-}
-const RAIN_COLS = [];
-for (let i = 0; i < 9; i++) {
-  RAIN_COLS.push({
-    fx: 0.42 + frameRnd() * 0.3,
-    speed: 0.00006 + frameRnd() * 0.00008,
-    phase: frameRnd() * 10,
-    w: 1 + frameRnd() * 2,
-  });
-}
-const NODES = [];
-for (let i = 0; i < 16; i++) {
-  NODES.push({ fx: 0.72 + frameRnd() * 0.26, fy: 0.25 + frameRnd() * 0.65, r: 1.5 + frameRnd() * 3, phase: frameRnd() * 10 });
-}
-const JELLIES = [];
-for (let i = 0; i < 7; i++) {
-  JELLIES.push({
-    fx: 0.15 + frameRnd() * 0.7, fy: 0.3 + frameRnd() * 0.6,
-    s: 6 + frameRnd() * 10, phase: frameRnd() * 10, speed: 0.00002 + frameRnd() * 0.00003,
-  });
-}
+const FRAME = buildFrameGeometry(0xab155a1);
+const CANYON_L = FRAME.canyonL;
+const CANYON_R = FRAME.canyonR;
+const RAIN_COLS = FRAME.rainCols;
+const NODES = FRAME.nodes;
+const JELLIES = FRAME.jellies;
 
 /**
  * The trench the tank sits in, in the token avatar's language: dark canyon

@@ -24,6 +24,7 @@ process.env.CHAIN_FEED ??= 'synthetic';
 // touches a chain: verification runs against a local stub RPC, and the
 // facilitator test below builds its own config and stubs Circle.
 process.env.ABYS_TOKEN_ADDRESS ??= '0x' + '11'.repeat(20);
+process.env.ALLOW_DEBUG_TICK ??= '1';
 
 // One receipt stub for the /intervene tests: any hash settles a valid burn of
 // the feed price, so the route logic (not the verifier) is what is under test.

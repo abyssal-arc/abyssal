@@ -22,6 +22,7 @@ interface Env {
 }
 
 const SNAP_KEY = 'world';
+const INSTANCE_KEY = 'instance';
 const SAVE_EVERY_MS = 30_000;
 
 export class AbyssalWorld {
@@ -33,7 +34,12 @@ export class AbyssalWorld {
   private async boot(): Promise<ReturnType<typeof createApp>> {
     if (!this.app) {
       const snapshot = await this.ctx.storage.get<string>(SNAP_KEY);
-      this.app = createApp({ snapshot: snapshot ?? undefined });
+      let instance = await this.ctx.storage.get<string>(INSTANCE_KEY);
+      if (!instance) {
+        instance = crypto.randomUUID();
+        await this.ctx.storage.put(INSTANCE_KEY, instance);
+      }
+      this.app = createApp({ snapshot: snapshot ?? undefined, instance });
     }
     return this.app;
   }

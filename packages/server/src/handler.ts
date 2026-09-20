@@ -29,6 +29,12 @@ import {
 export interface AppOptions {
   seed?: number;
   /**
+   * Stable identity of this world instance. The node adapter leaves it random
+   * per boot (a local mirror); the Worker passes one persisted in the Durable
+   * Object so every isolate reports the same tank.
+   */
+  instance?: string;
+  /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
    * the same handler runs inside a Cloudflare Worker where static assets come
@@ -106,6 +112,7 @@ export function createApp(options: AppOptions = {}) {
   const rpcUrl = process.env.ARC_RPC_URL ?? 'https://rpc.mainnet.arc.io';
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastAdvanceAt = Date.now();
+  const instanceId = crypto.randomUUID();
   let chainTemp = 0.5;
   let chainDelta = 0;
   let marketTemp = 0.5;
@@ -309,6 +316,7 @@ export function createApp(options: AppOptions = {}) {
       totals: { born: world.totalBorn, died: world.totalDied, predations: world.totalPredations },
       network: NETWORK,
       chainId: CHAIN_ID,
+      instance: options.instance ?? instanceId,
       prices: ABYS_PRICES,
       paymentAsset: 'ABYSSAL',
       // How POST /intervene is paid: the visitor burns ABYS and presents the
@@ -454,7 +462,10 @@ export function createApp(options: AppOptions = {}) {
 
     if (req.method === 'GET' && path === '/events') {
       const since = Number(url.searchParams.get('since') ?? 0);
-      const events = world.eventLog.filter((e) => e.seq > since);
+      // Hard ceiling per response: the ring is 200 deep today, and this keeps
+      // that guarantee explicit if the ring ever grows.
+      const limit = Math.min(Number(url.searchParams.get('limit') ?? 500) || 500, 500);
+      const events = world.eventLog.filter((e) => e.seq > since).slice(-limit);
       return json({ tick: world.tick, events });
     }
 
@@ -483,6 +494,10 @@ export function createApp(options: AppOptions = {}) {
     }
 
     if (req.method === 'POST' && path === '/tick') {
+      // Debug-only: anyone could fast-forward a public tank otherwise.
+      if (process.env.ALLOW_DEBUG_TICK !== '1') {
+        return json({ error: 'debug route disabled', hint: 'set ALLOW_DEBUG_TICK=1' }, 404);
+      }
       await advance();
       return json({ ok: true, tick: world.tick });
     }
@@ -493,6 +508,13 @@ export function createApp(options: AppOptions = {}) {
         body = (await req.json()) as Record<string, unknown>;
       } catch {
         return json({ error: 'invalid JSON body' }, 400);
+      }
+      // Reads are a public data API (CORS *); writes are not. Browsers send
+  // Origin on same-origin POSTs too, so this only blocks foreign pages.
+      const origin = req.headers.get('origin');
+      const allowlist = (process.env.CORS_ORIGINS ?? '').split(',').filter(Boolean);
+      if (origin && origin !== `http://${req.headers.get('host')}` && !allowlist.includes(origin)) {
+        return json({ error: 'cross-origin interventions are not allowed' }, 403);
       }
       const type = body?.type as InterventionType;
       if (!INTERVENTION_TYPES.includes(type)) {
