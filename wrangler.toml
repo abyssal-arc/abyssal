@@ -13,9 +13,17 @@ class_name = "AbyssalWorld"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["AbyssalWorld"]
+# Free-plan Durable Objects require the sqlite backend.
+new_sqlite_classes = ["AbyssalWorld"]
 
 # Keeps the ecosystem ticking with zero viewers; per-request catchUp covers
 # the gaps between alarms.
 [triggers]
 crons = ["* * * * *"]
+
+# Custom domain: Cloudflare issues the Universal SSL certificate for the zone
+# automatically once the domain is active on the account.
+routes = [
+  { pattern = "abyssal-arc.com", custom_domain = true },
+  { pattern = "www.abyssal-arc.com", custom_domain = true },
+]
