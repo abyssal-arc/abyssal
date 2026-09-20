@@ -913,6 +913,19 @@ function processSnapshot(snap, recv) {
   });
   if (snapBuffer.length > BUFFER_KEEP) snapBuffer.shift();
   latestSnap = snapBuffer[snapBuffer.length - 1];
+  const chip = document.getElementById('tax-chip');
+  if (chip) {
+    const tax = snap.tax;
+    if (tax) {
+      chip.hidden = false;
+      chip.textContent = t('taxActive', {
+        species: tax.archetype,
+        pct: Math.round(tax.share * 100),
+      });
+    } else {
+      chip.hidden = true;
+    }
+  }
 }
 
 /* ---------- chain whales: the tank's food source, embodied ---------- */
@@ -1990,6 +2003,7 @@ function render() {
   const frameDt = Math.min(100, Math.max(1, now - lastFrameAt));
   lastFrameAt = now;
   const easeK = 1 - Math.exp(-frameDt / 38);
+  const tax = latestSnap.tax ?? null;
   const sx = cssW / latestSnap.width;
   const sy = cssH / latestSnap.height;
   // Ease the camera toward whatever the causal lens or a follow shot wants;
@@ -2216,6 +2230,9 @@ function render() {
         -DPR * sin * scaleY, DPR * cos * scaleY,
         px * DPR, py * DPR,
       );
+      // A hungry body runs on instinct, so it reads desaturated: the viewer
+      // sees the override without opening the card.
+      wctx.filter = c.hungry ? 'saturate(0.25) brightness(0.85)' : 'none';
       // Additive halo first so the body sits inside its own light.
       wctx.globalCompositeOperation = 'lighter';
       wctx.globalAlpha = 0.3 * vib;
@@ -2224,6 +2241,29 @@ function render() {
       wctx.globalAlpha = vib;
       wctx.drawImage(frame, -SPRITE / 2, -SPRITE / 2);
       wctx.globalAlpha = 1;
+      wctx.filter = 'none';
+      if (c.hungry || (tax && c.archetype === tax.archetype)) {
+        wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        if (c.hungry) {
+          // Flatline over the head: instinct is driving, not the brain.
+          const gy = py - SPRITE_BODY * base * cam.z - 8;
+          wctx.strokeStyle = 'rgba(147, 163, 189, 0.85)';
+          wctx.lineWidth = 1;
+          wctx.beginPath();
+          wctx.moveTo(px - 6, gy);
+          wctx.lineTo(px + 6, gy);
+          wctx.stroke();
+        }
+        if (tax && c.archetype === tax.archetype) {
+          // Monopoly fog: the taxed species wears a dim red rim so the tax
+          // reads on the tank, not only in the chip.
+          wctx.strokeStyle = 'rgba(255, 77, 109, 0.35)';
+          wctx.lineWidth = 2;
+          wctx.beginPath();
+          wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.75, 0, TAU);
+          wctx.stroke();
+        }
+      }
       if (c.id === selectedId) {
         // Soft double ring, drawn in sprite space so it tracks rotation/scale.
         const r = SPRITE_BODY + 14;
@@ -2888,6 +2928,13 @@ function handleEvents(events, bootstrap = false) {
   for (const e of events) {
     const sd = hashSeed(`ev:${e.seq}:${e.type}`);
     switch (e.type) {
+      case 'reseed': {
+        spawnRing(e.x, e.y, 26, 'rgba(126, 226, 168, 0.8)', 900);
+        pushEventLine('reseed', t('evtReseed', {
+          species: e.species ?? '?', x: Math.round(e.x), y: Math.round(e.y),
+        }));
+        break;
+      }
       case 'predation': {
         // Kill cam: flash, small screen shake, banner with both names.
         spawnBurst(e.x, e.y, [DOTS.red, DOTS.white], 8, 400, 3, sd);

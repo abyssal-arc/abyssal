@@ -131,7 +131,7 @@ export interface TickStats {
 export interface SimEvent {
   seq: number;
   tick: number;
-  type: 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor' | 'poison_kill';
+  type: 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor' | 'poison_kill' | 'reseed';
   /** World coordinates, when the event is localized. */
   x?: number;
   y?: number;
@@ -143,6 +143,8 @@ export interface SimEvent {
   preyArchetype?: Archetype;
   predatorName?: string;
   preyName?: string;
+  /** Reseeded species, for `reseed` events. */
+  species?: Archetype;
   /** Meteor metadata. */
   hash?: string;
   size?: number;
@@ -331,19 +333,34 @@ function recolonize(world: World, gap: number): number {
     const genome = randomGenome(world.rng);
     steerArchetype(genome, target);
     counts[target]++;
-    world.creatures.push(
-      makeCreature(
-        world,
-        genome,
-        world.rng.range(0, cfg.width),
-        world.rng.range(0, cfg.height),
-        world.rng.range(50, 80),
-        1,
-      ),
-    );
+    const x = world.rng.range(0, cfg.width);
+    const y = world.rng.range(0, cfg.height);
+    world.creatures.push(makeCreature(world, genome, x, y, world.rng.range(50, 80), 1));
+    // Positioned so the tank can show life drifting back into an empty niche
+    // instead of creatures simply appearing with no story.
+    pushEvent(world, { type: 'reseed', x, y, species: target });
   }
   world.totalBorn += seeded;
   return seeded;
+}
+
+/** Below this fraction of max energy the instinct override takes the wheel. */
+export function isHungry(world: World, c: Creature): boolean {
+  return c.energy < world.config.maxEnergy * HUNGER_LINE;
+}
+
+/**
+ * The species paying the dominance tax right now, with its share of the tank,
+ * or null while no single species crowds past `dominanceShare`. The renderer
+ * uses it to fog the monopoly instead of letting the tax run invisibly.
+ */
+export function dominantTax(world: World): { archetype: Archetype; share: number } | null {
+  const cfg = world.config;
+  if (cfg.populationFloor <= 0 || world.creatures.length < cfg.populationFloor) return null;
+  const counts = archetypeTally(world.creatures);
+  const ex = exhaustedNiche(counts, world.creatures.length, cfg.dominanceShare);
+  if (!ex) return null;
+  return { archetype: ex.archetype, share: counts[ex.archetype] / world.creatures.length };
 }
 
 export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG): World {

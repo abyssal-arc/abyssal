@@ -26,6 +26,8 @@ export {
   toJSON,
   fromJSON,
   WHALE_BOOM_SIZE,
+  isHungry,
+  dominantTax,
 } from './world.js';
 export type {
   Creature,

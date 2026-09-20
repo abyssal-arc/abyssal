@@ -158,6 +158,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC lands as plankton',
     causalEat: '{name} turns toward the money',
     viewInTank: 'view in tank',
+    taxActive: 'monopoly tax · {species} holds {pct}% of the tank',
+    evtReseed: '🌱 {species} drifts back in at ({x}, {y})',
   },
   fr: {
     day: 'Jour',
@@ -313,6 +315,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC tombe en plancton',
     causalEat: "{name} se tourne vers l'argent",
     viewInTank: 'voir dans le bac',
+    taxActive: 'taxe de monopole · {species} tient {pct}% du bac',
+    evtReseed: '🌱 {species} revient vers ({x}, {y})',
   },
   de: {
     day: 'Tag',
@@ -468,6 +472,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC landet als Plankton',
     causalEat: '{name} dreht zum Geld',
     viewInTank: 'im Becken ansehen',
+    taxActive: 'Monopolsteuer · {species} hält {pct}% des Beckens',
+    evtReseed: '🌱 {species} driftet zurück bei ({x}, {y})',
   },
   zh: {
     day: '天数',
@@ -623,6 +629,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC 落为浮游',
     causalEat: '{name} 转向这笔钱',
     viewInTank: '在缸中查看',
+    taxActive: '垄断税 · {species} 占缸内 {pct}%',
+    evtReseed: '🌱 {species} 在 ({x}, {y}) 补种回流',
   },
   ja: {
     day: '日目',
@@ -778,6 +786,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC がプランクトンとして着水',
     causalEat: '{name} がその金へ向きを変える',
     viewInTank: '水槽で見る',
+    taxActive: '独占税 · {species} が槽の {pct}% を占有',
+    evtReseed: '🌱 {species} が ({x}, {y}) へ再投入',
   },
   ko: {
     day: '일',
@@ -933,6 +943,8 @@ const dict = {
     causalPay: '{from} → {to} · {amount} USDC가 플랑크톤으로 착수',
     causalEat: '{name} 이 그 돈을 향해 돌아섭니다',
     viewInTank: '수조에서 보기',
+    taxActive: '독점세 · {species} 이 수조의 {pct}% 차지',
+    evtReseed: '🌱 {species} 이 ({x}, {y}) 로 재투입',
   },
 };
 

@@ -298,6 +298,21 @@ body.view-observe {
   pointer-events: none;
 }
 #causal-card[hidden] { display: none; }
+#tax-chip {
+  position: fixed;
+  top: calc(var(--sp) * 17);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 34;
+  padding: calc(var(--sp)) calc(var(--sp) * 3);
+  border-radius: 999px;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--danger);
+  pointer-events: none;
+}
+#tax-chip[hidden] { display: none; }
 #addr-world { margin-top: calc(var(--sp) * 2); }
 .langs { position: relative; }
 .lang-menu {

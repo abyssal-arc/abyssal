@@ -3,7 +3,9 @@ import {
   createWorld,
   DEFAULT_CONFIG,
   fromJSON,
+  dominantTax,
   genomeFingerprint,
+  isHungry,
   tick as tickWorld,
   txLanding,
   WHALE_BOOM_SIZE,
@@ -320,6 +322,8 @@ export function createApp(options: AppOptions = {}) {
       height: world.config.height,
       // Live top addresses by two-way volume; the tank embodies them as whales.
       whales: arcFeed ? arcFeed.whalesPayload() : [],
+      // The two hidden rules, surfaced so the tank is never a black box.
+      tax: dominantTax(world),
       chainTemp,
       marketTemp,
       creatures: world.creatures.map((c) => ({
@@ -338,6 +342,7 @@ export function createApp(options: AppOptions = {}) {
         generation: c.generation,
         bornTick: c.bornTick,
         genes: genomeFingerprint(c.genome),
+        hungry: isHungry(world, c),
       })),
       foods: world.foods.map((f) => ({ x: Math.round(f.x), y: Math.round(f.y) })),
     };

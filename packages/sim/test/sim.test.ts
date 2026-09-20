@@ -11,6 +11,8 @@ import {
   fromJSON,
   DEFAULT_CONFIG,
   archetypeOf,
+  dominantTax,
+  isHungry,
   steerArchetype,
   randomGenome,
   type Senses,
@@ -667,5 +669,33 @@ test('money is weather: payments and tx rain never rewrite a living genome', () 
     const b = before.get(c.id);
     if (b === undefined) continue;
     assert.equal(JSON.stringify(c.genome), b, `creature ${c.id} had its genome rewritten by money`);
+  }
+});
+
+test('the hidden rules are readable: hunger flag, dominance tax, positioned reseed', () => {
+  const w = createWorld(3);
+  for (let i = 0; i < 30; i++) tick(w, { chain: 0.6, market: 0.5 }, []);
+  assert.ok(w.creatures.length > 0);
+
+  // Hunger is a plain threshold on energy, exposed for the renderer.
+  const c = w.creatures[0];
+  c.energy = w.config.maxEnergy * 0.9;
+  assert.equal(isHungry(w, c), false);
+  c.energy = w.config.maxEnergy * 0.2;
+  assert.equal(isHungry(w, c), true);
+
+  // Force a monopoly: one species filling the glass crowds the rest out.
+  for (const cr of w.creatures) cr.archetype = 'WHALE';
+  const before = w.eventLog.length;
+  tick(w, { chain: 0.6, market: 0.5 }, []);
+  const tax = dominantTax(w);
+  assert.ok(tax, 'a one-species tank must report the dominance tax');
+  assert.equal(tax.archetype, 'WHALE');
+  assert.ok(tax.share > 0.5);
+  const reseeds = w.eventLog.slice(before).filter((e) => e.type === 'reseed');
+  assert.ok(reseeds.length > 0, 'recolonization must leave positioned events');
+  for (const e of reseeds) {
+    assert.ok(Number.isFinite(e.x) && Number.isFinite(e.y), 'reseed events carry a landing site');
+    assert.ok(e.species && e.species !== 'WHALE', 'the reserve refills the crowded-out niches');
   }
 });
