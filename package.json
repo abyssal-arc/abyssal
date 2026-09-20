@@ -1,0 +1,23 @@
+{
+  "name": "abyssal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Abyssal — the x402 observatory: an on-chain evolution arena on Arc (Circle L1, chainId 5042)",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @abyssal/sim && npm run build -w @abyssal/server",
+    "dev": "npm run build && node packages/server/dist/src/dev.js",
+    "test": "npm test -w @abyssal/sim && npm test -w @abyssal/server",
+    "typecheck": "npm run build -w @abyssal/sim && tsc -p packages/sim/tsconfig.json --noEmit && tsc -p packages/server/tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.6.3"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+# Local persisted world snapshot (everyone shares one world, but it is machine state).
+.data/
+# Verification screenshots taken during browser acceptance passes.
+.shots/
+# macOS Finder noise.
+.DS_Store
+# Token economics are designed here but not published yet; keep the doc local
+# so an over-eager `git add -A` cannot ship unpublished commitments.
+TOKEN_PLAN.md

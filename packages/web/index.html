@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ABYSSAL: the x402 observatory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <canvas id="world"></canvas>
+  <div id="vignette"></div>
+  <div id="tip" hidden></div>
+
+  <header id="topbar" class="glass rise">
+    <div class="brand">ABYSSAL<span class="tag" data-i18n="brandTag">the x402 observatory. Every creature eats a real machine payment</span></div>
+    <nav class="viewtabs">
+      <button data-view="observe" data-i18n="viewObserve">OBSERVE</button>
+      <button data-view="world" class="active" data-i18n="viewWorld">WORLD</button>
+    </nav>
+    <div class="stats">
+      <div class="stat"><i class="livedot" id="live-dot"></i><b id="live-label">–</b></div>
+      <div class="stat"><span data-i18n="day">Day</span> <b id="day">–</b></div>
+      <div class="stat"><span data-i18n="population">Population</span> <b id="pop">–</b></div>
+      <div class="stat temp" id="stat-chain" data-i18n-title="chainHelp" title="CHAIN temp = Arc USDC activity: food spawn 0.2×–1.8×, sky weather, feast/normal/famine regime"><i class="tdot" id="chain-dot"></i><span data-i18n="chain">CHAIN</span> <b id="chain-val">–</b></div>
+      <div class="stat temp" id="stat-market" data-i18n-title="marketHelp" title="MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter"><i class="tdot" id="market-dot"></i><span data-i18n="market">MARKET</span> <b id="market-val">–</b></div>
+      <div class="stat" data-i18n-title="nextHarvest" title="Next Harvest"><span class="stat-k" data-i18n="harvestK">HARVEST</span> <b id="harvest-val">–</b></div>
+      <div class="stat" data-i18n-title="judgmentDay" title="Judgment Day"><span class="stat-k" data-i18n="judgmentK">JUDGMENT</span> <b id="judgment-val">–</b></div>
+    </div>
+    <div class="controls">
+      <span class="fps"><span data-i18n="fps">FPS</span> <b id="fps">–</b></span>
+      <button id="help-btn" class="icon-btn" data-i18n-title="helpTip" title="How to play">?</button>
+      <button id="shake-toggle" class="icon-btn active" data-i18n-title="shakeTip" title="Screen shake">FX</button>
+      <div class="langs">
+        <button data-lang="en">EN</button>
+        <button data-lang="zh">中文</button>
+        <button data-lang="ja">日本語</button>
+        <button data-lang="ko">한국어</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="ticker" hidden></div>
+
+  <main id="observe-view" hidden>
+    <div class="obs-col obs-col-main">
+      <section class="glass obs-card obs-flowmap-card">
+        <div class="obs-head">
+          <span data-i18n="flowMapTitle">USDC flow map</span>
+          <span class="obs-sub" data-i18n="flowMapSub">each line = one real transfer</span>
+        </div>
+        <canvas id="flowmap"></canvas>
+        <div class="flowmap-legend">
+          <span><i class="lg-x402"></i><span data-i18n="legendX402">x402 (relayed)</span></span>
+          <span><i class="lg-plain"></i><span data-i18n="legendPlain">plain transfer</span></span>
+        </div>
+      </section>
+      <section class="glass obs-card obs-pulse-card">
+        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><span class="obs-sub" id="pulse-sub"></span></div>
+        <canvas id="pulse"></canvas>
+        <div class="flowmap-legend">
+          <span><i class="lg-plain"></i><span data-i18n="pulseLegendV">USDC volume per bucket</span></span>
+          <span><i class="lg-x402"></i><span data-i18n="pulseLegendX">gold cap = x402 share of bucket</span></span>
+        </div>
+      </section>
+    </div>
+    <div class="obs-col obs-col-side">
+      <section class="glass obs-card obs-stats-card">
+        <div class="obs-head"><span data-i18n="windowStats">Window</span><span class="obs-sub" id="obs-window"></span></div>
+        <div id="obs-stats"></div>
+      </section>
+      <section class="glass obs-card obs-endpoints-card">
+        <div class="obs-head"><span data-i18n="endpointsTitle">Top endpoints</span><span class="obs-sub" data-i18n="endpointsSub">by USDC volume</span></div>
+        <div id="endpoints"></div>
+      </section>
+    </div>
+    <div id="addr-card" class="glass" hidden>
+      <span class="tx-close">×</span>
+      <div class="addr-h"></div>
+      <div id="addr-stats"></div>
+      <div class="addr-sub" data-i18n="addrRecent">Recent flows</div>
+      <div id="addr-flows"></div>
+      <a class="explore" href="#" target="_blank" rel="noopener" data-i18n="addrExplorer">View on explorer</a>
+    </div>
+    <div id="observe-empty" class="obs-empty" hidden>
+      <div class="glass obs-card">
+        <p data-i18n="observeOffline">Live Arc observatory is offline.</p>
+        <p class="obs-hint" data-i18n="observeOfflineHint">Start the server with the Arc feed to stream real USDC flows.</p>
+        <code>npm run dev:arc</code>
+      </div>
+    </div>
+  </main>
+
+  <div id="tx-card" class="glass" hidden></div>
+
+  <div id="banner" hidden></div>
+
+  <aside id="board" class="glass panel rise">
+    <div class="panel-head" data-collapse="board">
+      <span class="ph-title" data-i18n="leaderboard">Leaderboard</span><i class="chev"></i>
+    </div>
+    <div class="panel-body">
+      <div class="board-group">
+        <div class="board-title" data-i18n="topPredators" data-i18n-title="predTip" title="Kills steal 50% of the victim's energy — predators grow, the weak get culled.">Top Predators</div>
+        <div id="lb-predators" class="board-list"></div>
+      </div>
+      <div class="board-group">
+        <div class="board-title" data-i18n="richest">Richest</div>
+        <div id="lb-richest" class="board-list"></div>
+      </div>
+      <div class="board-group">
+        <div class="board-title" data-i18n="elders">Elders</div>
+        <div id="lb-elders" class="board-list"></div>
+      </div>
+      <div id="world-legend" hidden>
+        <span><i class="lg-creature"></i><span data-i18n="legendCreature">creature — hover to inspect</span></span>
+        <span><i class="lg-food"></i><span data-i18n="legendFood">food — chain-fed plankton</span></span>
+        <span><i class="lg-meteor"></i><span data-i18n="legendMeteor">meteor — a real on-chain transfer</span></span>
+        <span><i class="lg-whale"></i><span data-i18n="legendWhale">whale — a top live address; when it moves real money, plankton bursts at its flank and the tank rushes in</span></span>
+      </div>
+    </div>
+  </aside>
+
+  <aside id="panel" class="glass panel rise">
+    <div class="panel-head" data-collapse="panel">
+      <span class="ph-title" data-i18n="interventions">Interventions</span><span id="pay-badge" class="pay-badge" hidden></span><i class="chev"></i>
+    </div>
+    <div class="panel-body">
+      <p class="hint" data-i18n="panelHint">Interventions are paid on Arc: USDC at list price or ABYS at a ~30% discount (x402 flow). In dev mode a click just works.</p>
+      <button class="iv" data-type="feed"><span data-i18n="feed">Feed</span> <span class="price">100 ABYS</span></button>
+      <button class="iv" data-type="poison"><span data-i18n="poison">Poison</span> <span class="price">250 ABYS</span></button>
+      <button class="iv" data-type="bloom"><span data-i18n="bloom">Bloom</span> <span class="price">500 ABYS</span></button>
+      <button class="iv" data-type="drought"><span data-i18n="drought">Drought</span> <span class="price">500 ABYS</span></button>
+      <p class="hint" id="target-hint" data-i18n="targetHint" hidden>Click the canvas to pick a target area; click the button again to cancel.</p>
+      <div id="toast" hidden></div>
+      <div id="creature-card" hidden></div>
+      <div class="sub-head" data-collapse="events-wrap">
+        <span data-i18n="eventsTitle">Live events</span><i class="chev"></i>
+      </div>
+      <div id="events-wrap" class="sub-body"><div id="events"></div></div>
+      <div class="sub-head" data-collapse="rain-wrap">
+        <span><span data-i18n="chainRain">Chain rain</span> <span id="rain-status" class="rain-status"></span></span><i class="chev"></i>
+      </div>
+      <div id="rain-wrap" class="sub-body"><div id="rain"></div></div>
+    </div>
+  </aside>
+
+  <div id="dock" class="glass rise">
+    <button id="dock-obits" class="dock-btn"><span data-i18n="extinctionLists">Extinction lists</span></button>
+    <button id="dock-analytics" class="dock-btn"><span data-i18n="analytics">Analytics</span></button>
+    <span class="token" id="dock-token" data-i18n="tokenTbd">Token: TBD</span>
+  </div>
+
+  <div id="drawer-obits" class="drawer glass" hidden>
+    <div class="section-title"><span data-i18n="extinctionLists">Extinction lists</span><span class="legend"><i class="dot harvest"></i><span data-i18n="harvest">harvest</span> <i class="dot judgment"></i><span data-i18n="judgment">judgment</span></span></div>
+    <div id="death-stats"></div>
+    <div id="judgments" data-i18n="noCulls">No culls yet</div>
+  </div>
+
+  <div id="drawer-analytics" class="drawer glass" hidden>
+    <div class="day-anchor">
+      <span class="da-label" data-i18n="dayAnchor">Day digest</span>
+      <code id="day-digest">–</code>
+      <span class="da-note" data-i18n="dayAnchorNote">preview · commits on-chain at day end</span>
+    </div>
+    <div class="sig-guide">
+      <div><i class="sg-dot chain"></i><span data-i18n="chainHelp">CHAIN temp = Arc USDC activity: food spawn 0.2×–1.8×, sky weather, feast/normal/famine regime</span></div>
+      <div><i class="sg-dot market"></i><span data-i18n="marketHelp">MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter</span></div>
+    </div>
+    <div class="analytics-body">
+      <div id="chart-wrap">
+        <div class="section-title" data-i18n="popHistory">Population history</div>
+        <canvas id="chart"></canvas>
+      </div>
+      <div id="temps-wrap">
+        <div class="section-title" data-i18n="tempsTitle">Chain &amp; Market</div>
+        <canvas id="temps"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div id="welcome" hidden>
+    <div class="welcome-card glass">
+      <h1>ABYSSAL</h1>
+      <p class="wtag" data-i18n="brandTag">the x402 observatory. Every creature eats a real machine payment</p>
+      <p data-i18n="welcomeL1"></p>
+      <p data-i18n="welcomeL2"></p>
+      <p data-i18n="welcomeL3"></p>
+      <p data-i18n="welcomeL4"></p>
+      <button id="enter" class="cta" data-i18n="enterTank">Enter the tank</button>
+    </div>
+  </div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
