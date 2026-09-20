@@ -86,10 +86,7 @@ Environment variables:
 | `ARC_RPC_URL` | `https://rpc.mainnet.arc.io` | Arc JSON-RPC endpoint (used when `CHAIN_FEED=arc`) |
 | `ARC_USDC_ADDRESS` | `0x3600…0000` | Native USDC precompile on Arc |
 | `EXPLORER_TX_URL` | `https://explorer.arc.io/tx/` | Explorer base URL for tx links |
-| `SELLER_PRIVATE_KEY` | unset | Required to sell: the key controlling the settlement recipient. Without it the observatory still runs free, but `POST /intervene` answers 503 |
-| `SELLER_PAY_TO` | seller address | Override the receiving address |
-| `X402_TESTNET` | unset | `1` dry-runs settlement on the keyless Arc testnet trial (5042002); unset settles real USDC on Arc mainnet (5042) |
-| `FACILITATOR_URL` | `https://api.circle.com/v1/facilitator/x402` | Circle facilitator base URL |
+| `ABYS_TOKEN_ADDRESS` | unset | Deployed ABYS contract. Interventions are paid by burning ABYS; until this is set `POST /intervene` answers 503 while the observatory still runs free |
 | `COMPRESS_LEVEL` | `6` | Brotli quality for response compression in the node adapter (6 ≈ 0.5–3 ms/payload; 11 costs ~570 ms on `/history`) |
 | `COMPRESS_MIN_BYTES` | `1024` | Responses smaller than this are sent uncompressed |
 
@@ -101,12 +98,12 @@ same day, the same individuals and the same lineages instead of reseeding.
 Client-side ambience (nebula, stars, motes) is generated from fixed seeds for
 the same reason, so a refresh never re-rolls the scenery.
 
-**Two chains, two jobs.** The observatory *reads* Arc **mainnet 5042** (the
-USDC transfer flow). Interventions *settle* real USDC on Arc **mainnet 5042**
-by default, once the operator sets `SELLER_PRIVATE_KEY`; `X402_TESTNET=1`
-dry-runs the same flow on the keyless testnet trial (5042002). The UI badges
-the intervention panel with whichever settlement chain is live, and says
-"settlement unconfigured" until a seller key exists.
+**One chain, two jobs.** The observatory *reads* Arc **mainnet 5042** (the
+USDC transfer flow). Interventions are paid on the same chain by **burning
+ABYS**: the visitor's burn transaction is the payment, its receipt is the
+proof, and nobody custodies anything. The UI badges the panel with the burn
+settlement, and says "settlement unconfigured" until `ABYS_TOKEN_ADDRESS` is
+set.
 
 Tip: plain `npm run dev` already talks to the real Arc mainnet RPC. There is
 no flag to flip. The Arc feed indexes the **USDC transfer flow**, which is what
@@ -173,33 +170,29 @@ calmer pre/after-market, near-zero on weekends). See
 
 Four interventions (`packages/server/src/payments.ts`):
 
-| Intervention | USDC / ABYS | Effect |
+| Intervention | ABYS (burned) | Effect |
 | --- | --- | --- |
-| `feed` | 0.05 / 35 | Drop food in a target area |
-| `poison` | 0.1 / 70 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
-| `bloom` | 0.25 / 175 | Global food spawn ×2 (2400 ticks = 10 min) |
-| `drought` | 0.25 / 175 | Global food spawn halted (2400 ticks = 10 min) |
+| `feed` | 35 | Drop food in a target area |
+| `poison` | 70 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
+| `bloom` | 175 | Global food spawn ×2 (2400 ticks = 10 min) |
+| `drought` | 175 | Global food spawn halted (2400 ticks = 10 min) |
 
-On Arc, `POST /intervene` is a real **x402 v2 flow settled by Circle's
-Facilitator Service** (`packages/server/src/facilitator.ts`). The 402 response
-carries an `exact` USDC requirement (EIP-3009); the browser signs a
-`TransferWithAuthorization` with the wallet (`eth_signTypedData_v4`), gasless
-for the payer, who never submits a transaction, and retries with the payload
-base64url-encoded in `X-Payment`. The server signs its own EIP-712 seller proof
-and posts to Circle's `/settle`, polling `/status/{paymentId}` while pending.
-Before calling Circle it recovers the signer from the authorization and
-rejects `signer_mismatch` locally, so a wallet that signed with the wrong
-account gets an actionable message instead of an opaque settlement failure.
+`POST /intervene` is paid by destruction. The 402 response carries one `exact`
+offer naming the ABYS contract and an amount in base units; the wallet sends a
+`burn(amount)` transaction to that contract and the client retries with the
+transaction hash in `X-Payment-Tx`. The server fetches the receipt and accepts
+the intervention only if it contains an ABYS `Transfer` to the zero address for
+at least the asked amount, and only once per hash. There is no seller key, no
+facilitator and no custody: the tokens leave circulation.
 
-There is no demo or unpaid path. Without `SELLER_PRIVATE_KEY` the server
+There is no demo or unpaid path. Without `ABYS_TOKEN_ADDRESS` the server
 still boots and the observatory stays free to watch, but `POST /intervene`
-answers **503 settlement not configured** and the panel says so.
+answers **503 token not deployed** and the panel says so.
 
-For a deployment without a facilitator, the reserved fallback is receipt
-verification: after the client transfers and retries with the hash in
-`X-Payment-Tx`, scan that transaction for the ERC-20 `Transfer` event (token
-contract, recipient, amount, confirmations) with txHash replay protection.
-`TOKEN_ADDRESS` is `null` until the token is deployed.
+`packages/server/src/facilitator.ts` keeps a Circle Facilitator client
+(EIP-3009 seller proofs, `/settle`, signer recovery) as a reserved path for a
+future USDC-denominated product such as the paid data tier. Interventions do
+not use it.
 
 Money enters this simulation only as weather. A paid intervention changes the
 environment (food, drains, spawn rates) and a chain transfer becomes plankton
@@ -285,11 +278,10 @@ Either way, an unpaid request gets **HTTP 402** with a body like:
 
 ## Road to mainnet
 
-1. **Token**: deploy the ABYS ERC-20, set `TOKEN_ADDRESS`, replace the
-   placeholder `PAY_TO` with a real treasury multisig.
-2. **Payments**: for facilitator-less deployments, verify payment by scanning
-   the ERC-20 `Transfer` event in the payer's receipt (token contract,
-   recipient, amount, confirmations, txHash replay protection).
+1. **Token**: deploy the ABYS ERC-20 with `burn(uint256)` emitting
+   `Transfer(from, 0x0)`, then export `ABYS_TOKEN_ADDRESS`.
+2. **Data tier**: price the historical API in USDC through the reserved Circle
+   facilitator path, keeping interventions on burn-to-pay.
 3. **Trust anchor**: commit the daily world-summary digest on chain so anyone
    can verify the operator didn't rig the simulation (task tracked in
    `TOKEN_PLAN.md`; it is a public attestation, not a distribution mechanism).

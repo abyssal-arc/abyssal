@@ -15,10 +15,10 @@ import type { AddressInfo } from 'node:net';
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
 process.env.CHAIN_FEED ??= 'synthetic';
-// A throwaway seller key so createApp builds the real x402 gate. Nothing here
-// broadcasts: settleFromRequest bails on a missing X-Payment before any fetch,
-// and the signer test points FACILITATOR_URL at a local stub.
-process.env.SELLER_PRIVATE_KEY ??= '0x' + '4c'.repeat(32);
+// A dummy ABYS address so createApp builds the burn-payment gate. Nothing here
+// touches a chain: verification runs against a local stub RPC, and the
+// facilitator test below builds its own config and stubs Circle.
+process.env.ABYS_TOKEN_ADDRESS ??= '0x' + '11'.repeat(20);
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}): Request {
   return new Request(`http://localhost${path}`, {
@@ -28,7 +28,7 @@ function post(path: string, body: unknown, headers: Record<string, string> = {})
   });
 }
 
-test('402 advertises the exact USDC offer on Arc mainnet', async () => {
+test('402 advertises the ABYS burn offer on Arc mainnet', async () => {
   const app = createApp({ seed: 1 });
   const res = await app.fetch(post('/intervene', { type: 'feed', x: 100, y: 100 }));
   assert.equal(res.status, 402);
@@ -36,51 +36,118 @@ test('402 advertises the exact USDC offer on Arc mainnet', async () => {
     error: string;
     accepts: {
       scheme: string;
+      settle: string;
       network: string;
       asset: string;
       amount: string;
-      payTo: string;
-      extra?: { assetTransferMethod?: string };
     }[];
   };
   assert.equal(body.error, 'payment required');
-  assert.equal(body.accepts.length, 1, 'one exact offer, no unpaid alternative');
+  assert.equal(body.accepts.length, 1, 'one burn offer, no unpaid alternative');
   const req = body.accepts[0];
   assert.equal(req.scheme, 'exact');
-  // Settlement defaults to real money on Arc mainnet; testnet needs an opt-in.
+  assert.equal(req.settle, 'burn');
   assert.equal(req.network, 'eip155:5042');
-  assert.equal(req.amount, '50000'); // 0.05 USDC in base units
-  assert.equal(req.extra?.assetTransferMethod, 'eip3009');
-  assert.match(req.payTo, /^0x[0-9a-f]{40}$/);
+  assert.equal(req.asset, process.env.ABYS_TOKEN_ADDRESS);
+  assert.equal(req.amount, '35000000'); // 35 ABYS in base units
 });
 
-test('402 amounts follow the USDC price list in base units', async () => {
+test('402 amounts follow the ABYS price list in base units', async () => {
   const app = createApp({ seed: 1 });
-  for (const [type, micro] of [
-    ['feed', '50000'],
-    ['poison', '100000'],
-    ['bloom', '250000'],
-    ['drought', '250000'],
+  for (const [type, base] of [
+    ['feed', '35000000'],
+    ['poison', '70000000'],
+    ['bloom', '175000000'],
+    ['drought', '175000000'],
   ] as const) {
     const res = await app.fetch(post('/intervene', { type, x: 10, y: 10 }));
     assert.equal(res.status, 402);
     const body = (await res.json()) as { accepts: { amount: string }[] };
-    assert.equal(body.accepts[0].amount, micro, `${type} should cost ${micro} base units`);
+    assert.equal(body.accepts[0].amount, base, `${type} should cost ${base} base units`);
   }
 });
 
-test('/intervene answers 503 until the operator configures settlement', async () => {
-  const pk = process.env.SELLER_PRIVATE_KEY;
-  delete process.env.SELLER_PRIVATE_KEY;
+test('/intervene answers 503 until the token is deployed', async () => {
+  const tok = process.env.ABYS_TOKEN_ADDRESS;
+  delete process.env.ABYS_TOKEN_ADDRESS;
   try {
     const app = createApp({ seed: 1 });
     const res = await app.fetch(post('/intervene', { type: 'feed', x: 100, y: 100 }));
     assert.equal(res.status, 503);
     const body = (await res.json()) as { error: string };
-    assert.equal(body.error, 'settlement not configured');
+    assert.equal(body.error, 'token not deployed');
   } finally {
-    if (pk) process.env.SELLER_PRIVATE_KEY = pk;
+    if (tok) process.env.ABYS_TOKEN_ADDRESS = tok;
   }
+});
+
+test('a burn receipt pays: Transfer to zero for at least the asked amount', async () => {
+  const { verifyBurnReceipt, burnOffer, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
+  const token = process.env.ABYS_TOKEN_ADDRESS as string;
+  const payer = '0x' + 'ab'.repeat(20);
+  const stub = (receipt: unknown) =>
+    createServer((req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: receipt }));
+    });
+  const burnLog = (to: string, value: string, addr = token) => ({
+    address: addr,
+    topics: [TRANSFER_TOPIC, `0x${payer.slice(2).padStart(64, '0')}`, to],
+    data: value,
+  });
+  const offer = burnOffer('feed');
+
+  const ok = stub({
+    status: '0x1',
+    logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))],
+  });
+  await new Promise<void>((r) => ok.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(ok.address() as AddressInfo).port}`;
+  const v = await verifyBurnReceipt(url, offer, '0x' + 'a1'.repeat(32));
+  assert.equal(v.ok, true);
+  assert.equal(v.payer, payer);
+  ok.close();
+
+  const bad = stub({ status: '0x1', logs: [burnLog(payer, '0x' + (35_000_000).toString(16))] });
+  await new Promise<void>((r) => bad.listen(0, '127.0.0.1', () => r()));
+  const v2 = await verifyBurnReceipt(
+    `http://127.0.0.1:${(bad.address() as AddressInfo).port}`,
+    offer,
+    '0x' + 'a2'.repeat(32),
+  );
+  assert.equal(v2.ok, false, 'a transfer to a person is not a burn');
+  bad.close();
+
+  const low = stub({ status: '0x1', logs: [burnLog(BURN_SINK, '0x' + (34_999_999).toString(16))] });
+  await new Promise<void>((r) => low.listen(0, '127.0.0.1', () => r()));
+  const v3 = await verifyBurnReceipt(
+    `http://127.0.0.1:${(low.address() as AddressInfo).port}`,
+    offer,
+    '0x' + 'a3'.repeat(32),
+  );
+  assert.equal(v3.ok, false, 'underpaying must not settle');
+  low.close();
+
+  const reverted = stub({ status: '0x0', logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))] });
+  await new Promise<void>((r) => reverted.listen(0, '127.0.0.1', () => r()));
+  const v4 = await verifyBurnReceipt(
+    `http://127.0.0.1:${(reverted.address() as AddressInfo).port}`,
+    offer,
+    '0x' + 'a4'.repeat(32),
+  );
+  assert.equal(v4.ok, false);
+  assert.equal(v4.reason, 'transaction reverted');
+  reverted.close();
+
+  const twice = stub({ status: '0x1', logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))] });
+  await new Promise<void>((r) => twice.listen(0, '127.0.0.1', () => r()));
+  const hash = '0x' + 'a5'.repeat(32);
+  const first = await verifyBurnReceipt(`http://127.0.0.1:${(twice.address() as AddressInfo).port}`, offer, hash);
+  const second = await verifyBurnReceipt(`http://127.0.0.1:${(twice.address() as AddressInfo).port}`, offer, hash);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, false, 'one burn buys one intervention');
+  assert.equal(second.reason, 'receipt already used');
+  twice.close();
 });
 
 test('/state exposes marketTemp plus harvest and judgment countdowns', async () => {

@@ -1637,27 +1637,22 @@ function showTxCard(flow) {
  * (applyStaticI18n restores the generic keys first).
  */
 function applyChainStrings() {
-  if (state.pricesUsdc) {
-    document.querySelectorAll('button.iv').forEach((btn) => {
-      const type = btn.dataset.type;
-      const usdc = state.pricesUsdc[type];
-      const abys = state.prices?.[type];
-      const priceEl = btn.querySelector('.price');
-      if (priceEl && usdc) priceEl.textContent = `${usdc} USDC · ${abys} ABYS`;
-    });
-  }
+  document.querySelectorAll('button.iv').forEach((btn) => {
+    const type = btn.dataset.type;
+    const abys = state.prices?.[type];
+    const priceEl = btn.querySelector('.price');
+    if (priceEl && abys) priceEl.textContent = `${abys} ABYS · ${t('burnLabel')}`;
+  });
   const pay = state.payment;
   const badge = document.getElementById('pay-badge');
   if (badge && pay) {
     badge.hidden = false;
     badge.dataset.mode = pay.mode;
-    badge.textContent = pay.mode === 'x402'
-      ? (pay.trial ? t('payBadgeTrial') : t('payBadgeLive'))
-      : t('payBadgeUnconfigured');
+    badge.textContent = pay.mode === 'burn' ? t('payBadgeBurn') : t('payBadgeUnconfigured');
   }
   const dockToken = document.getElementById('dock-token');
   if (dockToken) {
-    dockToken.textContent = pay?.mode === 'x402' ? t('dockTokenX402') : t('dockTokenUnconfigured');
+    dockToken.textContent = pay?.mode === 'burn' ? t('dockTokenBurn') : t('dockTokenUnconfigured');
   }
   chainCopyApplied = true;
 }
@@ -2874,17 +2869,6 @@ function b64urlJson(obj) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-const EIP3009_TYPES = {
-  TransferWithAuthorization: [
-    { name: 'from', type: 'address' },
-    { name: 'to', type: 'address' },
-    { name: 'value', type: 'uint256' },
-    { name: 'validAfter', type: 'uint256' },
-    { name: 'validBefore', type: 'uint256' },
-    { name: 'nonce', type: 'bytes32' },
-  ],
-};
-
 const ARC_CHAINS = {
   5042: {
     name: 'Arc',
@@ -2899,22 +2883,18 @@ const ARC_CHAINS = {
 };
 
 /**
- * Ask the visitor's wallet for a gasless EIP-3009 authorization matching the
- * server's offer and wrap it into an x402 payment payload. The buyer never
- * sends a transaction: Circle's Facilitator Service broadcasts the transfer.
+ * Ask the visitor's wallet to burn the asked ABYS. The burn transaction IS the
+ * payment: its receipt carries the Transfer-to-zero event the server verifies,
+ * so there is no seller key and nothing to custody anywhere.
  */
-async function payX402(offer, description) {
+async function payBurn(offer) {
   const eth = window.ethereum;
   if (!eth) return { error: 'no-wallet' };
-  // Sign with the account the visitor just approved: some wallets list more
-  // addresses in eth_accounts than the one that will actually sign, and an
-  // authorization from the wrong one never settles.
   const approved = await eth.request({ method: 'eth_requestAccounts' });
-  const chainId = parseInt(offer.network.split(':')[1], 10);
-  const want = `0x${chainId.toString(16)}`;
+  const want = `0x${offer.chainId.toString(16)}`;
   const have = await eth.request({ method: 'eth_chainId' });
   if (have !== want) {
-    const info = ARC_CHAINS[chainId];
+    const info = ARC_CHAINS[offer.chainId];
     try {
       await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: want }] });
     } catch (err) {
@@ -2933,39 +2913,23 @@ async function payX402(offer, description) {
   }
   const accounts = approved?.length ? approved : await eth.request({ method: 'eth_accounts' });
   const from = accounts[0];
-  const nonce = `0x${[...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
-  const message = {
-    from,
-    to: offer.payTo,
-    value: offer.amount,
-    validAfter: '0',
-    validBefore: String(Math.floor(Date.now() / 1000) + 3600),
-    nonce,
-  };
-  const signature = await eth.request({
-    method: 'eth_signTypedData_v4',
-    params: [from, JSON.stringify({
-      domain: { name: 'USDC', version: '2', chainId, verifyingContract: offer.asset },
-      types: EIP3009_TYPES,
-      primaryType: 'TransferWithAuthorization',
-      message,
-    })],
+  // burn(uint256): selector 0x42966c68 plus the 32-byte base-unit amount.
+  const amount = BigInt(offer.amount).toString(16).padStart(64, '0');
+  const tx = await eth.request({
+    method: 'eth_sendTransaction',
+    params: [{ from, to: offer.asset, data: `0x42966c68${amount}` }],
   });
-  return {
-    header: b64urlJson({
-      x402Version: 2,
-      resource: { url: `${location.origin}/intervene`, description, mimeType: 'application/json' },
-      accepted: offer,
-      payload: { signature, authorization: message },
-    }),
-  };
+  return { tx };
 }
 
 /** Settlement verdicts we can turn into something the visitor can act on. */
 const PAY_REASON_KEYS = {
-  signer_mismatch: 'paySignerMismatch',
-  invalid_exact_evm_payload_signature: 'paySignerMismatch',
-  insufficient_funds: 'payInsufficientFunds',
+  'receipt already used': 'payReceiptUsed',
+  'transaction reverted': 'payTxReverted',
+  'no burn of the asked amount in this transaction': 'payBurnMissing',
+  'receipt not found': 'payBurnMissing',
+  'bad tx hash': 'payBurnMissing',
+  'receipt lookup failed': 'payBurnMissing',
 };
 
 function payReasonText(reason) {
@@ -2989,17 +2953,17 @@ async function intervene(body) {
     if (res.status === 402) {
       const gate = await res.json();
       const offer = gate.accepts?.[0];
-      if (!offer || offer.scheme !== 'exact') {
+      if (!offer || offer.settle !== 'burn') {
         toast(t('paymentRequired', { amount: offer?.amount ?? '?' }), true);
         return;
       }
       toast(t('paySign'));
-      const paid = await payX402(offer, `ABYSSAL intervention: ${body.type}`);
+      const paid = await payBurn(offer);
       if (paid.error === 'no-wallet') {
         toast(t('needWallet'), true);
         return;
       }
-      res = await send({ 'x-payment': paid.header });
+      res = await send({ 'x-payment-tx': paid.tx });
     }
     const data = await res.json();
     if (res.status === 402) {

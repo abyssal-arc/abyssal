@@ -6,11 +6,11 @@
  * USDC transfer and pays the gas. On Arc the settlement is final immediately,
  * which is what lets an intervention land in the same tick as the payment.
  *
- * Enabled by SELLER_PRIVATE_KEY in the environment (the key controlling
- * `payTo`). Without it there is no way to pay: interventions answer 503 while
- * the observatory stays free to watch. Settlement defaults to Arc mainnet
- * (eip155:5042); X402_TESTNET=1 opts into the keyless Arc testnet trial
- * (eip155:5042002) for dry runs.
+ * RESERVED: interventions do not use this module. They are paid by burning
+ * ABYS and proven with a burn receipt (see payments.ts). What remains here is
+ * the USDC path for a future paid data tier: enabled by SELLER_PRIVATE_KEY
+ * (the key controlling `payTo`), settling on Arc mainnet (eip155:5042), or on
+ * the keyless Arc testnet trial (eip155:5042002) with X402_TESTNET=1.
  */
 import { keccak256, recoverTypedDataAddress, toBytes } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';

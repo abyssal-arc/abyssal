@@ -15,17 +15,14 @@ import { SyntheticFeed, type ChainFeed } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
   ABYS_PRICES,
+  burnOffer,
   CHAIN_ID,
   explorerTxUrl,
   NETWORK,
-  PRICES_USDC,
+  tokenAddress,
+  verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
-import {
-  exactRequirement,
-  facilitatorConfig,
-  settleFromRequest,
-} from './facilitator.js';
 import { serveStatic } from './static.js';
 
 export interface AppOptions {
@@ -96,10 +93,10 @@ export function createApp(options: AppOptions = {}) {
     (arcFeed
       ? { name: 'arc-usdc-flow', sample: async () => arcFeed.market() }
       : new SyntheticMarketFeed());
-  // Real x402 settlement (Circle Facilitator Service) on Arc. Null until the
-  // operator sets SELLER_PRIVATE_KEY; interventions then answer 503 instead of
-  // pretending to be paid. There is no demo path.
-  const fac = facilitatorConfig();
+  // Interventions are paid by burning ABYS: no seller key, no facilitator,
+  // the receipt is the proof. Until the token address is configured there is
+  // nothing to burn and /intervene answers 503. There is no demo path.
+  const rpcUrl = process.env.ARC_RPC_URL ?? 'https://rpc.mainnet.arc.io';
   let timer: ReturnType<typeof setInterval> | null = null;
   let chainTemp = 0.5;
   let chainDelta = 0;
@@ -302,14 +299,13 @@ export function createApp(options: AppOptions = {}) {
       network: NETWORK,
       chainId: CHAIN_ID,
       prices: ABYS_PRICES,
-      pricesUsdc: PRICES_USDC,
       paymentAsset: 'ABYSSAL',
-      // How POST /intervene is paid: real x402 settlement through Circle's
-      // Facilitator Service, or 'unconfigured' until the operator sets
-      // SELLER_PRIVATE_KEY. The UI badges the intervention panel with this.
-      payment: fac
-        ? { mode: 'x402', network: fac.network, payTo: fac.payTo, trial: fac.chainId !== 5042 }
-        : { mode: 'unconfigured', network: null, payTo: null, trial: false },
+      // How POST /intervene is paid: the visitor burns ABYS and presents the
+      // burn receipt, or 'unconfigured' until ABYS_TOKEN_ADDRESS is set. The UI
+      // badges the intervention panel with this.
+      payment: tokenAddress()
+        ? { mode: 'burn', network: `eip155:${CHAIN_ID}`, token: tokenAddress() }
+        : { mode: 'unconfigured', network: null, token: null },
     };
   }
 
@@ -383,7 +379,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /observe': 'Arc USDC flow observatory: stats, endpoint ranking, pulse, recent flows (available:false off-Arc)',
-        'POST /intervene': 'x402-gated intervention (feed/poison/bloom/drought): real USDC on Arc settled by Circle Facilitator Service; 503 until the operator configures a seller key',
+        'POST /intervene': 'intervention (feed/poison/bloom/drought) paid by burning ABYS on Arc; the burn receipt is the payment proof; 503 until ABYS_TOKEN_ADDRESS is set',
         'POST /tick': 'debug: advance one tick manually',
         'GET /ui': 'redirects to /',
       },
@@ -400,7 +396,7 @@ export function createApp(options: AppOptions = {}) {
         headers: {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type,x-payment,x-payment-tx',
+          'access-control-allow-headers': 'content-type,x-payment-tx',
         },
       });
     }
@@ -488,20 +484,21 @@ export function createApp(options: AppOptions = {}) {
       if (!INTERVENTION_TYPES.includes(type)) {
         return json({ error: 'unknown intervention type', types: INTERVENTION_TYPES }, 400);
       }
-      if (!fac) {
+      const token = tokenAddress();
+      if (!token) {
         return json(
-          { error: 'settlement not configured', hint: 'the operator must set SELLER_PRIVATE_KEY' },
+          { error: 'token not deployed', hint: 'the operator must set ABYS_TOKEN_ADDRESS' },
           503,
         );
       }
-      const exactOffer = exactRequirement(fac, PRICES_USDC[type]);
-      const settlement = await settleFromRequest(req, fac, exactOffer);
-      if (!settlement.ok) {
-        return json({
-          error: 'payment required',
-          accepts: [exactOffer],
-          reason: settlement.reason,
-        }, 402);
+      const offer = burnOffer(type);
+      const txHash = String(req.headers.get('x-payment-tx') ?? body.tx ?? '');
+      if (!txHash) {
+        return json({ error: 'payment required', accepts: [offer] }, 402);
+      }
+      const verdict = await verifyBurnReceipt(rpcUrl, offer, txHash);
+      if (!verdict.ok) {
+        return json({ error: 'payment required', accepts: [offer], reason: verdict.reason }, 402);
       }
       const intervention = buildIntervention(body);
       if (!intervention) {
@@ -514,7 +511,7 @@ export function createApp(options: AppOptions = {}) {
         affected: result.affected,
         amount: result.amount,
         tick: world.tick,
-        settlement: { tx: settlement.tx, payer: settlement.payer, network: fac.network },
+        settlement: { tx: txHash, payer: verdict.payer, burned: offer.amount, network: offer.network },
       });
     }
 
