@@ -575,6 +575,26 @@ test('FlowMeter calibrates by rank: bounded, median-centred, outlier-proof', asy
   }
 });
 
+test('/intervene accepts same-origin https posts and rejects foreign pages', async () => {
+  const app = createApp({ seed: 1 });
+  const same = await app.fetch(
+    new Request('https://abyssal-arc.com/intervene', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://abyssal-arc.com' },
+      body: JSON.stringify({ type: 'feed', x: 100, y: 100 }),
+    }),
+  );
+  assert.notEqual(same.status, 403, 'same-origin https must not trip the gate');
+  const foreign = await app.fetch(
+    new Request('https://abyssal-arc.com/intervene', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+      body: JSON.stringify({ type: 'feed', x: 100, y: 100 }),
+    }),
+  );
+  assert.equal(foreign.status, 403);
+});
+
 test('invalid params are rejected before the burn receipt is consumed', async () => {
   const app = createApp({ seed: 1 });
   const hash = '0x' + 'b9'.repeat(32);

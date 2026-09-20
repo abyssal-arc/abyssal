@@ -515,7 +515,7 @@ export function createApp(options: AppOptions = {}) {
   // Origin on same-origin POSTs too, so this only blocks foreign pages.
       const origin = req.headers.get('origin');
       const allowlist = (process.env.CORS_ORIGINS ?? '').split(',').filter(Boolean);
-      if (origin && origin !== `http://${req.headers.get('host')}` && !allowlist.includes(origin)) {
+      if (origin && origin !== new URL(req.url).origin && !allowlist.includes(origin)) {
         return json({ error: 'cross-origin interventions are not allowed' }, 403);
       }
       const type = body?.type as InterventionType;
