@@ -49,14 +49,14 @@ test('402 advertises the ABYS burn offer on Arc mainnet', async () => {
   assert.equal(req.settle, 'burn');
   assert.equal(req.network, 'eip155:5042');
   assert.equal(req.asset, process.env.ABYS_TOKEN_ADDRESS);
-  assert.equal(req.amount, '50000000000'); // 50,000 ABYS in base units
+  assert.equal(req.amount, '100000000000'); // 100,000 ABYS in base units
 });
 
 test('402 amounts follow the ABYS price list in base units', async () => {
   const app = createApp({ seed: 1 });
   for (const [type, base] of [
-    ['feed', '50000000000'],
-    ['poison', '100000000000'],
+    ['feed', '100000000000'],
+    ['poison', '150000000000'],
     ['bloom', '200000000000'],
     ['drought', '200000000000'],
   ] as const) {
@@ -85,7 +85,7 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   const { verifyBurnReceipt, burnOffer, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
   const token = process.env.ABYS_TOKEN_ADDRESS as string;
   const payer = '0x' + 'ab'.repeat(20);
-  const PRICE = 50_000_000_000n; // 50,000 ABYS in base units
+  const PRICE = 100_000_000_000n; // 100,000 ABYS in base units
   const stub = (receipt: unknown) =>
     createServer((req, res) => {
       res.setHeader('content-type', 'application/json');

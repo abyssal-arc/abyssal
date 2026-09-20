@@ -176,8 +176,8 @@ Four interventions (`packages/server/src/payments.ts`):
 
 | Intervention | ABYS (burned) | Effect |
 | --- | --- | --- |
-| `feed` | 50,000 | Drop food in a target area |
-| `poison` | 100,000 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
+| `feed` | 100,000 | Drop food in a target area |
+| `poison` | 150,000 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
 | `bloom` | 200,000 | Global food spawn ×2 (2400 ticks = 10 min) |
 | `drought` | 200,000 | Global food spawn halted (2400 ticks = 10 min) |
 
