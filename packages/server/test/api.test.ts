@@ -49,16 +49,16 @@ test('402 advertises the ABYS burn offer on Arc mainnet', async () => {
   assert.equal(req.settle, 'burn');
   assert.equal(req.network, 'eip155:5042');
   assert.equal(req.asset, process.env.ABYS_TOKEN_ADDRESS);
-  assert.equal(req.amount, '35000000'); // 35 ABYS in base units
+  assert.equal(req.amount, '50000000000'); // 50,000 ABYS in base units
 });
 
 test('402 amounts follow the ABYS price list in base units', async () => {
   const app = createApp({ seed: 1 });
   for (const [type, base] of [
-    ['feed', '35000000'],
-    ['poison', '70000000'],
-    ['bloom', '175000000'],
-    ['drought', '175000000'],
+    ['feed', '50000000000'],
+    ['poison', '100000000000'],
+    ['bloom', '200000000000'],
+    ['drought', '200000000000'],
   ] as const) {
     const res = await app.fetch(post('/intervene', { type, x: 10, y: 10 }));
     assert.equal(res.status, 402);
@@ -85,69 +85,48 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   const { verifyBurnReceipt, burnOffer, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
   const token = process.env.ABYS_TOKEN_ADDRESS as string;
   const payer = '0x' + 'ab'.repeat(20);
+  const PRICE = 50_000_000_000n; // 50,000 ABYS in base units
   const stub = (receipt: unknown) =>
     createServer((req, res) => {
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: receipt }));
     });
-  const burnLog = (to: string, value: string, addr = token) => ({
+  const burnLog = (to: string, value: bigint, addr = token) => ({
     address: addr,
     topics: [TRANSFER_TOPIC, `0x${payer.slice(2).padStart(64, '0')}`, to],
-    data: value,
+    data: `0x${value.toString(16)}`,
   });
   const offer = burnOffer('feed');
+  const run = async (receipt: unknown, hash: string) => {
+    const srv = stub(receipt);
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+    try {
+      return await verifyBurnReceipt(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`, offer, hash);
+    } finally {
+      srv.close();
+    }
+  };
 
-  const ok = stub({
-    status: '0x1',
-    logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))],
-  });
-  await new Promise<void>((r) => ok.listen(0, '127.0.0.1', () => r()));
-  const url = `http://127.0.0.1:${(ok.address() as AddressInfo).port}`;
-  const v = await verifyBurnReceipt(url, offer, '0x' + 'a1'.repeat(32));
+  const v = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a1'.repeat(32));
   assert.equal(v.ok, true);
   assert.equal(v.payer, payer);
-  ok.close();
 
-  const bad = stub({ status: '0x1', logs: [burnLog(payer, '0x' + (35_000_000).toString(16))] });
-  await new Promise<void>((r) => bad.listen(0, '127.0.0.1', () => r()));
-  const v2 = await verifyBurnReceipt(
-    `http://127.0.0.1:${(bad.address() as AddressInfo).port}`,
-    offer,
-    '0x' + 'a2'.repeat(32),
-  );
+  const v2 = await run({ status: '0x1', logs: [burnLog(payer, PRICE)] }, '0x' + 'a2'.repeat(32));
   assert.equal(v2.ok, false, 'a transfer to a person is not a burn');
-  bad.close();
 
-  const low = stub({ status: '0x1', logs: [burnLog(BURN_SINK, '0x' + (34_999_999).toString(16))] });
-  await new Promise<void>((r) => low.listen(0, '127.0.0.1', () => r()));
-  const v3 = await verifyBurnReceipt(
-    `http://127.0.0.1:${(low.address() as AddressInfo).port}`,
-    offer,
-    '0x' + 'a3'.repeat(32),
-  );
+  const v3 = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE - 1n)] }, '0x' + 'a3'.repeat(32));
   assert.equal(v3.ok, false, 'underpaying must not settle');
-  low.close();
 
-  const reverted = stub({ status: '0x0', logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))] });
-  await new Promise<void>((r) => reverted.listen(0, '127.0.0.1', () => r()));
-  const v4 = await verifyBurnReceipt(
-    `http://127.0.0.1:${(reverted.address() as AddressInfo).port}`,
-    offer,
-    '0x' + 'a4'.repeat(32),
-  );
+  const v4 = await run({ status: '0x0', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a4'.repeat(32));
   assert.equal(v4.ok, false);
   assert.equal(v4.reason, 'transaction reverted');
-  reverted.close();
 
-  const twice = stub({ status: '0x1', logs: [burnLog(BURN_SINK, '0x' + (35_000_000).toString(16))] });
-  await new Promise<void>((r) => twice.listen(0, '127.0.0.1', () => r()));
   const hash = '0x' + 'a5'.repeat(32);
-  const first = await verifyBurnReceipt(`http://127.0.0.1:${(twice.address() as AddressInfo).port}`, offer, hash);
-  const second = await verifyBurnReceipt(`http://127.0.0.1:${(twice.address() as AddressInfo).port}`, offer, hash);
+  const first = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
+  const second = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
   assert.equal(first.ok, true);
   assert.equal(second.ok, false, 'one burn buys one intervention');
   assert.equal(second.reason, 'receipt already used');
-  twice.close();
 });
 
 test('/state exposes marketTemp plus harvest and judgment countdowns', async () => {

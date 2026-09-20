@@ -29,10 +29,10 @@ export const BURN_SINK = '0x0000000000000000000000000000000000000000000000000000
 
 /** ABYS prices per intervention, whole tokens (6 decimals on-chain). */
 export const ABYS_PRICES: Record<InterventionType, string> = {
-  feed: '35',
-  poison: '70',
-  bloom: '175',
-  drought: '175',
+  feed: '50000',
+  poison: '100000',
+  bloom: '200000',
+  drought: '200000',
 };
 
 /** Null until the operator deploys ABYS and exports ABYS_TOKEN_ADDRESS. */

@@ -175,10 +175,10 @@ Four interventions (`packages/server/src/payments.ts`):
 
 | Intervention | ABYS (burned) | Effect |
 | --- | --- | --- |
-| `feed` | 35 | Drop food in a target area |
-| `poison` | 70 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
-| `bloom` | 175 | Global food spawn ×2 (2400 ticks = 10 min) |
-| `drought` | 175 | Global food spawn halted (2400 ticks = 10 min) |
+| `feed` | 50,000 | Drop food in a target area |
+| `poison` | 100,000 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
+| `bloom` | 200,000 | Global food spawn ×2 (2400 ticks = 10 min) |
+| `drought` | 200,000 | Global food spawn halted (2400 ticks = 10 min) |
 
 `POST /intervene` is paid by destruction. The 402 response carries one `exact`
 offer naming the ABYS contract and an amount in base units; the wallet sends a
