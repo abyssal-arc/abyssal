@@ -1,6 +1,5 @@
 # ABYSSAL
 
-![ABYSSAL — the x402 observatory](packages/web/assets/banner.png)
 
 **Site: [abyssal-arc.com](https://abyssal-arc.com)** · token **ABYS**
 
