@@ -25,11 +25,16 @@ import {
   verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
-import { serveStatic } from './static.js';
 
 export interface AppOptions {
   seed?: number;
-  webRoot?: string;
+  /**
+   * Serves static files when provided (the node adapter passes one backed by
+   * node:fs). Keeping it injected keeps this module free of node builtins, so
+   * the same handler runs inside a Cloudflare Worker where static assets come
+   * from the runtime instead.
+   */
+  static?: (pathname: string, headers: Headers) => Promise<Response | null>;
   /** Serialized world snapshot (sim `toJSON`) to resume instead of seeding a fresh world. */
   snapshot?: string;
   chainFeed?: ChainFeed;
@@ -100,6 +105,7 @@ export function createApp(options: AppOptions = {}) {
   // nothing to burn and /intervene answers 503. There is no demo path.
   const rpcUrl = process.env.ARC_RPC_URL ?? 'https://rpc.mainnet.arc.io';
   let timer: ReturnType<typeof setInterval> | null = null;
+  let lastAdvanceAt = Date.now();
   let chainTemp = 0.5;
   let chainDelta = 0;
   let marketTemp = 0.5;
@@ -178,6 +184,7 @@ export function createApp(options: AppOptions = {}) {
       });
     }
     if (txRain.length > 12) txRain = txRain.slice(-12);
+    lastAdvanceAt = Date.now();
   }
 
   /**
@@ -419,8 +426,8 @@ export function createApp(options: AppOptions = {}) {
     if (req.method === 'GET' && path === '/') {
       // The web frontend lives at the root; without a webRoot (embedded API
       // use) fall back to the endpoint index JSON.
-      if (options.webRoot) {
-        const res = await serveStatic(options.webRoot, '/index.html', req.headers);
+      if (options.static) {
+        const res = await options.static('/index.html', req.headers);
         if (res) return res;
       }
       return json(apiIndex());
@@ -528,8 +535,8 @@ export function createApp(options: AppOptions = {}) {
       });
     }
 
-    if (req.method === 'GET' && options.webRoot) {
-      const res = await serveStatic(options.webRoot, path, req.headers);
+    if (req.method === 'GET' && options.static) {
+      const res = await options.static(path, req.headers);
       if (res) return res;
     }
 
@@ -539,6 +546,21 @@ export function createApp(options: AppOptions = {}) {
   return {
     fetch,
     world,
+    /**
+     * Advance the world to wall-clock now for runtimes that cannot hold a
+     * 250ms interval (a Worker isolate sleeps between requests). The chain is
+     * sampled once and the elapsed ticks are replayed with it, capped so a
+     * long idle gap cannot stall a request.
+     */
+    async catchUp(maxTicks = 240): Promise<number> {
+      const elapsed = Math.min(maxTicks, Math.floor((Date.now() - lastAdvanceAt) / 250));
+      if (elapsed <= 0) return 0;
+      await advance();
+      for (let i = 1; i < elapsed; i++) {
+        tickWorld(world, { chain: chainTemp, market: marketTemp }, []);
+      }
+      return elapsed;
+    },
     start(ms = 250): void {
       if (timer) return;
       timer = setInterval(() => {

@@ -13,6 +13,7 @@ import { toJSON } from '@abyssal/sim';
 import { compressible, encodeBody } from './compress.js';
 import { createApp } from './handler.js';
 import { setBurnLedger } from './payments.js';
+import { serveStatic } from './static.js';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const TICK_MS = Number(process.env.TICK_MS ?? 250);
@@ -53,7 +54,7 @@ setBurnLedger({
 
 const snapshot = process.env.FRESH_WORLD ? undefined : loadSnapshot();
 const app = createApp({
-  webRoot,
+  static: (pathname, headers) => serveStatic(webRoot, pathname, headers),
   seed: Number(process.env.SEED ?? 1337),
   snapshot,
 });

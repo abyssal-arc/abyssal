@@ -1,0 +1,21 @@
+name = "abyssal"
+main = "packages/server/src/worker.ts"
+compatibility_date = "2026-09-01"
+
+# The web client ships as Workers Static Assets; any path that is not a file
+# falls through to the Worker and routes into the Durable Object.
+[assets]
+directory = "./packages/web"
+
+[[durable_objects.bindings]]
+name = "WORLD"
+class_name = "AbyssalWorld"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["AbyssalWorld"]
+
+# Keeps the ecosystem ticking with zero viewers; per-request catchUp covers
+# the gaps between alarms.
+[triggers]
+crons = ["* * * * *"]

@@ -2,6 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
 import { createApp } from '../src/handler.js';
+import { serveStatic } from '../src/static.js';
 import {
   ARC_USDC,
   exactRequirement,
@@ -205,7 +206,7 @@ test('GET / serves the web frontend, GET /api serves the endpoint index', async 
   const { dirname, join } = await import('node:path');
   const { fileURLToPath } = await import('node:url');
   const webRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'web');
-  const app = createApp({ seed: 1, webRoot });
+  const app = createApp({ seed: 1, static: (p, h) => serveStatic(webRoot, p, h) });
 
   const root = await app.fetch(new Request('http://localhost/'));
   assert.equal(root.status, 200);

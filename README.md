@@ -152,6 +152,26 @@ chain this week rather than against a fixed number. Off Arc it defaults to
 calmer pre/after-market, near-zero on weekends). See
 `packages/server/src/market.ts`.
 
+## Deploy (Cloudflare Workers)
+
+The handler carries no node builtins, so the same code runs as a Worker: the
+world lives in one Durable Object (`AbyssalWorld`), a one-minute cron alarm
+keeps time flowing with zero viewers, and snapshots persist in the object's
+storage between isolates. The web client ships as Workers Static Assets; any
+path that is not a file routes into the object.
+
+```bash
+npx wrangler login                 # once, browser OAuth
+npx wrangler secret put ABYS_TOKEN_ADDRESS   # the deployed token contract
+npx wrangler deploy                # assets + worker + DO migration
+```
+
+Bind `abyssal-arc.com` by adding it as a Cloudflare zone (NS switch at the
+registrar) and then Workers → Custom domains, or a `routes` entry in
+`wrangler.toml`. Cloudflare issues a free Universal SSL certificate for the
+zone automatically and the custom domain terminates on it; there is no
+certificate management anywhere in this repo.
+
 ## API
 
 | Method | Path | Description |
