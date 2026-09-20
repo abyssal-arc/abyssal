@@ -34,10 +34,17 @@
       <button id="help-btn" class="icon-btn" data-i18n-title="helpTip" title="How to play">?</button>
       <button id="shake-toggle" class="icon-btn active" data-i18n-title="shakeTip" title="Screen shake">FX</button>
       <div class="langs">
-        <button data-lang="en">EN</button>
-        <button data-lang="zh">中文</button>
-        <button data-lang="ja">日本語</button>
-        <button data-lang="ko">한국어</button>
+        <button id="lang-btn" class="icon-btn" aria-haspopup="listbox" aria-expanded="false" data-i18n-title="languageTip" title="Language">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3c2.8 2.6 4.2 5.6 4.2 9s-1.4 6.4-4.2 9c-2.8-2.6-4.2-5.6-4.2-9s1.4-6.4 4.2-9z"></path></svg>
+        </button>
+        <div id="lang-menu" class="lang-menu glass" role="listbox" hidden>
+          <button role="option" data-lang="en">English</button>
+          <button role="option" data-lang="fr">Français</button>
+          <button role="option" data-lang="de">Deutsch</button>
+          <button role="option" data-lang="zh">中文</button>
+          <button role="option" data-lang="ja">日本語</button>
+          <button role="option" data-lang="ko">한국어</button>
+        </div>
       </div>
     </div>
   </header>

@@ -283,19 +283,32 @@ body.view-observe {
 .icon-btn:hover { border-color: var(--accent); color: var(--fg-1); }
 .icon-btn.active { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 10px var(--accent-dim); }
 
-.langs { display: flex; gap: calc(var(--sp)); }
-.langs button {
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  color: var(--fg-3);
-  font-size: 11px;
-  padding: 3px 8px;
-  cursor: pointer;
-  transition: all var(--ease);
+.langs { position: relative; }
+.lang-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  min-width: 118px;
+  padding: calc(var(--sp));
 }
-.langs button:hover { color: var(--fg-1); }
-.langs button.active { color: var(--accent); border-color: var(--accent); }
+.lang-menu[hidden] { display: none; }
+.lang-menu button {
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: var(--fg-2);
+  font-size: 12px;
+  text-align: left;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: color var(--ease), background var(--ease);
+}
+.lang-menu button:hover { color: var(--fg-1); background: rgba(120, 160, 220, 0.08); }
+.lang-menu button.active { color: var(--accent); }
+.langs .icon-btn svg { display: block; }
 
 /* ---------- floating panels ---------- */
 .panel {
