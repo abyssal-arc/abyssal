@@ -3139,13 +3139,25 @@ async function payBurn(offer) {
   }
   const accounts = approved?.length ? approved : await eth.request({ method: 'eth_accounts' });
   const from = accounts[0];
-  // transfer(blackhole, amount): works on any ERC-20, no burn() required, and
-  // reads as burning in every explorer. selector a9059cbb + dead + amount.
+  // Two burn conventions exist and tokens differ on which they allow: some
+  // implement burn(), others forbid transfers to the blackhole. Preflight both
+  // with eth_call and send whichever the contract itself says will succeed, so
+  // the wallet never shows a generic "third-party contract failed" revert.
   const amount = BigInt(offer.amount).toString(16).padStart(64, '0');
   const dead = '000000000000000000000000000000000000000000000000000000000000dead';
+  const candidates = [`0x42966c68${amount}`, `0xa9059cbb${dead}${amount}`];
+  let data = null;
+  for (const d of candidates) {
+    try {
+      await eth.request({ method: 'eth_call', params: [{ from, to: offer.asset, data: d }, 'latest'] });
+      data = d;
+      break;
+    } catch { /* this convention reverts for this token */ }
+  }
+  if (!data) return { error: 'preflight-failed' };
   const tx = await eth.request({
     method: 'eth_sendTransaction',
-    params: [{ from, to: offer.asset, data: `0xa9059cbb${dead}${amount}` }],
+    params: [{ from, to: offer.asset, data }],
   });
   return { tx };
 }
@@ -3190,6 +3202,10 @@ async function intervene(body) {
       const paid = await payBurn(offer);
       if (paid.error === 'no-wallet') {
         toast(t('needWallet'), true);
+        return;
+      }
+      if (paid.error === 'preflight-failed') {
+        toast(t('payPreflight', { amount: offer.amount }), true);
         return;
       }
       // The burn needs a block or two before its receipt exists; retry while
