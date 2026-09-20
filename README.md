@@ -112,11 +112,13 @@ Tip: plain `npm run dev` already talks to the real Arc mainnet RPC. There is
 no flag to flip. The Arc feed indexes the **USDC transfer flow**, which is what
 powers both the observatory and the ecosystem's food economy.
 
-The live feed is **self-calibrating**: it keeps a slow EWMA baseline of
-per-block tx count and gasUsed, and maps current/baseline through a logistic
-(~0.5 = average load) instead of hardcoded reference values. On 5 consecutive
-RPC failures the server degrades to the synthetic feed (`feedStatus:
-"degraded"` in `/state`) and switches back automatically on recovery.
+The temperatures calibrate themselves by rank: every poll is scored against
+the polls of the last few minutes and reported as its percentile in that
+window, so there are no reference throughputs to retune when Arc's absolute
+volume moves, and a single whale settlement cannot stretch the scale for
+everybody else. On 5 consecutive RPC failures the server degrades to the
+synthetic feed (`feedStatus: "degraded"` in `/state`) and switches back
+automatically on recovery.
 
 ### Bandwidth
 
@@ -142,10 +144,12 @@ uncompressed, and **0** while the tab is hidden.
 | Judgment day | 19200 | 80 min |
 
 The market sense is the **turbulence of the stablecoin flow** on Arc
-(`arc-usdc-flow`: coefficient of variation of per-poll USDC volume over a
-rolling window), i.e. how turbulent the stablecoin flow is right now. Off Arc it defaults to `SyntheticMarketFeed` (US equities session
-rhythm: volatile 9:30-16:00 ET, calmer pre/after-market, near-zero on
-weekends). See `packages/server/src/market.ts`.
+(`arc-usdc-flow`): the size of the volume swing between polls, reported as a
+percentile of recent swings, so "volatile" always means volatile for this
+chain this week rather than against a fixed number. Off Arc it defaults to
+`SyntheticMarketFeed` (US equities session rhythm: volatile 9:30-16:00 ET,
+calmer pre/after-market, near-zero on weekends). See
+`packages/server/src/market.ts`.
 
 ## API
 
@@ -196,6 +200,14 @@ verification: after the client transfers and retries with the hash in
 `X-Payment-Tx`, scan that transaction for the ERC-20 `Transfer` event (token
 contract, recipient, amount, confirmations) with txHash replay protection.
 `TOKEN_ADDRESS` is `null` until the token is deployed.
+
+Money enters this simulation only as weather. A paid intervention changes the
+environment (food, drains, spawn rates) and a chain transfer becomes plankton
+at a landing site; no code path writes a payment, a price or a settlement
+outcome into an individual creature's genome or brain, and the sim never pays
+anybody back. There is no agent-to-agent transfer, no prediction market and no
+reward stream: ABYS is only a discounted unit for buying environment
+perturbations. `sim.test.ts` pins the environment-only half of that boundary.
 
 Either way, an unpaid request gets **HTTP 402** with a body like:
 

@@ -645,3 +645,27 @@ test('predation: a whale takes one meal per hunt cooldown, not one per tick', ()
     'a digesting whale leaves the rest of the pod alone',
   );
 });
+
+test('money is weather: payments and tx rain never rewrite a living genome', () => {
+  const w = createWorld(5);
+  for (let i = 0; i < 40; i++) tick(w, { chain: 0.6, market: 0.5 }, []);
+  const before = new Map(w.creatures.map((c) => [c.id, JSON.stringify(c.genome)]));
+  assert.ok(before.size > 0);
+
+  applyIntervention(w, { type: 'feed', x: 500, y: 500, radius: 200 });
+  const rain = [
+    { hash: '0x' + 'ab'.repeat(32), size: 0.95 },
+    { hash: '0x' + 'cd'.repeat(32), size: 0.2 },
+  ];
+  for (let i = 0; i < 30; i++) tick(w, { chain: 0.9, market: 0.9 }, i === 0 ? rain : []);
+
+  // Survivors keep exactly the genome they were born with: money may move
+  // food around and cull the weak, but it must never edit an individual.
+  // Creatures born inside the window are skipped, mutation at birth is the
+  // only place a genome is allowed to change.
+  for (const c of w.creatures) {
+    const b = before.get(c.id);
+    if (b === undefined) continue;
+    assert.equal(JSON.stringify(c.genome), b, `creature ${c.id} had its genome rewritten by money`);
+  }
+});

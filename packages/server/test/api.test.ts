@@ -463,3 +463,33 @@ test('/snapshot?tx= replays only the meteors the client has not seen', async () 
   const fallback = await rain('since=0&tx=0xnotawindowmember');
   assert.deepEqual(fallback.map((t) => t.hash), (await rain('since=0')).map((t) => t.hash));
 });
+
+test('FlowMeter calibrates by rank: bounded, median-centred, outlier-proof', async () => {
+  const { FlowMeter } = await import('../src/arc.js');
+
+  const m = new FlowMeter(60, 0.5);
+  for (let i = 0; i < 80; i++) m.read(10 + (i % 3));
+  const calm = m.value;
+  assert.ok(calm > 0.35 && calm < 0.65, `a stationary flow should sit near the middle, got ${calm}`);
+
+  // A step up reads hot while it is unusual relative to the recent window.
+  for (let i = 0; i < 10; i++) m.read(1000);
+  assert.ok(m.value > 0.8, 'a sudden sustained spike must read hot');
+
+  // And re-centres once the spike IS the recent regime: rank measures
+  // unusualness, not absolute throughput, so growth never pins it at 1.
+  for (let i = 0; i < 140; i++) m.read(1000);
+  assert.ok(m.value > 0.35 && m.value < 0.65, `a settled new regime must re-centre, got ${m.value}`);
+
+  // One absurd settlement must not stretch the scale for the polls after it.
+  const n = new FlowMeter(60, 1);
+  for (let i = 0; i < 40; i++) n.read(10);
+  n.read(1e12);
+  const after = n.read(10);
+  assert.ok(after < 0.6, `an ordinary poll after a whale must not read saturated, got ${after}`);
+
+  for (const v of [-5, 0, 1e18]) {
+    const r = m.read(v);
+    assert.ok(r >= 0 && r <= 1, 'percentile must stay inside [0,1]');
+  }
+});

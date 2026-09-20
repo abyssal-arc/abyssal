@@ -9,11 +9,14 @@
  *  - Every transfer also becomes a food meteor (ChainTx) with provenance in
  *    `meta`, so clicking a meteor in the world view can show the real
  *    payment behind it.
- *  - Chain temperature: EWMA-baselined logistic of per-poll transfer count
- *    and volume, self-calibrating against a slow EWMA baseline.
- *  - Market temperature (`market()`): coefficient of variation of per-poll
- *    USDC volume over a rolling window, baselined the same way: how
- *    turbulent the stablecoin flow is.
+ *  - Chain temperature: the empirical percentile of this poll's flow
+ *    intensity (transfer count plus volume, both log-scaled) among the polls
+ *    of the last few minutes. Order-statistics instead of a fitted curve, so
+ *    there is no gain or baseline constant to retune when the chain's
+ *    absolute level moves.
+ *  - Market temperature (`market()`): the same percentile trick applied to
+ *    the size of the volume swing between polls, i.e. how unusual the current
+ *    turbulence is relative to recent turbulence.
  *  - x402 heuristic: EIP-3009 authorized transfers are submitted by a
  *    facilitator/relayer, so `tx.from != transfer.from` marks a relayed
  *    (x402-style, gasless-for-payer) settlement. Only resolvable for live
@@ -65,9 +68,41 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
-/** r=1 -> 0.5 (average), r=2 -> ~0.98 (hot), r=0.5 -> ~0.12 (quiet). */
-function logistic(r: number): number {
-  return 1 / (1 + Math.exp(-4 * (r - 1)));
+/**
+ * Self-calibration by rank. Arc's USDC flow has no stable absolute scale: one
+ * poll carries $4 of dust, the next a $4M settlement, and the daily level
+ * drifts as the machine-payment economy grows, so any fixed threshold would
+ * pin the temperature at an extreme within days. Scoring each poll against
+ * the polls we actually saw recently needs no such threshold: the reading is
+ * the fraction of the window below the current score, bounded by
+ * construction, and a single whale transfer cannot stretch the scale for
+ * everybody else because ranks only care about order.
+ */
+export class FlowMeter {
+  private window: number[] = [];
+  private smooth: number | null = null;
+
+  constructor(private maxWindow = 90, private ema = 0.3) {}
+
+  /** Fold in one score and return the smoothed mid-rank percentile 0..1. */
+  read(score: number): number {
+    let below = 0;
+    let equal = 0;
+    for (const v of this.window) {
+      if (v < score) below++;
+      else if (v === score) equal++;
+    }
+    // Mid-rank so a perfectly flat window reads as middle, not as coldest.
+    const rank = this.window.length === 0 ? 0.5 : (below + equal / 2) / this.window.length;
+    this.window.push(score);
+    if (this.window.length > this.maxWindow) this.window.shift();
+    this.smooth = this.smooth === null ? rank : this.smooth + this.ema * (rank - this.smooth);
+    return clamp01(this.smooth);
+  }
+
+  get value(): number {
+    return this.smooth === null ? 0.5 : this.smooth;
+  }
 }
 
 function hex(n: number): string {
@@ -89,10 +124,6 @@ function amountOf(data: string): number {
 /** $0.01 -> ~0.13, $10 -> ~0.21, $1k -> ~0.6, $100k -> 1.0 (meteor size). */
 function sizeOf(amount: number): number {
   return clamp01(Math.log10(amount + 1) / 5);
-}
-
-function avg(xs: number[]): number {
-  return xs.length === 0 ? 0 : xs.reduce((s, v) => s + v, 0) / xs.length;
 }
 
 /* ---------- chain whales: the tank as a live map of top on-chain actors ---------- */
@@ -222,10 +253,10 @@ export class ArcUsdcFeed implements ChainFeed {
   private whaleCache: Map<string, WhaleRow> = new Map();
   private whaleCacheT = 0;
 
-  private countEwm: number | null = null;
-  private volEwm: number | null = null;
-  private cvEwm = 0.5;
-  private heatWindow: number[] = [];
+  private level = new FlowMeter();
+  private turbulence = new FlowMeter();
+  private chainTemp = 0.5;
+  private prevVolume = 0;
   private prevTemp = 0.5;
   private marketTemp = 0.5;
 
@@ -254,7 +285,7 @@ export class ArcUsdcFeed implements ChainFeed {
     // the last computed temperature (stale-while-revalidate). Awaiting here
     // bunches ticks into a burst the moment the poll resolves, which the
     // frontend reads as a stutter every poll interval.
-    const temp = this.heatWindow.length > 0 ? avg(this.heatWindow) : this.prevTemp;
+    const temp = this.chainTemp;
     const delta = temp - this.prevTemp;
     this.prevTemp = temp;
     return { temp, delta, blockNumber: this.lastBlock >= 0 ? this.lastBlock : undefined };
@@ -529,7 +560,7 @@ export class ArcUsdcFeed implements ChainFeed {
           .sort((a, b) => a - b)
           .map((k) => buckets.get(k)!)
           .slice(-this.maxPulse);
-        return; // baselines are seeded by the first live polls instead
+        return; // the meters start ranking from the first live polls
       }
 
       const bucketKey = Math.floor(now / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
@@ -543,31 +574,13 @@ export class ArcUsdcFeed implements ChainFeed {
       }
       if (this.pulse.length > this.maxPulse) this.pulse.splice(0, this.pulse.length - this.maxPulse);
 
-      // Self-calibrating temperatures (skip the very first live poll, which
-      // seeds the baselines, so the ratio is never garbage).
-      if (this.countEwm === null || this.volEwm === null) {
-        this.countEwm = Math.max(1, count);
-        this.volEwm = Math.max(1, volume);
-      } else {
-        const heat = clamp01(
-          0.5 * logistic(count / Math.max(1, this.countEwm)) +
-            0.5 * logistic(volume / Math.max(1, this.volEwm)),
-        );
-        this.heatWindow.push(heat);
-        if (this.heatWindow.length > 12) this.heatWindow.shift();
-        this.countEwm = this.countEwm * 0.97 + count * 0.03;
-        this.volEwm = this.volEwm * 0.97 + volume * 0.03;
-      }
-
-      // Market temperature: how turbulent is the flow volume right now?
-      const win = this.pulse.slice(-30).map((p) => p.volume);
-      if (win.length >= 6) {
-        const mean = Math.max(1e-9, avg(win));
-        const sd = Math.sqrt(avg(win.map((v) => (v - mean) ** 2)));
-        const cv = sd / mean;
-        this.marketTemp = clamp01(logistic(cv / Math.max(0.05, this.cvEwm)));
-        this.cvEwm = this.cvEwm * 0.97 + cv * 0.03;
-      }
+      // Both temperatures are percentiles of recent polls (FlowMeter), so a
+      // chain whose absolute volume grows tenfold does not read as
+      // permanently hot, and a quiet chain does not read as permanently cold.
+      this.chainTemp = this.level.read(Math.log1p(count) + Math.log1p(volume));
+      const swing = Math.abs(Math.log1p(volume) - Math.log1p(this.prevVolume));
+      this.prevVolume = volume;
+      this.marketTemp = this.turbulence.read(swing);
     } catch {
       this.consecutiveFailures++;
     }
