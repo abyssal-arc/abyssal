@@ -19,6 +19,7 @@ interface DoBinding {
 
 interface Env {
   WORLD: DoBinding;
+  ABYS_TOKEN_ADDRESS?: string;
 }
 
 const SNAP_KEY = 'world';
@@ -31,7 +32,7 @@ export class AbyssalWorld {
 
   constructor(private ctx: { storage: DoStorage }) {}
 
-  private async boot(): Promise<ReturnType<typeof createApp>> {
+  private async boot(token?: string): Promise<ReturnType<typeof createApp>> {
     if (!this.app) {
       const snapshot = await this.ctx.storage.get<string>(SNAP_KEY);
       let instance = await this.ctx.storage.get<string>(INSTANCE_KEY);
@@ -39,7 +40,7 @@ export class AbyssalWorld {
         instance = crypto.randomUUID();
         await this.ctx.storage.put(INSTANCE_KEY, instance);
       }
-      this.app = createApp({ snapshot: snapshot ?? undefined, instance });
+      this.app = createApp({ snapshot: snapshot ?? undefined, instance, token });
     }
     return this.app;
   }
@@ -51,8 +52,8 @@ export class AbyssalWorld {
     await this.ctx.storage.put(SNAP_KEY, toJSON(app.world));
   }
 
-  async fetch(request: Request): Promise<Response> {
-    const app = await this.boot();
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const app = await this.boot(env.ABYS_TOKEN_ADDRESS);
     await app.catchUp();
     const response = await app.fetch(request);
     await this.persist(app);

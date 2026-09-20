@@ -27,7 +27,7 @@ export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11
 /** The zero address: `to` of a burn, per ERC-20 convention. */
 export const BURN_SINK = '0x0000000000000000000000000000000000000000000000000000000000000000';
 
-/** ABYS prices per intervention, whole tokens (6 decimals on-chain). */
+/** ABYS prices per intervention, in whole tokens; base units come from the token's decimals(). */
 export const ABYS_PRICES: Record<InterventionType, string> = {
   feed: '100000',
   poison: '150000',
@@ -57,14 +57,53 @@ export interface BurnOffer {
   amount: string;
 }
 
-export function burnOffer(type: InterventionType): BurnOffer {
+let metaCache: { address: string; decimals: number; at: number } | null = null;
+
+/**
+ * Address plus decimals of the payment token, read from the chain and cached
+ * for five minutes. Assuming a fixed decimals would let someone burn a dust
+ * fraction and pass a whole-token check, so an unreadable token fails closed.
+ */
+export async function tokenMeta(
+  rpcUrl: string,
+  override?: string | null,
+): Promise<{ address: string; decimals: number } | null> {
+  const address = (override ?? process.env.ABYS_TOKEN_ADDRESS ?? '').toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(address)) return null;
+  if (metaCache && metaCache.address === address && Date.now() - metaCache.at < 300_000) {
+    return metaCache;
+  }
+  try {
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: address, data: '0x313ce567' }, 'latest'] }),
+    });
+    const hex = ((await res.json()) as { result?: string }).result;
+    if (typeof hex !== 'string') return null;
+    const decimals = parseInt(hex, 16);
+    if (!Number.isFinite(decimals) || decimals < 0 || decimals > 36) return null;
+    metaCache = { address, decimals, at: Date.now() };
+    return metaCache;
+  } catch {
+    return null;
+  }
+}
+
+export async function burnOffer(
+  rpcUrl: string,
+  type: InterventionType,
+  override?: string | null,
+): Promise<BurnOffer | null> {
+  const meta = await tokenMeta(rpcUrl, override);
+  if (!meta) return null;
   return {
     scheme: 'exact',
     settle: 'burn',
     network: NETWORK_ID,
     chainId: CHAIN_ID,
-    asset: tokenAddress() as string,
-    amount: String(BigInt(Math.round(Number(ABYS_PRICES[type]) * 1_000_000))),
+    asset: meta.address,
+    amount: String(BigInt(ABYS_PRICES[type]) * 10n ** BigInt(meta.decimals)),
   };
 }
 

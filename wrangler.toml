@@ -27,3 +27,8 @@ routes = [
   { pattern = "abyssal-arc.com", custom_domain = true },
   { pattern = "www.abyssal-arc.com", custom_domain = true },
 ]
+
+# Deployed ABYS contract on Arc mainnet (public information; a proxy whose
+# implementation answers decimals() = 18, which the offer math reads live).
+[vars]
+ABYS_TOKEN_ADDRESS = "0x347ef48695eb437cf9e7e3df8637866f9baf1767"

@@ -28,11 +28,22 @@ process.env.ALLOW_DEBUG_TICK ??= '1';
 
 // One receipt stub for the /intervene tests: any hash settles a valid burn of
 // the feed price, so the route logic (not the verifier) is what is under test.
-const receiptStub = createServer((req, res) => {
-  res.setHeader('content-type', 'application/json');
-  res.end(JSON.stringify({
-    jsonrpc: '2.0', id: 1,
-    result: {
+const DEC18 = '0x' + (18).toString(16).padStart(64, '0');
+
+/** RPC stub that answers decimals() and whatever the receipt handler returns. */
+function rpcStub(answer: (data: string | undefined) => unknown) {
+  return createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    const data = (JSON.parse(body || '{}') as { params?: [{ data?: string }] })?.params?.[0]?.data;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: answer(data) }));
+  });
+}
+
+const receiptStub = rpcStub((data) => (data === '0x313ce567'
+  ? DEC18
+  : {
       status: '0x1',
       logs: [{
         address: process.env.ABYS_TOKEN_ADDRESS,
@@ -41,11 +52,9 @@ const receiptStub = createServer((req, res) => {
           `0x${'ab'.repeat(20).padStart(64, '0')}`,
           BURN_SINK,
         ],
-        data: '0x' + (100_000_000_000).toString(16),
+        data: '0x' + (100_000n * 10n ** 18n).toString(16),
       }],
-    },
-  }));
-});
+    }));
 await new Promise<void>((r) => receiptStub.listen(0, '127.0.0.1', () => r()));
 process.env.ARC_RPC_URL = `http://127.0.0.1:${(receiptStub.address() as AddressInfo).port}`;
 after(() => receiptStub.close());
@@ -79,16 +88,16 @@ test('402 advertises the ABYS burn offer on Arc mainnet', async () => {
   assert.equal(req.settle, 'burn');
   assert.equal(req.network, 'eip155:5042');
   assert.equal(req.asset, process.env.ABYS_TOKEN_ADDRESS);
-  assert.equal(req.amount, '100000000000'); // 100,000 ABYS in base units
+  assert.equal(req.amount, '100000000000000000000000'); // 100,000 ABYS at 18 decimals
 });
 
 test('402 amounts follow the ABYS price list in base units', async () => {
   const app = createApp({ seed: 1 });
   for (const [type, base] of [
-    ['feed', '100000000000'],
-    ['poison', '150000000000'],
-    ['bloom', '200000000000'],
-    ['drought', '200000000000'],
+    ['feed', '100000000000000000000000'],
+    ['poison', '150000000000000000000000'],
+    ['bloom', '200000000000000000000000'],
+    ['drought', '200000000000000000000000'],
   ] as const) {
     const res = await app.fetch(post('/intervene', { type, x: 10, y: 10 }));
     assert.equal(res.status, 402);
@@ -115,18 +124,13 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   const { verifyBurnReceipt, burnOffer, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
   const token = process.env.ABYS_TOKEN_ADDRESS as string;
   const payer = '0x' + 'ab'.repeat(20);
-  const PRICE = 100_000_000_000n; // 100,000 ABYS in base units
-  const stub = (receipt: unknown) =>
-    createServer((req, res) => {
-      res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: receipt }));
-    });
+  const PRICE = 100_000n * 10n ** 18n; // 100,000 ABYS at 18 decimals
+  const stub = (receipt: unknown) => rpcStub((data) => (data === '0x313ce567' ? DEC18 : receipt));
   const burnLog = (to: string, value: bigint, addr = token) => ({
     address: addr,
     topics: [TRANSFER_TOPIC, `0x${payer.slice(2).padStart(64, '0')}`, to],
     data: `0x${value.toString(16)}`,
   });
-  const offer = burnOffer('feed');
   const run = async (receipt: unknown, hash: string) => {
     const srv = stub(receipt);
     await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
@@ -137,6 +141,7 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
     }
   };
 
+  const offer = (await burnOffer(`http://127.0.0.1:1`, 'feed'))!; // decimals cached from the stubs below
   const v = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a1'.repeat(32));
   assert.equal(v.ok, true);
   assert.equal(v.payer, payer);
@@ -576,7 +581,8 @@ test('invalid params are rejected before the burn receipt is consumed', async ()
   const bad = await app.fetch(post('/intervene', { type: 'feed', x: -5, y: 5 }, { 'x-payment-tx': hash }));
   assert.equal(bad.status, 400, 'a malformed intervention must not charge anyone');
   const good = await app.fetch(post('/intervene', { type: 'feed', x: 500, y: 500 }, { 'x-payment-tx': hash }));
-  assert.equal(good.status, 200, 'the receipt must survive the rejected request');
+  const goodBody = (await good.json()) as { reason?: string };
+  assert.equal(good.status, 200, `the receipt must survive the rejected request, got ${goodBody.reason}`);
 });
 
 test('used burn receipts persist through the ledger, so restarts cannot replay', async () => {
@@ -589,30 +595,26 @@ test('used burn receipts persist through the ledger, so restarts cannot replay',
     append: (h: string) => appendFileSync(file, `${h}\n`),
   });
   setBurnLedger(mk());
-  const srv = createServer((req, res) => {
-    res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({
-      jsonrpc: '2.0', id: 1,
-      result: {
-        status: '0x1',
-        logs: [{
-          address: process.env.ABYS_TOKEN_ADDRESS,
-          topics: [TRANSFER_TOPIC, `0x${'cd'.repeat(20).padStart(64, '0')}`, BURN_SINK],
-          data: '0x' + (100_000_000_000).toString(16),
-        }],
-      },
-    }));
-  });
+  const srv = rpcStub(() => ({
+    status: '0x1',
+    logs: [{
+      address: process.env.ABYS_TOKEN_ADDRESS,
+      topics: [TRANSFER_TOPIC, `0x${'cd'.repeat(20).padStart(64, '0')}`, BURN_SINK],
+      data: '0x' + PRICE.toString(16),
+    }],
+  }));
   await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
   const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  const PRICE = 100_000n * 10n ** 18n;
+  const offer = (await burnOffer(url, 'feed'))!;
   try {
     const hash = '0x' + 'b8'.repeat(32);
-    const first = await verifyBurnReceipt(url, burnOffer('feed'), hash);
+    const first = await verifyBurnReceipt(url, offer, hash);
     assert.equal(first.ok, true);
     assert.ok(readFileSync(file, 'utf8').includes(hash), 'the used hash must hit the ledger file');
     // A fresh boot reloads the ledger: the same burn is dead on arrival.
     setBurnLedger(mk());
-    const replayed = await verifyBurnReceipt(url, burnOffer('feed'), hash);
+    const replayed = await verifyBurnReceipt(url, offer, hash);
     assert.equal(replayed.ok, false);
     assert.equal(replayed.reason, 'receipt already used');
   } finally {

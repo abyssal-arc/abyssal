@@ -34,6 +34,8 @@ export interface AppOptions {
    * Object so every isolate reports the same tank.
    */
   instance?: string;
+  /** Payment token contract; defaults to the ABYS_TOKEN_ADDRESS env var. */
+  token?: string;
   /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
@@ -520,13 +522,6 @@ export function createApp(options: AppOptions = {}) {
       if (!INTERVENTION_TYPES.includes(type)) {
         return json({ error: 'unknown intervention type', types: INTERVENTION_TYPES }, 400);
       }
-      const token = tokenAddress();
-      if (!token) {
-        return json(
-          { error: 'token not deployed', hint: 'the operator must set ABYS_TOKEN_ADDRESS' },
-          503,
-        );
-      }
       // Validate the request fully before touching the payment: a typo in
       // x/y/radius must cost nothing, so the burn receipt is only consumed
       // once we know the intervention can actually be applied.
@@ -534,7 +529,13 @@ export function createApp(options: AppOptions = {}) {
       if (!intervention) {
         return json({ error: 'invalid intervention params (need x, y, radius 10..300 inside the world)' }, 400);
       }
-      const offer = burnOffer(type);
+      const offer = await burnOffer(rpcUrl, type, options.token);
+      if (!offer) {
+        return json(
+          { error: 'token not deployed', hint: 'set ABYS_TOKEN_ADDRESS to an ERC-20 that answers decimals()' },
+          503,
+        );
+      }
       const txHash = String(req.headers.get('x-payment-tx') ?? body.tx ?? '');
       if (!txHash) {
         return json({ error: 'payment required', accepts: [offer] }, 402);
