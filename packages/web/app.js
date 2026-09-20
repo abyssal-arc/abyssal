@@ -2358,39 +2358,39 @@ function drawAbyssFrame(now, ct) {
         -DPR * sin * scaleY, DPR * cos * scaleY,
         px * DPR, py * DPR,
       );
-      // A hungry body runs on instinct, so it reads desaturated: the viewer
-      // sees the override without opening the card.
-      wctx.filter = c.hungry ? 'saturate(0.25) brightness(0.85)' : 'none';
-      // Additive halo first so the body sits inside its own light.
-      wctx.globalCompositeOperation = 'lighter';
-      wctx.globalAlpha = 0.3 * vib;
-      wctx.drawImage(creatureGlow(c.spriteKey), -48, -48, 96, 96);
-      wctx.globalCompositeOperation = 'source-over';
-      wctx.globalAlpha = vib;
+      // A hungry body runs on instinct: no halo and a dimmer body read as
+      // "running on fumes". A per-sprite canvas filter would cost a frame per
+      // creature and made the whole tank stutter, so hunger stays cheap.
+      if (!c.hungry) {
+        wctx.globalCompositeOperation = 'lighter';
+        wctx.globalAlpha = 0.3 * vib;
+        wctx.drawImage(creatureGlow(c.spriteKey), -48, -48, 96, 96);
+        wctx.globalCompositeOperation = 'source-over';
+      }
+      wctx.globalAlpha = vib * (c.hungry ? 0.55 : 1);
       wctx.drawImage(frame, -SPRITE / 2, -SPRITE / 2);
       wctx.globalAlpha = 1;
-      wctx.filter = 'none';
-      if (c.hungry || (tax && c.archetype === tax.archetype)) {
+      if (c.hungry && (cam.z > 1.4 || c.id === selectedId)) {
+        // Flatline over the head, but only while the viewer is inspecting
+        // (zoomed in or selected): at tank scale it read as stray noise.
         wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-        if (c.hungry) {
-          // Flatline over the head: instinct is driving, not the brain.
-          const gy = py - SPRITE_BODY * base * cam.z - 8;
-          wctx.strokeStyle = 'rgba(147, 163, 189, 0.85)';
-          wctx.lineWidth = 1;
-          wctx.beginPath();
-          wctx.moveTo(px - 6, gy);
-          wctx.lineTo(px + 6, gy);
-          wctx.stroke();
-        }
-        if (tax && c.archetype === tax.archetype) {
-          // Monopoly fog: the taxed species wears a dim red rim so the tax
-          // reads on the tank, not only in the chip.
-          wctx.strokeStyle = 'rgba(255, 77, 109, 0.35)';
-          wctx.lineWidth = 2;
-          wctx.beginPath();
-          wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.75, 0, TAU);
-          wctx.stroke();
-        }
+        const gy = py - SPRITE_BODY * base * cam.z - 8;
+        wctx.strokeStyle = 'rgba(147, 163, 189, 0.85)';
+        wctx.lineWidth = 1;
+        wctx.beginPath();
+        wctx.moveTo(px - 6, gy);
+        wctx.lineTo(px + 6, gy);
+        wctx.stroke();
+      }
+      if (tax && c.archetype === tax.archetype) {
+        // Monopoly fog: the taxed species wears a dim red rim so the tax
+        // reads on the tank, not only in the chip.
+        wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        wctx.strokeStyle = 'rgba(255, 77, 109, 0.35)';
+        wctx.lineWidth = 2;
+        wctx.beginPath();
+        wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.75, 0, TAU);
+        wctx.stroke();
       }
       if (c.id === selectedId) {
         // Soft double ring, drawn in sprite space so it tracks rotation/scale.
