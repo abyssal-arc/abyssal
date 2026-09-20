@@ -14,21 +14,17 @@ import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import { SyntheticFeed, type ChainFeed } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
-  acceptsFor,
   ABYS_PRICES,
   CHAIN_ID,
   explorerTxUrl,
   NETWORK,
   PRICES_USDC,
-  SimulatedVerifier,
   type InterventionType,
-  type PaymentVerifier,
 } from './payments.js';
 import {
   exactRequirement,
   facilitatorConfig,
   settleFromRequest,
-  type Settlement,
 } from './facilitator.js';
 import { serveStatic } from './static.js';
 
@@ -39,7 +35,6 @@ export interface AppOptions {
   snapshot?: string;
   chainFeed?: ChainFeed;
   marketFeed?: MarketFeed;
-  verifier?: PaymentVerifier;
 }
 
 const INTERVENTION_TYPES: InterventionType[] = ['feed', 'poison', 'bloom', 'drought'];
@@ -101,9 +96,9 @@ export function createApp(options: AppOptions = {}) {
     (arcFeed
       ? { name: 'arc-usdc-flow', sample: async () => arcFeed.market() }
       : new SyntheticMarketFeed());
-  const verifier: PaymentVerifier = options.verifier ?? new SimulatedVerifier();
-  // Real x402 settlement (Circle Facilitator Service) on Arc when a seller
-  // key is configured; null keeps the demo verifier path.
+  // Real x402 settlement (Circle Facilitator Service) on Arc. Null until the
+  // operator sets SELLER_PRIVATE_KEY; interventions then answer 503 instead of
+  // pretending to be paid. There is no demo path.
   const fac = facilitatorConfig();
   let timer: ReturnType<typeof setInterval> | null = null;
   let chainTemp = 0.5;
@@ -309,12 +304,12 @@ export function createApp(options: AppOptions = {}) {
       prices: ABYS_PRICES,
       pricesUsdc: PRICES_USDC,
       paymentAsset: 'ABYSSAL',
-      // How POST /intervene is paid right now: real x402 settlement through
-      // Circle's Facilitator Service when a seller key is configured, demo
-      // header otherwise. The UI badges the intervention panel with this.
+      // How POST /intervene is paid: real x402 settlement through Circle's
+      // Facilitator Service, or 'unconfigured' until the operator sets
+      // SELLER_PRIVATE_KEY. The UI badges the intervention panel with this.
       payment: fac
         ? { mode: 'x402', network: fac.network, payTo: fac.payTo, trial: fac.chainId !== 5042 }
-        : { mode: 'demo', network: null, payTo: null, trial: false },
+        : { mode: 'unconfigured', network: null, payTo: null, trial: false },
     };
   }
 
@@ -388,7 +383,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /observe': 'Arc USDC flow observatory: stats, endpoint ranking, pulse, recent flows (available:false off-Arc)',
-        'POST /intervene': 'x402-gated intervention (feed/poison/bloom/drought): live USDC on Arc via Circle Facilitator Service when configured, demo header otherwise',
+        'POST /intervene': 'x402-gated intervention (feed/poison/bloom/drought): real USDC on Arc settled by Circle Facilitator Service; 503 until the operator configures a seller key',
         'POST /tick': 'debug: advance one tick manually',
         'GET /ui': 'redirects to /',
       },
@@ -405,7 +400,7 @@ export function createApp(options: AppOptions = {}) {
         headers: {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type,x-payment-demo,x-payment,x-payment-tx',
+          'access-control-allow-headers': 'content-type,x-payment,x-payment-tx',
         },
       });
     }
@@ -493,20 +488,19 @@ export function createApp(options: AppOptions = {}) {
       if (!INTERVENTION_TYPES.includes(type)) {
         return json({ error: 'unknown intervention type', types: INTERVENTION_TYPES }, 400);
       }
-      // Live mode advertises the x402-spec USDC offer settled by Circle;
-      // demo mode keeps the legacy ABYSSAL/USDC accept list.
-      const exactOffer = fac ? exactRequirement(fac, PRICES_USDC[type]) : null;
-      const accepts = exactOffer ? [exactOffer] : acceptsFor(type);
-      let settlement: Settlement | null = null;
-      const paid = fac && exactOffer
-        ? (settlement = await settleFromRequest(req, fac, exactOffer)).ok
-        : await verifier.verify(req, acceptsFor(type)[0]);
-      if (!paid) {
+      if (!fac) {
+        return json(
+          { error: 'settlement not configured', hint: 'the operator must set SELLER_PRIVATE_KEY' },
+          503,
+        );
+      }
+      const exactOffer = exactRequirement(fac, PRICES_USDC[type]);
+      const settlement = await settleFromRequest(req, fac, exactOffer);
+      if (!settlement.ok) {
         return json({
           error: 'payment required',
-          accepts,
-          demo: !fac,
-          reason: settlement?.reason,
+          accepts: [exactOffer],
+          reason: settlement.reason,
         }, 402);
       }
       const intervention = buildIntervention(body);
@@ -520,9 +514,7 @@ export function createApp(options: AppOptions = {}) {
         affected: result.affected,
         amount: result.amount,
         tick: world.tick,
-        settlement: settlement
-          ? { tx: settlement.tx, payer: settlement.payer, network: fac?.network }
-          : null,
+        settlement: { tx: settlement.tx, payer: settlement.payer, network: fac.network },
       });
     }
 

@@ -7,9 +7,10 @@
  * which is what lets an intervention land in the same tick as the payment.
  *
  * Enabled by SELLER_PRIVATE_KEY in the environment (the key controlling
- * `payTo`); without it the server stays in demo mode. X402_MAINNET=1 settles
- * on Arc mainnet (eip155:5042, requires a Circle API key per the docs);
- * the default is the keyless trial on Arc testnet (eip155:5042002).
+ * `payTo`). Without it there is no way to pay: interventions answer 503 while
+ * the observatory stays free to watch. Settlement defaults to Arc mainnet
+ * (eip155:5042); X402_TESTNET=1 opts into the keyless Arc testnet trial
+ * (eip155:5042002) for dry runs.
  */
 import { keccak256, recoverTypedDataAddress, toBytes } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -28,11 +29,11 @@ export interface FacilitatorConfig {
   account: ReturnType<typeof privateKeyToAccount>;
 }
 
-/** Null unless a seller key is configured, the server then stays in demo. */
+/** Null unless a seller key is configured; the server then refuses to sell. */
 export function facilitatorConfig(): FacilitatorConfig | null {
   const pk = process.env.SELLER_PRIVATE_KEY;
   if (!pk) return null;
-  const chainId = process.env.X402_MAINNET === '1' ? ARC_MAINNET_CHAIN_ID : ARC_TESTNET_CHAIN_ID;
+  const chainId = process.env.X402_TESTNET === '1' ? ARC_TESTNET_CHAIN_ID : ARC_MAINNET_CHAIN_ID;
   const account = privateKeyToAccount(pk as `0x${string}`);
   return {
     network: `eip155:${chainId}`,

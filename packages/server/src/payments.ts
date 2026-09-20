@@ -4,7 +4,7 @@
  * Single network: Arc mainnet (Circle L1), chainId 5042, USDC gas, native x402.
  * Dual pricing, USDC at list price, or ABYS at a ~30% discount (TOKEN_PLAN.md
  * §7). Real settlement goes through Circle's Facilitator Service when a seller
- * key is configured (see facilitator.ts); without one the demo verifier applies.
+ * key is configured (see facilitator.ts); without one the server refuses to sell.
  *
  * All env reads happen per call (never at module load) because dev.ts sets the
  * environment after the imports are evaluated.
@@ -82,20 +82,4 @@ export function acceptsFor(type: InterventionType): PaymentRequirement[] {
     },
     abys,
   ];
-}
-
-export interface PaymentVerifier {
-  readonly name: string;
-  verify(req: Request, requirement: PaymentRequirement): Promise<boolean>;
-}
-
-/**
- * Development verifier: any request carrying `X-Payment-Demo: true` is
- * treated as paid. Never enable this outside local development.
- */
-export class SimulatedVerifier implements PaymentVerifier {
-  readonly name = 'simulated';
-  async verify(req: Request): Promise<boolean> {
-    return req.headers.get('x-payment-demo') === 'true';
-  }
 }

@@ -1653,12 +1653,11 @@ function applyChainStrings() {
     badge.dataset.mode = pay.mode;
     badge.textContent = pay.mode === 'x402'
       ? (pay.trial ? t('payBadgeTrial') : t('payBadgeLive'))
-      : t('payBadgeDemo');
-    paymentMode = pay.mode === 'x402' ? 'x402' : 'demo';
+      : t('payBadgeUnconfigured');
   }
   const dockToken = document.getElementById('dock-token');
   if (dockToken) {
-    dockToken.textContent = pay?.mode === 'x402' ? t('dockTokenX402') : t('dockTokenDemo');
+    dockToken.textContent = pay?.mode === 'x402' ? t('dockTokenX402') : t('dockTokenUnconfigured');
   }
   chainCopyApplied = true;
 }
@@ -2864,10 +2863,9 @@ function toast(msg, isError = false) {
 
 /* ---------- x402 wallet payment (Circle Facilitator Service) ---------- */
 
-// How POST /intervene is paid right now, per the server's state.payment:
-// 'x402' = the visitor signs an EIP-3009 authorization, Circle settles it;
-// 'demo' = the dev header is accepted (no wallet needed).
-let paymentMode = 'demo';
+// POST /intervene is paid by signing an EIP-3009 authorization that Circle
+// settles on Arc. Until the operator configures a seller key the endpoint
+// answers 503 and the panel says so; there is no unpaid path.
 
 function b64urlJson(obj) {
   const bytes = new TextEncoder().encode(JSON.stringify(obj));
@@ -2983,25 +2981,25 @@ async function intervene(body) {
       headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify(body),
     });
-    let res = await send(paymentMode === 'demo' ? { 'x-payment-demo': 'true' } : {});
+    let res = await send({});
+    if (res.status === 503) {
+      toast(t('settlementUnconfigured'), true);
+      return;
+    }
     if (res.status === 402) {
       const gate = await res.json();
-      if (gate.demo) {
-        res = await send({ 'x-payment-demo': 'true' });
-      } else {
-        const offer = gate.accepts?.[0];
-        if (!offer || offer.scheme !== 'exact') {
-          toast(t('paymentRequired', { amount: offer?.amount ?? '?' }), true);
-          return;
-        }
-        toast(t('paySign'));
-        const paid = await payX402(offer, `ABYSSAL intervention: ${body.type}`);
-        if (paid.error === 'no-wallet') {
-          toast(t('needWallet'), true);
-          return;
-        }
-        res = await send({ 'x-payment': paid.header });
+      const offer = gate.accepts?.[0];
+      if (!offer || offer.scheme !== 'exact') {
+        toast(t('paymentRequired', { amount: offer?.amount ?? '?' }), true);
+        return;
       }
+      toast(t('paySign'));
+      const paid = await payX402(offer, `ABYSSAL intervention: ${body.type}`);
+      if (paid.error === 'no-wallet') {
+        toast(t('needWallet'), true);
+        return;
+      }
+      res = await send({ 'x-payment': paid.header });
     }
     const data = await res.json();
     if (res.status === 402) {

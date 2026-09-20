@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { tick, toJSON } from '@abyssal/sim';
+import { applyIntervention, tick, toJSON } from '@abyssal/sim';
 import { createApp } from '../src/handler.js';
 import {
   ARC_USDC,
@@ -15,6 +15,10 @@ import type { AddressInfo } from 'node:net';
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
 process.env.CHAIN_FEED ??= 'synthetic';
+// A throwaway seller key so createApp builds the real x402 gate. Nothing here
+// broadcasts: settleFromRequest bails on a missing X-Payment before any fetch,
+// and the signer test points FACILITATOR_URL at a local stub.
+process.env.SELLER_PRIVATE_KEY ??= '0x' + '4c'.repeat(32);
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}): Request {
   return new Request(`http://localhost${path}`, {
@@ -24,7 +28,7 @@ function post(path: string, body: unknown, headers: Record<string, string> = {})
   });
 }
 
-test('402 advertises dual USDC/ABYS pricing on Arc', async () => {
+test('402 advertises the exact USDC offer on Arc mainnet', async () => {
   const app = createApp({ seed: 1 });
   const res = await app.fetch(post('/intervene', { type: 'feed', x: 100, y: 100 }));
   assert.equal(res.status, 402);
@@ -33,54 +37,50 @@ test('402 advertises dual USDC/ABYS pricing on Arc', async () => {
     accepts: {
       scheme: string;
       network: string;
-      chainId: number;
       asset: string;
-      tokenAddress: string | null;
       amount: string;
       payTo: string;
+      extra?: { assetTransferMethod?: string };
     }[];
   };
   assert.equal(body.error, 'payment required');
-  assert.equal(body.accepts.length, 2, 'the payer must be offered both assets');
-  const [usdc, abys] = body.accepts;
-  for (const req of [usdc, abys]) {
-    assert.equal(req.scheme, 'x402');
-    assert.equal(req.network, 'arc');
-    assert.equal(req.chainId, 5042);
-  }
-  assert.equal(usdc.asset, 'USDC');
-  assert.equal(usdc.amount, '0.05'); // feed: USDC list price
-  assert.ok(usdc.tokenAddress, 'native USDC precompile address');
-  assert.equal(abys.asset, 'ABYSSAL');
-  assert.equal(abys.amount, '35'); // feed: ABYS at the ~30% discount
-  assert.equal(abys.tokenAddress, null); // token not deployed yet
+  assert.equal(body.accepts.length, 1, 'one exact offer, no unpaid alternative');
+  const req = body.accepts[0];
+  assert.equal(req.scheme, 'exact');
+  // Settlement defaults to real money on Arc mainnet; testnet needs an opt-in.
+  assert.equal(req.network, 'eip155:5042');
+  assert.equal(req.amount, '50000'); // 0.05 USDC in base units
+  assert.equal(req.extra?.assetTransferMethod, 'eip3009');
+  assert.match(req.payTo, /^0x[0-9a-f]{40}$/);
 });
 
-test('402 amounts follow the dual price list', async () => {
+test('402 amounts follow the USDC price list in base units', async () => {
   const app = createApp({ seed: 1 });
-  for (const [type, usdc, abys] of [
-    ['feed', '0.05', '35'],
-    ['poison', '0.1', '70'],
-    ['bloom', '0.25', '175'],
-    ['drought', '0.25', '175'],
+  for (const [type, micro] of [
+    ['feed', '50000'],
+    ['poison', '100000'],
+    ['bloom', '250000'],
+    ['drought', '250000'],
   ] as const) {
     const res = await app.fetch(post('/intervene', { type, x: 10, y: 10 }));
     assert.equal(res.status, 402);
     const body = (await res.json()) as { accepts: { amount: string }[] };
-    assert.equal(body.accepts[0].amount, usdc, `${type} should cost ${usdc} USDC`);
-    assert.equal(body.accepts[1].amount, abys, `${type} should cost ${abys} ABYS`);
+    assert.equal(body.accepts[0].amount, micro, `${type} should cost ${micro} base units`);
   }
 });
 
-test('demo payment header unlocks the intervention', async () => {
-  const app = createApp({ seed: 1 });
-  const res = await app.fetch(
-    post('/intervene', { type: 'feed', x: 100, y: 100 }, { 'x-payment-demo': 'true' }),
-  );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as { ok: boolean; receipt: string };
-  assert.equal(body.ok, true);
-  assert.match(body.receipt, /^feed:/);
+test('/intervene answers 503 until the operator configures settlement', async () => {
+  const pk = process.env.SELLER_PRIVATE_KEY;
+  delete process.env.SELLER_PRIVATE_KEY;
+  try {
+    const app = createApp({ seed: 1 });
+    const res = await app.fetch(post('/intervene', { type: 'feed', x: 100, y: 100 }));
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as { error: string };
+    assert.equal(body.error, 'settlement not configured');
+  } finally {
+    if (pk) process.env.SELLER_PRIVATE_KEY = pk;
+  }
 });
 
 test('/state exposes marketTemp plus harvest and judgment countdowns', async () => {
@@ -164,7 +164,7 @@ test('GET / falls back to the endpoint index when no webRoot is configured', asy
 
 test('/events streams positioned events and honors ?since=', async () => {
   const app = createApp({ seed: 1 });
-  await app.fetch(post('/intervene', { type: 'feed', x: 100, y: 100 }, { 'x-payment-demo': 'true' }));
+  applyIntervention(app.world, { type: 'feed', x: 100, y: 100, radius: 80 });
   const res = await app.fetch(new Request('http://localhost/events?since=0'));
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
@@ -182,7 +182,7 @@ test('/events streams positioned events and honors ?since=', async () => {
 
 test('/snapshot returns world + state + events in one request', async () => {
   const app = createApp({ seed: 1 });
-  await app.fetch(post('/intervene', { type: 'bloom' }, { 'x-payment-demo': 'true' }));
+  applyIntervention(app.world, { type: 'bloom' });
   const res = await app.fetch(new Request('http://localhost/snapshot?since=0'));
   assert.equal(res.status, 200);
   const body = (await res.json()) as {

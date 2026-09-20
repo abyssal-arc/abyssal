@@ -86,9 +86,9 @@ Environment variables:
 | `ARC_RPC_URL` | `https://rpc.mainnet.arc.io` | Arc JSON-RPC endpoint (used when `CHAIN_FEED=arc`) |
 | `ARC_USDC_ADDRESS` | `0x3600…0000` | Native USDC precompile on Arc |
 | `EXPLORER_TX_URL` | `https://explorer.arc.io/tx/` | Explorer base URL for tx links |
-| `SELLER_PRIVATE_KEY` | unset | Enables real x402 settlement via Circle's Facilitator Service; unset keeps demo mode |
+| `SELLER_PRIVATE_KEY` | unset | Required to sell: the key controlling the settlement recipient. Without it the observatory still runs free, but `POST /intervene` answers 503 |
 | `SELLER_PAY_TO` | seller address | Override the receiving address |
-| `X402_MAINNET` | unset | `1` settles on Arc mainnet (5042); otherwise the keyless Arc testnet trial (5042002) |
+| `X402_TESTNET` | unset | `1` dry-runs settlement on the keyless Arc testnet trial (5042002); unset settles real USDC on Arc mainnet (5042) |
 | `FACILITATOR_URL` | `https://api.circle.com/v1/facilitator/x402` | Circle facilitator base URL |
 | `COMPRESS_LEVEL` | `6` | Brotli quality for response compression in the node adapter (6 ≈ 0.5–3 ms/payload; 11 costs ~570 ms on `/history`) |
 | `COMPRESS_MIN_BYTES` | `1024` | Responses smaller than this are sent uncompressed |
@@ -102,10 +102,11 @@ Client-side ambience (nebula, stars, motes) is generated from fixed seeds for
 the same reason, so a refresh never re-rolls the scenery.
 
 **Two chains, two jobs.** The observatory *reads* Arc **mainnet 5042** (the
-USDC transfer flow). Interventions *settle* on Arc **testnet 5042002** by
-default (the keyless x402 trial, no testnet USDC needed to try it); set
-`X402_MAINNET=1` plus a funded `SELLER_PRIVATE_KEY` to settle real USDC on
-mainnet. The UI badges the intervention panel with whichever mode is live.
+USDC transfer flow). Interventions *settle* real USDC on Arc **mainnet 5042**
+by default, once the operator sets `SELLER_PRIVATE_KEY`; `X402_TESTNET=1`
+dry-runs the same flow on the keyless testnet trial (5042002). The UI badges
+the intervention panel with whichever settlement chain is live, and says
+"settlement unconfigured" until a seller key exists.
 
 Tip: plain `npm run dev` already talks to the real Arc mainnet RPC. There is
 no flag to flip. The Arc feed indexes the **USDC transfer flow**, which is what
@@ -186,9 +187,9 @@ Before calling Circle it recovers the signer from the authorization and
 rejects `signer_mismatch` locally, so a wallet that signed with the wrong
 account gets an actionable message instead of an opaque settlement failure.
 
-Without `SELLER_PRIVATE_KEY` the server runs in **demo mode**: an
-`X-Payment-Demo: true` header counts as paid (`SimulatedVerifier`, development
-only), and the UI badges the panel accordingly.
+There is no demo or unpaid path. Without `SELLER_PRIVATE_KEY` the server
+still boots and the observatory stays free to watch, but `POST /intervene`
+answers **503 settlement not configured** and the panel says so.
 
 For a deployment without a facilitator, the reserved fallback is receipt
 verification: after the client transfers and retries with the hash in
@@ -276,8 +277,7 @@ Either way, an unpaid request gets **HTTP 402** with a body like:
    placeholder `PAY_TO` with a real treasury multisig.
 2. **Payments**: for facilitator-less deployments, verify payment by scanning
    the ERC-20 `Transfer` event in the payer's receipt (token contract,
-   recipient, amount, confirmations, txHash replay protection); everywhere,
-   remove the `X-Payment-Demo` backdoor.
+   recipient, amount, confirmations, txHash replay protection).
 3. **Trust anchor**: commit the daily world-summary digest on chain so anyone
    can verify the operator didn't rig the simulation (task tracked in
    `TOKEN_PLAN.md`; it is a public attestation, not a distribution mechanism).
