@@ -160,6 +160,8 @@ const dict = {
     viewInTank: 'view in tank',
     taxActive: 'monopoly tax · {species} holds {pct}% of the tank',
     evtReseed: '🌱 {species} drifts back in at ({x}, {y})',
+    evtInterventionBy: 'signed by {who} · {amount} burned',
+    evtBacklash: '⚠️ the poison overreached: a short famine answers at ({x}, {y})',
   },
   fr: {
     day: 'Jour',
@@ -317,6 +319,8 @@ const dict = {
     viewInTank: 'voir dans le bac',
     taxActive: 'taxe de monopole · {species} tient {pct}% du bac',
     evtReseed: '🌱 {species} revient vers ({x}, {y})',
+    evtInterventionBy: 'signé par {who} · {amount} brûlés',
+    evtBacklash: '⚠️ le poison a dépassé : une courte famine répond en ({x}, {y})',
   },
   de: {
     day: 'Tag',
@@ -474,6 +478,8 @@ const dict = {
     viewInTank: 'im Becken ansehen',
     taxActive: 'Monopolsteuer · {species} hält {pct}% des Beckens',
     evtReseed: '🌱 {species} driftet zurück bei ({x}, {y})',
+    evtInterventionBy: 'signiert von {who} · {amount} verbrannt',
+    evtBacklash: '⚠️ das Gift hat übergriffen: eine kurze Hungersnot antwortet bei ({x}, {y})',
   },
   zh: {
     day: '天数',
@@ -631,6 +637,8 @@ const dict = {
     viewInTank: '在缸中查看',
     taxActive: '垄断税 · {species} 占缸内 {pct}%',
     evtReseed: '🌱 {species} 在 ({x}, {y}) 补种回流',
+    evtInterventionBy: '署名 {who} · 已烧 {amount}',
+    evtBacklash: '⚠️ 毒杀过度：({x}, {y}) 触发短饥荒反噬',
   },
   ja: {
     day: '日目',
@@ -788,6 +796,8 @@ const dict = {
     viewInTank: '水槽で見る',
     taxActive: '独占税 · {species} が槽の {pct}% を占有',
     evtReseed: '🌱 {species} が ({x}, {y}) へ再投入',
+    evtInterventionBy: '署名 {who} · {amount} バーン済',
+    evtBacklash: '⚠️ 毒がやりすぎた：({x}, {y}) に短い飢饉が返す',
   },
   ko: {
     day: '일',
@@ -945,6 +955,8 @@ const dict = {
     viewInTank: '수조에서 보기',
     taxActive: '독점세 · {species} 이 수조의 {pct}% 차지',
     evtReseed: '🌱 {species} 이 ({x}, {y}) 로 재투입',
+    evtInterventionBy: '서명 {who} · {amount} 소각됨',
+    evtBacklash: '⚠️ 독이 과했음: ({x}, {y}) 에 짧은 기근이 되받음',
   },
 };
 

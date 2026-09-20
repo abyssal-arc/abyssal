@@ -699,3 +699,55 @@ test('the hidden rules are readable: hunger flag, dominance tax, positioned rese
     assert.ok(e.species && e.species !== 'WHALE', 'the reserve refills the crowded-out niches');
   }
 });
+
+test('counters: repeated feeds decay, bloom and drought cancel, poison overreach backlashes', () => {
+  const w = createWorld(11);
+  for (let i = 0; i < 20; i++) tick(w, { chain: 0.5, market: 0.5 }, []);
+
+  // Same water, second helping: the drop shrinks instead of stacking.
+  const first = applyIntervention(w, { type: 'feed', x: 500, y: 500, radius: 80 });
+  const second = applyIntervention(w, { type: 'feed', x: 510, y: 505, radius: 80 });
+  assert.ok((second.amount ?? 0) < (first.amount ?? 0), 'an overlapping feed must decay');
+  const far = applyIntervention(w, { type: 'feed', x: 100, y: 100, radius: 80 });
+  assert.equal(far.amount, first.amount, 'a far-away feed is unaffected');
+
+  // Opposite weathers cancel each other.
+  applyIntervention(w, { type: 'bloom' });
+  assert.ok(w.effects.some((e) => e.kind === 'bloom'));
+  applyIntervention(w, { type: 'drought' });
+  assert.ok(w.effects.some((e) => e.kind === 'drought'));
+  assert.ok(!w.effects.some((e) => e.kind === 'bloom'), 'drought must end a bloom');
+  applyIntervention(w, { type: 'bloom' });
+  assert.ok(!w.effects.some((e) => e.kind === 'drought'), 'bloom must end a drought');
+
+  // A poison that kills its neighbourhood answers with a short famine.
+  const w2 = createWorld(12);
+  for (let i = 0; i < 20; i++) tick(w2, { chain: 0.5, market: 0.5 }, []);
+  applyIntervention(w2, { type: 'poison', x: 500, y: 500, radius: 120 });
+  let placed = 0;
+  for (const c of w2.creatures) {
+    if (placed >= 12) break;
+    c.x = 500 + (placed % 4) * 10;
+    c.y = 500 + Math.floor(placed / 4) * 10;
+    c.energy = 1;
+    placed++;
+  }
+  tick(w2, { chain: 0.5, market: 0.5 }, []);
+  const backlash = w2.eventLog.filter((e) => e.type === 'intervention' && e.kind === 'backlash');
+  assert.ok(backlash.length > 0, 'a massacre must trigger the famine backlash');
+  assert.ok(w2.effects.some((e) => e.kind === 'drought'), 'the backlash halts spawning briefly');
+});
+
+test('interventions carry their payer through to effects and events', () => {
+  const w = createWorld(13);
+  for (let i = 0; i < 10; i++) tick(w, { chain: 0.5, market: 0.5 }, []);
+  const meta = { payer: '0x' + '77'.repeat(20), paid: '50000 ABYS' };
+  applyIntervention(w, { type: 'feed', x: 400, y: 400, radius: 80 }, meta);
+  const feast = w.effects.find((e) => e.kind === 'feast');
+  assert.equal(feast?.payer, meta.payer);
+  assert.equal(feast?.paid, meta.paid);
+  const ev = w.eventLog.filter((e) => e.type === 'intervention').slice(-1)[0];
+  assert.equal(ev.payer, meta.payer);
+  assert.equal(ev.paid, meta.paid);
+  assert.ok(typeof ev.affected === 'number');
+});

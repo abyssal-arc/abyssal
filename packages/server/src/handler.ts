@@ -296,6 +296,8 @@ export function createApp(options: AppOptions = {}) {
         y: e.y,
         radius: e.radius,
         ticksRemaining: e.expiresTick - world.tick,
+        payer: e.payer,
+        paid: e.paid,
       })),
       totals: { born: world.totalBorn, died: world.totalDied, predations: world.totalPredations },
       network: NETWORK,
@@ -509,7 +511,10 @@ export function createApp(options: AppOptions = {}) {
       if (!intervention) {
         return json({ error: 'invalid intervention params (need x, y, radius 10..300 inside the world)' }, 400);
       }
-      const result = applyIntervention(world, intervention);
+      const result = applyIntervention(world, intervention, {
+        payer: verdict.payer,
+        paid: `${ABYS_PRICES[type]} ABYS`,
+      });
       return json({
         ok: true,
         receipt: result.message,

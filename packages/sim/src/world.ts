@@ -89,6 +89,13 @@ export interface TimedEffect {
   expiresTick: number;
   /** Poison only: energy drained per tick inside the radius. */
   damagePerTick: number;
+  /** Who paid for this intervention, so the tank can name its author. */
+  payer?: string;
+  /** What they paid, as displayed (e.g. "50000 ABYS"). */
+  paid?: string;
+  /** Poison only: kills attributed so far, for the backlash rule. */
+  kills?: number;
+  backlashed?: boolean;
 }
 
 export type CullType = 'harvest' | 'judgment';
@@ -136,6 +143,10 @@ export interface SimEvent {
   x?: number;
   y?: number;
   radius?: number;
+  /** Intervention attribution: payer address and what they paid. */
+  payer?: string;
+  paid?: string;
+  affected?: number;
   /** Predation metadata. */
   predatorId?: number;
   preyId?: number;
@@ -155,7 +166,7 @@ export interface SimEvent {
   count?: number;
   positions?: { id: number; x: number; y: number }[];
   /** Intervention metadata. */
-  kind?: Intervention['type'];
+  kind?: Intervention['type'] | 'backlash';
 }
 
 export interface World {
@@ -166,6 +177,8 @@ export interface World {
   creatures: Creature[];
   foods: Food[];
   effects: TimedEffect[];
+  /** Recent paid feeds, so the same spot cannot be fed into a permanent feast. */
+  feedFatigue: { x: number; y: number; until: number }[];
   /** Cull history: hourly harvests and daily judgment days. */
   culls: CullRecord[];
   /** Ring buffer of recent positioned events for visualization. */
@@ -373,6 +386,7 @@ export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG):
     creatures: [],
     foods: [],
     effects: [],
+    feedFatigue: [],
     culls: [],
     eventLog: [],
     nextEventSeq: 1,
@@ -818,6 +832,21 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
           name: c.name,
           archetype: c.archetype,
         });
+        e.kills = (e.kills ?? 0) + 1;
+        if (!e.backlashed && e.kills >= POISON_BACKLASH_KILLS) {
+          // A poison that kills its whole neighbourhood answers with a short
+          // famine, so a massacre cannot double as a quiet respawn farm.
+          e.backlashed = true;
+          world.effects.push({
+            kind: 'drought', x: 0, y: 0, radius: 0,
+            expiresTick: world.tick + 600, damagePerTick: 0,
+            payer: e.payer, paid: e.paid,
+          });
+          pushEvent(world, {
+            type: 'intervention', kind: 'backlash',
+            x: e.x, y: e.y, radius: e.radius, payer: e.payer, paid: e.paid,
+          });
+        }
         break;
       }
     }
@@ -886,11 +915,29 @@ function countInZone(world: World, x: number, y: number, radius: number): number
 }
 
 /** Apply a (already paid for) intervention. */
-export function applyIntervention(world: World, intervention: Intervention): InterventionResult {
+/** Overlapping feeds inside this window decay, so paying is not a GM button. */
+const FEED_FATIGUE_TICKS = 2400;
+const FEED_FATIGUE_RADIUS = 200;
+/** Kills inside one poison zone before the tank answers with a short famine. */
+const POISON_BACKLASH_KILLS = 10;
+
+export function applyIntervention(
+  world: World,
+  intervention: Intervention,
+  meta?: { payer?: string; paid?: string },
+): InterventionResult {
   const cfg = world.config;
   switch (intervention.type) {
     case 'feed': {
-      const amount = Math.floor(intervention.amount ?? 40);
+      // Same water, second helping: repeated feeds on one spot decay, so a
+      // wallet cannot farm a single corner into a permanent feast.
+      const fatigue = (world.feedFatigue ??= []).filter((f) => f.until > world.tick);
+      world.feedFatigue = fatigue;
+      const overlap = fatigue.filter(
+        (f) => (f.x - intervention.x) ** 2 + (f.y - intervention.y) ** 2 < FEED_FATIGUE_RADIUS ** 2,
+      ).length;
+      const amount = Math.max(4, Math.floor((intervention.amount ?? 40) * Math.pow(0.6, overlap)));
+      fatigue.push({ x: intervention.x, y: intervention.y, until: world.tick + FEED_FATIGUE_TICKS });
       for (let i = 0; i < amount; i++) {
         const angle = world.rng.range(0, Math.PI * 2);
         const dist = Math.sqrt(world.rng.next()) * intervention.radius;
@@ -908,15 +955,19 @@ export function applyIntervention(world: World, intervention: Intervention): Int
         radius: 250,
         expiresTick: world.tick + 400,
         damagePerTick: 0,
+        payer: meta?.payer,
+        paid: meta?.paid,
       });
       world.lastEvents.push(`intervention:feed@${Math.round(intervention.x)},${Math.round(intervention.y)}`);
+      const affected = countInZone(world, intervention.x, intervention.y, 250);
       pushEvent(world, {
         type: 'intervention', kind: 'feed',
         x: intervention.x, y: intervention.y, radius: intervention.radius,
+        payer: meta?.payer, paid: meta?.paid, affected,
       });
       return {
         message: `feed: dropped ${amount} food around (${Math.round(intervention.x)}, ${Math.round(intervention.y)})`,
-        affected: countInZone(world, intervention.x, intervention.y, 250),
+        affected,
         amount,
       };
     }
@@ -929,11 +980,16 @@ export function applyIntervention(world: World, intervention: Intervention): Int
         radius: intervention.radius,
         expiresTick: world.tick + duration,
         damagePerTick: 2.0,
+        payer: meta?.payer,
+        paid: meta?.paid,
+        kills: 0,
       });
       world.lastEvents.push(`intervention:poison@${Math.round(intervention.x)},${Math.round(intervention.y)}`);
       pushEvent(world, {
         type: 'intervention', kind: 'poison',
         x: intervention.x, y: intervention.y, radius: intervention.radius,
+        payer: meta?.payer, paid: meta?.paid,
+        affected: countInZone(world, intervention.x, intervention.y, intervention.radius),
       });
       return {
         message: `poison: radius ${intervention.radius} at (${Math.round(intervention.x)}, ${Math.round(intervention.y)}) for ${duration} ticks`,
@@ -942,7 +998,12 @@ export function applyIntervention(world: World, intervention: Intervention): Int
     }
     case 'bloom': {
       const duration = intervention.durationTicks ?? 2400;
-      world.effects.push({ kind: 'bloom', x: 0, y: 0, radius: 0, expiresTick: world.tick + duration, damagePerTick: 0 });
+      // Bloom and drought are opposite weathers: buying one ends the other.
+      world.effects = world.effects.filter((e) => e.kind !== 'drought');
+      world.effects.push({
+        kind: 'bloom', x: 0, y: 0, radius: 0, expiresTick: world.tick + duration,
+        damagePerTick: 0, payer: meta?.payer, paid: meta?.paid,
+      });
       world.lastEvents.push('intervention:bloom');
       pushEvent(world, { type: 'intervention', kind: 'bloom' });
       return {
@@ -952,7 +1013,11 @@ export function applyIntervention(world: World, intervention: Intervention): Int
     }
     case 'drought': {
       const duration = intervention.durationTicks ?? 2400;
-      world.effects.push({ kind: 'drought', x: 0, y: 0, radius: 0, expiresTick: world.tick + duration, damagePerTick: 0 });
+      world.effects = world.effects.filter((e) => e.kind !== 'bloom');
+      world.effects.push({
+        kind: 'drought', x: 0, y: 0, radius: 0, expiresTick: world.tick + duration,
+        damagePerTick: 0, payer: meta?.payer, paid: meta?.paid,
+      });
       world.lastEvents.push('intervention:drought');
       pushEvent(world, { type: 'intervention', kind: 'drought' });
       return {

@@ -2307,6 +2307,14 @@ function render() {
       wctx.globalAlpha = 0.5 * pulse;
       wctx.drawImage(sprite, px - pr / 2, py - pr / 2, pr, pr);
       wctx.globalAlpha = 1;
+      if (e.payer) {
+        // Paid interventions are signed on the water: who burned, how much.
+        wctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        wctx.fillStyle = 'rgba(230, 237, 247, 0.75)';
+        wctx.textAlign = 'center';
+        wctx.fillText(`${shortAddr(e.payer)} · ${e.paid ?? ''}`, px, py - pr / 2 - 6);
+        wctx.textAlign = 'left';
+      }
     }
   }
 
@@ -2993,6 +3001,14 @@ function handleEvents(events, bootstrap = false) {
         } else if (e.kind === 'drought') {
           spawnEdgePulse('rgba(110, 130, 180, 1)', 900);
           pushEventLine('intervention', t('evtDrought'));
+        } else if (e.kind === 'backlash') {
+          spawnRing(e.x, e.y, e.radius ?? 80, 'rgba(110, 130, 180, 0.9)', 900);
+          pushEventLine('intervention', t('evtBacklash', { x: Math.round(e.x), y: Math.round(e.y) }));
+        }
+        if (e.payer) {
+          pushEventLine('intervention', t('evtInterventionBy', {
+            who: shortAddr(e.payer), amount: e.paid ?? '',
+          }));
         }
         break;
     }
