@@ -3139,11 +3139,13 @@ async function payBurn(offer) {
   }
   const accounts = approved?.length ? approved : await eth.request({ method: 'eth_accounts' });
   const from = accounts[0];
-  // burn(uint256): selector 0x42966c68 plus the 32-byte base-unit amount.
+  // transfer(blackhole, amount): works on any ERC-20, no burn() required, and
+  // reads as burning in every explorer. selector a9059cbb + dead + amount.
   const amount = BigInt(offer.amount).toString(16).padStart(64, '0');
+  const dead = '000000000000000000000000000000000000000000000000000000000000dead';
   const tx = await eth.request({
     method: 'eth_sendTransaction',
-    params: [{ from, to: offer.asset, data: `0x42966c68${amount}` }],
+    params: [{ from, to: offer.asset, data: `0xa9059cbb${dead}${amount}` }],
   });
   return { tx };
 }

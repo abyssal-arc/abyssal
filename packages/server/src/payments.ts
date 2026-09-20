@@ -26,6 +26,10 @@ export const NETWORK_ID = `eip155:${CHAIN_ID}`;
 export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 /** The zero address: `to` of a burn, per ERC-20 convention. */
 export const BURN_SINK = '0x0000000000000000000000000000000000000000000000000000000000000000';
+/** Blackhole address: transferring here is the other burn convention. */
+export const DEAD_SINK = '0x000000000000000000000000000000000000000000000000000000000000dead';
+/** Both conventions count as burning: contract burn() and blackhole transfer. */
+const SINKS = new Set([BURN_SINK, DEAD_SINK]);
 
 /** ABYS prices per intervention, in whole tokens; base units come from the token's decimals(). */
 export const ABYS_PRICES: Record<InterventionType, string> = {
@@ -177,7 +181,7 @@ export async function verifyBurnReceipt(
     if (String(log.address).toLowerCase() !== token) continue;
     const topics = log.topics ?? [];
     if (topics[0] !== TRANSFER_TOPIC) continue;
-    if (String(topics[2]).toLowerCase() !== BURN_SINK) continue;
+    if (!SINKS.has(String(topics[2]).toLowerCase())) continue;
     const value = BigInt(log.data ?? '0x0');
     if (value < BigInt(offer.amount)) continue;
     remember(key);

@@ -15,7 +15,7 @@ import { appendFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
-import { BURN_SINK, TRANSFER_TOPIC } from '../src/payments.js';
+import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -155,6 +155,9 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   const v4 = await run({ status: '0x0', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a4'.repeat(32));
   assert.equal(v4.ok, false);
   assert.equal(v4.reason, 'transaction reverted');
+  // The blackhole convention counts as burning too.
+  const v5 = await run({ status: '0x1', logs: [burnLog(DEAD_SINK, PRICE)] }, '0x' + 'a6'.repeat(32));
+  assert.equal(v5.ok, true, 'transfer to the blackhole address is a burn');
 
   const hash = '0x' + 'a5'.repeat(32);
   const first = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, hash);

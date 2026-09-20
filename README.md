@@ -243,8 +243,11 @@ Either way, an unpaid request gets **HTTP 402** with a body like:
                 "asset": "0xABYS…", "amount": "100000000000" }] }
 ```
 
-The wallet sends `burn(amount)` itself and the client retries while the
-receipt is still pending, so a fast wallet never reads as a failed payment.
+The wallet sends `transfer(blackhole, amount)` itself, and the client retries
+while the receipt is still pending, so a fast wallet never reads as a failed
+payment. Both burn conventions count: a contract `burn()` (Transfer to 0x0)
+or a transfer to the blackhole `0x…dead`; the wallet uses the latter because
+it works on any ERC-20.
 Used receipts are appended to `.data/used-burns.txt` (`USED_BURNS_FILE`
 relocates it), so a server restart cannot replay an old burn. Request params
 are validated before the receipt is consumed: a typo in x/y/radius costs
