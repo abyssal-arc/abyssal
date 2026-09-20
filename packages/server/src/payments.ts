@@ -87,12 +87,30 @@ async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promi
 }
 
 /**
- * Hashes of burn receipts already accepted. In-memory on purpose: a restart
- * clears it, and the only thing a replayed old hash can buy is one extra
- * intervention at a price the payer already burned for, which the amount check
- * below still has to pass against the offer they present.
+ * Hashes of burn receipts already accepted. Memory alone would let a restart
+ * replay an old burn, so production wires a ledger (see setBurnLedger, which
+ * dev.ts points at .data/used-burns.txt); without one the set stays in memory
+ * and the amount check below is the only replay guard.
  */
 const usedReceipts = new Set<string>();
+
+export interface BurnLedger {
+  load(): string[];
+  append(hash: string): void;
+}
+
+let ledger: BurnLedger | null = null;
+
+/** Attach persistent storage for used receipts; call once at boot. */
+export function setBurnLedger(next: BurnLedger): void {
+  ledger = next;
+  for (const h of next.load()) usedReceipts.add(h);
+}
+
+function remember(hash: string): void {
+  usedReceipts.add(hash);
+  ledger?.append(hash);
+}
 
 /**
  * Accept a payment iff `txHash` is a successful transaction whose logs contain
@@ -123,7 +141,7 @@ export async function verifyBurnReceipt(
     if (String(topics[2]).toLowerCase() !== BURN_SINK) continue;
     const value = BigInt(log.data ?? '0x0');
     if (value < BigInt(offer.amount)) continue;
-    usedReceipts.add(key);
+    remember(key);
     return { ok: true, payer: `0x${String(topics[1]).slice(-40)}`.toLowerCase() };
   }
   return { ok: false, reason: 'no burn of the asked amount in this transaction' };

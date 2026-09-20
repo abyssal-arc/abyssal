@@ -5,13 +5,14 @@
  * It also owns world persistence: the single shared world is snapshotted to
  * disk so a server restart resumes the same ecosystem instead of reseeding.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toJSON } from '@abyssal/sim';
 import { compressible, encodeBody } from './compress.js';
 import { createApp } from './handler.js';
+import { setBurnLedger } from './payments.js';
 
 const PORT = Number(process.env.PORT ?? 8787);
 const TICK_MS = Number(process.env.TICK_MS ?? 250);
@@ -28,6 +29,27 @@ function loadSnapshot(): string | undefined {
     return undefined;
   }
 }
+
+// Used burn receipts survive restarts here; a CF Worker would plug a KV-backed
+// ledger into the same interface instead.
+const burnsFile = process.env.USED_BURNS_FILE ?? join(repoRoot, '.data', 'used-burns.txt');
+setBurnLedger({
+  load: () => {
+    try {
+      return readFileSync(burnsFile, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  },
+  append: (hash) => {
+    try {
+      mkdirSync(dirname(burnsFile), { recursive: true });
+      appendFileSync(burnsFile, `${hash}\n`);
+    } catch (err) {
+      console.warn('[abyssal] burn ledger write failed:', err);
+    }
+  },
+});
 
 const snapshot = process.env.FRESH_WORLD ? undefined : loadSnapshot();
 const app = createApp({

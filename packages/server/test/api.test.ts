@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
 import { createApp } from '../src/handler.js';
@@ -10,7 +10,11 @@ import {
 } from '../src/facilitator.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createServer } from 'node:http';
+import { appendFileSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
+import { BURN_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -19,6 +23,30 @@ process.env.CHAIN_FEED ??= 'synthetic';
 // touches a chain: verification runs against a local stub RPC, and the
 // facilitator test below builds its own config and stubs Circle.
 process.env.ABYS_TOKEN_ADDRESS ??= '0x' + '11'.repeat(20);
+
+// One receipt stub for the /intervene tests: any hash settles a valid burn of
+// the feed price, so the route logic (not the verifier) is what is under test.
+const receiptStub = createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({
+    jsonrpc: '2.0', id: 1,
+    result: {
+      status: '0x1',
+      logs: [{
+        address: process.env.ABYS_TOKEN_ADDRESS,
+        topics: [
+          TRANSFER_TOPIC,
+          `0x${'ab'.repeat(20).padStart(64, '0')}`,
+          BURN_SINK,
+        ],
+        data: '0x' + (100_000_000_000).toString(16),
+      }],
+    },
+  }));
+});
+await new Promise<void>((r) => receiptStub.listen(0, '127.0.0.1', () => r()));
+process.env.ARC_RPC_URL = `http://127.0.0.1:${(receiptStub.address() as AddressInfo).port}`;
+after(() => receiptStub.close());
 
 function post(path: string, body: unknown, headers: Record<string, string> = {}): Request {
   return new Request(`http://localhost${path}`, {
@@ -537,5 +565,56 @@ test('FlowMeter calibrates by rank: bounded, median-centred, outlier-proof', asy
   for (const v of [-5, 0, 1e18]) {
     const r = m.read(v);
     assert.ok(r >= 0 && r <= 1, 'percentile must stay inside [0,1]');
+  }
+});
+
+test('invalid params are rejected before the burn receipt is consumed', async () => {
+  const app = createApp({ seed: 1 });
+  const hash = '0x' + 'b9'.repeat(32);
+  const bad = await app.fetch(post('/intervene', { type: 'feed', x: -5, y: 5 }, { 'x-payment-tx': hash }));
+  assert.equal(bad.status, 400, 'a malformed intervention must not charge anyone');
+  const good = await app.fetch(post('/intervene', { type: 'feed', x: 500, y: 500 }, { 'x-payment-tx': hash }));
+  assert.equal(good.status, 200, 'the receipt must survive the rejected request');
+});
+
+test('used burn receipts persist through the ledger, so restarts cannot replay', async () => {
+  const { setBurnLedger, verifyBurnReceipt, burnOffer } = await import('../src/payments.js');
+  const file = join(tmpdir(), `abyssal-burns-${process.pid}-${Date.now()}.txt`);
+  const mk = () => ({
+    load: () => {
+      try { return readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { return []; }
+    },
+    append: (h: string) => appendFileSync(file, `${h}\n`),
+  });
+  setBurnLedger(mk());
+  const srv = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({
+      jsonrpc: '2.0', id: 1,
+      result: {
+        status: '0x1',
+        logs: [{
+          address: process.env.ABYS_TOKEN_ADDRESS,
+          topics: [TRANSFER_TOPIC, `0x${'cd'.repeat(20).padStart(64, '0')}`, BURN_SINK],
+          data: '0x' + (100_000_000_000).toString(16),
+        }],
+      },
+    }));
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const hash = '0x' + 'b8'.repeat(32);
+    const first = await verifyBurnReceipt(url, burnOffer('feed'), hash);
+    assert.equal(first.ok, true);
+    assert.ok(readFileSync(file, 'utf8').includes(hash), 'the used hash must hit the ledger file');
+    // A fresh boot reloads the ledger: the same burn is dead on arrival.
+    setBurnLedger(mk());
+    const replayed = await verifyBurnReceipt(url, burnOffer('feed'), hash);
+    assert.equal(replayed.ok, false);
+    assert.equal(replayed.reason, 'receipt already used');
+  } finally {
+    srv.close();
+    rmSync(file, { force: true });
   }
 });

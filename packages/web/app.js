@@ -3154,7 +3154,7 @@ function toast(msg, isError = false) {
   toast._t = setTimeout(() => { el.hidden = true; }, 5000);
 }
 
-/* ---------- x402 wallet payment (Circle Facilitator Service) ---------- */
+/* ---------- burn-to-pay: the visitor burns ABYS, the receipt pays ---------- */
 
 // POST /intervene is paid by signing an EIP-3009 authorization that Circle
 // settles on Arc. Until the operator configures a seller key the endpoint
@@ -3261,9 +3261,19 @@ async function intervene(body) {
         toast(t('needWallet'), true);
         return;
       }
-      res = await send({ 'x-payment-tx': paid.tx });
+      // The burn needs a block or two before its receipt exists; retry while
+      // the server still cannot find it, so a fast wallet does not read as a
+      // failed payment.
+      let pending = null;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        res = await send({ 'x-payment-tx': paid.tx });
+        pending = await res.json();
+        if (res.status !== 402 || !/not found|lookup failed/.test(pending.reason ?? '')) break;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      data = pending;
     }
-    const data = await res.json();
+    if (data === null) data = await res.json();
     if (res.status === 402) {
       toast(t('payFailed', { reason: payReasonText(data.reason ?? data.error) }), true);
     } else if (!res.ok) {

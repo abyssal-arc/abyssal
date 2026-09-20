@@ -498,6 +498,13 @@ export function createApp(options: AppOptions = {}) {
           503,
         );
       }
+      // Validate the request fully before touching the payment: a typo in
+      // x/y/radius must cost nothing, so the burn receipt is only consumed
+      // once we know the intervention can actually be applied.
+      const intervention = buildIntervention(body);
+      if (!intervention) {
+        return json({ error: 'invalid intervention params (need x, y, radius 10..300 inside the world)' }, 400);
+      }
       const offer = burnOffer(type);
       const txHash = String(req.headers.get('x-payment-tx') ?? body.tx ?? '');
       if (!txHash) {
@@ -506,10 +513,6 @@ export function createApp(options: AppOptions = {}) {
       const verdict = await verifyBurnReceipt(rpcUrl, offer, txHash);
       if (!verdict.ok) {
         return json({ error: 'payment required', accepts: [offer], reason: verdict.reason }, 402);
-      }
-      const intervention = buildIntervention(body);
-      if (!intervention) {
-        return json({ error: 'invalid intervention params (need x, y, radius 10..300 inside the world)' }, 400);
       }
       const result = applyIntervention(world, intervention, {
         payer: verdict.payer,

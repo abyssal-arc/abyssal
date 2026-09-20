@@ -27,8 +27,8 @@ Two views over one data source:
   transfer; clicking an address or a leaderboard row jumps the camera to the
   matching whale or creature.
 
-Plus an intervention panel paid over real x402 (USDC at list price, or **ABYS**
-at a ~30% discount).
+Plus an intervention panel paid by **burning ABYS**: the burn receipt is the
+payment, and nobody custodies anything.
 
 > Everything in this repository is original work.
 
@@ -39,7 +39,7 @@ at a ~30% discount).
 │ Browser (packages/web)                                     │
 │  Canvas world / observatory / charts / cull lists / panel  │
 └──────────────┬───────────────────────────────▲─────────────┘
-        poll /snapshot /observe /history   POST /intervene (x402)
+        poll /snapshot /observe /history   POST /intervene (burn receipt)
                │                               │
 ┌──────────────▼───────────────────────────────┴─────────────┐
 │ packages/server  (Fetch API handler: export default fetch) │
@@ -166,11 +166,11 @@ calmer pre/after-market, near-zero on weekends). See
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/observe` | Arc USDC flow observatory: window stats, endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
-| POST | `/intervene` | x402-gated intervention: USDC at list price or ABYS at a ~30% discount |
+| POST | `/intervene` | intervention gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
 | POST | `/tick` | debug: advance one tick manually |
 | GET | `/ui` | Redirects to `/` |
 
-## Interventions and x402 payments
+## Interventions: burn-to-pay
 
 Four interventions (`packages/server/src/payments.ts`):
 
@@ -203,17 +203,22 @@ environment (food, drains, spawn rates) and a chain transfer becomes plankton
 at a landing site; no code path writes a payment, a price or a settlement
 outcome into an individual creature's genome or brain, and the sim never pays
 anybody back. There is no agent-to-agent transfer, no prediction market and no
-reward stream: ABYS is only a discounted unit for buying environment
-perturbations. `sim.test.ts` pins the environment-only half of that boundary.
+reward stream: ABYS is only the unit for buying environment perturbations. `sim.test.ts` pins the environment-only half of that boundary.
 
 Either way, an unpaid request gets **HTTP 402** with a body like:
 
 ```json
 { "error": "payment required",
-  "accepts": [{ "scheme": "x402", "network": "arc", "chainId": 5042,
-                "asset": "USDC", "tokenAddress": "0x3600…0000",
-                "amount": "50000", "payTo": "0x…" }] }
+  "accepts": [{ "scheme": "exact", "settle": "burn", "network": "eip155:5042",
+                "asset": "0xABYS…", "amount": "100000000000" }] }
 ```
+
+The wallet sends `burn(amount)` itself and the client retries while the
+receipt is still pending, so a fast wallet never reads as a failed payment.
+Used receipts are appended to `.data/used-burns.txt` (`USED_BURNS_FILE`
+relocates it), so a server restart cannot replay an old burn. Request params
+are validated before the receipt is consumed: a typo in x/y/radius costs
+nothing.
 
 ## Simulation engine notes (packages/sim)
 
