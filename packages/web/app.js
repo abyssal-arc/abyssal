@@ -2087,6 +2087,134 @@ function render() {
   }
   wctx.globalAlpha = 1;
 
+/* ---------- abyss frame: trench walls, portal ring, gold data rain ---------- */
+
+const frameRnd = mulberry32(0xab155a1);
+const CANYON_L = [];
+const CANYON_R = [];
+for (let i = 0; i <= 14; i++) {
+  CANYON_L.push(0.035 + 0.05 * Math.sin(i * 1.7) ** 2 + frameRnd() * 0.03);
+  CANYON_R.push(0.035 + 0.05 * Math.cos(i * 1.3) ** 2 + frameRnd() * 0.03);
+}
+const RAIN_COLS = [];
+for (let i = 0; i < 9; i++) {
+  RAIN_COLS.push({
+    fx: 0.42 + frameRnd() * 0.3,
+    speed: 0.00006 + frameRnd() * 0.00008,
+    phase: frameRnd() * 10,
+    w: 1 + frameRnd() * 2,
+  });
+}
+const NODES = [];
+for (let i = 0; i < 16; i++) {
+  NODES.push({ fx: 0.72 + frameRnd() * 0.26, fy: 0.25 + frameRnd() * 0.65, r: 1.5 + frameRnd() * 3, phase: frameRnd() * 10 });
+}
+const JELLIES = [];
+for (let i = 0; i < 7; i++) {
+  JELLIES.push({
+    fx: 0.15 + frameRnd() * 0.7, fy: 0.3 + frameRnd() * 0.6,
+    s: 6 + frameRnd() * 10, phase: frameRnd() * 10, speed: 0.00002 + frameRnd() * 0.00003,
+  });
+}
+
+/**
+ * The trench the tank sits in, in the token avatar's language: dark canyon
+ * walls frame the water, a portal ring at the surface pours the payment flow
+ * down as gold data rain, and the observatory's graph drifts on the right wall
+ * among jellyfish bells. Seeded once, so every viewer sees the same trench.
+ */
+function drawAbyssFrame(now, ct) {
+  wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  for (const [side, profile] of [['L', CANYON_L], ['R', CANYON_R]]) {
+    wctx.beginPath();
+    if (side === 'L') wctx.moveTo(0, 0); else wctx.moveTo(cssW, 0);
+    for (let i = 0; i < profile.length; i++) {
+      const y = (i / (profile.length - 1)) * cssH;
+      const x = side === 'L' ? profile[i] * cssW : cssW - profile[i] * cssW;
+      wctx.lineTo(x, y);
+    }
+    if (side === 'L') wctx.lineTo(0, cssH); else wctx.lineTo(cssW, cssH);
+    wctx.closePath();
+    wctx.fillStyle = 'rgba(2, 6, 9, 0.92)';
+    wctx.fill();
+    wctx.strokeStyle = 'rgba(111, 214, 255, 0.10)';
+    wctx.lineWidth = 1;
+    wctx.stroke();
+  }
+  const px0 = 0.57 * cssW;
+  const py0 = -0.06 * cssH;
+  for (let k = 0; k < 3; k++) {
+    wctx.beginPath();
+    wctx.ellipse(px0, py0, (0.16 + k * 0.05) * cssW, (0.035 + k * 0.012) * cssH, 0, 0, TAU);
+    wctx.strokeStyle = `rgba(233, 161, 63, ${0.16 - k * 0.04})`;
+    wctx.lineWidth = 1;
+    wctx.stroke();
+  }
+  const rainA = 0.10 + 0.35 * ct;
+  for (const col of RAIN_COLS) {
+    const x = col.fx * cssW;
+    const span = cssH * 0.85;
+    const off = (now * col.speed + col.phase) % 1;
+    for (let d = 0; d < 26; d++) {
+      const t = (off + d / 26) % 1;
+      const y = t * span;
+      const fade = Math.sin(t * Math.PI);
+      const sz = col.w * (0.6 + fade);
+      wctx.globalAlpha = rainA * fade * (0.5 + 0.5 * Math.sin(now / 700 + d + col.phase));
+      wctx.fillStyle = d % 5 === 0 ? '#ffcc6f' : '#e9a13f';
+      wctx.fillRect(x - sz / 2, y, sz, sz * 1.6);
+    }
+  }
+  wctx.globalAlpha = 1;
+  wctx.strokeStyle = 'rgba(111, 214, 255, 0.10)';
+  wctx.lineWidth = 0.6;
+  for (let i = 0; i < NODES.length; i++) {
+    for (let j = i + 1; j < NODES.length; j++) {
+      const a = NODES[i];
+      const b = NODES[j];
+      const dx = (a.fx - b.fx) * cssW;
+      const dy = (a.fy - b.fy) * cssH;
+      if (dx * dx + dy * dy < (0.12 * cssW) ** 2) {
+        wctx.beginPath();
+        wctx.moveTo(a.fx * cssW, a.fy * cssH);
+        wctx.lineTo(b.fx * cssW, b.fy * cssH);
+        wctx.stroke();
+      }
+    }
+  }
+  for (const n of NODES) {
+    const tw = 0.5 + 0.5 * Math.sin(now / 1200 + n.phase);
+    wctx.globalAlpha = 0.25 + 0.35 * tw;
+    wctx.fillStyle = '#7fd8ff';
+    wctx.beginPath();
+    wctx.arc(n.fx * cssW, n.fy * cssH, n.r * (0.8 + 0.4 * tw), 0, TAU);
+    wctx.fill();
+  }
+  for (const j of JELLIES) {
+    const y = (((j.fy - now * j.speed) % 1) + 1) % 1 * cssH;
+    const x = j.fx * cssW + 6 * Math.sin(now / 2600 + j.phase);
+    const pulse = 0.85 + 0.15 * Math.sin(now / 900 + j.phase);
+    wctx.globalAlpha = 0.3;
+    wctx.strokeStyle = '#9fe8ff';
+    wctx.lineWidth = 1;
+    wctx.beginPath();
+    wctx.arc(x, y, j.s * pulse, Math.PI, 0);
+    wctx.stroke();
+    for (let t = -2; t <= 2; t++) {
+      wctx.beginPath();
+      wctx.moveTo(x + t * j.s * 0.35, y);
+      wctx.quadraticCurveTo(
+        x + t * j.s * 0.5, y + j.s * 1.2,
+        x + t * j.s * 0.3 + 2 * Math.sin(now / 700 + t), y + j.s * 2.2,
+      );
+      wctx.stroke();
+    }
+  }
+  wctx.globalAlpha = 1;
+}
+
+  drawAbyssFrame(now, ct);
+
   // 3) Market volatility shimmer (kept faint on purpose).
   const m = latestSnap.marketTemp ?? 0;
   if (m > 0.5) {

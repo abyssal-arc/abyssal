@@ -5,9 +5,9 @@
 
 :root {
   /* background */
-  --bg-0: #04070d;
-  --bg-1: #060a12;
-  --bg-2: #0a101d;
+  --bg-0: #020709;
+  --bg-1: #031015;
+  --bg-2: #06171d;
 
   /* glass panels */
   --glass-bg: rgba(10, 16, 29, 0.62);
@@ -22,8 +22,8 @@
   --fg-3: #54637e;
 
   /* accents */
-  --accent: #4dd0e1;
-  --accent-dim: rgba(77, 208, 225, 0.16);
+  --accent: #6fd6ff;
+  --accent-dim: rgba(111, 214, 255, 0.16);
   --danger: #ff4d6d;
   --amber: #e0a34d;
 
