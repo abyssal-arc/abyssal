@@ -21,7 +21,10 @@ Two views over one data source:
 - **WORLD**: a deterministic ecosystem driven by that same flow. Chain
   congestion sets the food spawn rate, market turbulence sets the excitation,
   and the window's biggest payers swim through the tank as whales whose own
-  transfers feed the water around them.
+  transfers feed the water around them.  First visit rides a causal lens: the camera follows one real transfer from
+  chain to plankton to the creature that eats it. Clicking a meteor opens its
+  transfer; clicking an address or a leaderboard row jumps the camera to the
+  matching whale or creature.
 
 Plus an intervention panel paid over real x402 (USDC at list price, or **ABYS**
 at a ~30% discount).

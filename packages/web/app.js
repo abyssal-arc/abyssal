@@ -976,9 +976,9 @@ function drawWhales(now, sx, sy, shX, shY, ct) {
     const bucket = lane.seed % HUE_BUCKETS;
     const frames = creatureFrames('WHALE', bucket);
     const frame = frames[Math.floor(t / 220 + (lane.seed % 4)) % frames.length];
-    const px = x * sx + shX;
-    const py = y * sy + shY;
-    const scale = (size * sx) / SPRITE;
+    const px = vx(x * sx) + shX;
+    const py = vy(y * sy) + shY;
+    const scale = (size * sx * cam.z) / SPRITE;
     const cos = Math.cos(angle);
     const sin = Math.sin(angle);
     wctx.setTransform(
@@ -1002,7 +1002,7 @@ function drawWhales(now, sx, sy, shX, shY, ct) {
         wctx.strokeStyle = hsla(PALETTE_HUES[bucket], 100, 80, (1 - k) * 0.55 * edge);
         wctx.lineWidth = 1.6;
         wctx.beginPath();
-        wctx.arc(px, py, size * sx * (0.45 + k * 0.5), 0, TAU);
+        wctx.arc(px, py, size * sx * cam.z * (0.45 + k * 0.5), 0, TAU);
         wctx.stroke();
         // The only moment a whale carries a label: while its money is landing.
         wctx.globalAlpha = (1 - k) * 0.85 * edge;
@@ -1011,14 +1011,14 @@ function drawWhales(now, sx, sy, shX, shY, ct) {
         wctx.textAlign = 'center';
         wctx.fillText(
           `#${w.rank} ${shortAddr(w.address)} · ${fmtUsd(fed.amount)}`,
-          px, py + size * sx * 0.5 + 14,
+          px, py + size * sx * cam.z * 0.5 + 14,
         );
       }
     }
     wctx.globalAlpha = 1;
     whaleHits.push({
       addr: w.address, rank: w.rank, volume: w.volume, count: w.count,
-      x: px, y: py, r: size * sx * 0.45,
+      x: px, y: py, r: size * sx * cam.z * 0.45,
     });
   }
   wctx.textAlign = 'left';
@@ -1052,6 +1052,90 @@ function creatureHitAt(ev) {
   }
   return best;
 }
+/* ---------- camera: causal lens and follow shots ---------- */
+
+/** Focus in normalized world coords plus zoom; identity until something asks. */
+const cam = { fx: 0.5, fy: 0.5, z: 1 };
+window.__cam = cam;
+/** { kind, id|addr|x|y, until, z } for leaderboard/whale/address follow shots. */
+let follow = null;
+/** Scripted first-visit sequence: money lands, food lands, somebody eats it. */
+let causal = null;
+
+function vx(bx) { return (bx - cam.fx * cssW) * cam.z + cssW / 2; }
+function vy(by) { return (by - cam.fy * cssH) * cam.z + cssH / 2; }
+function baseXFromView(v) { return (v - cssW / 2) / cam.z + cam.fx * cssW; }
+function baseYFromView(v) { return (v - cssH / 2) / cam.z + cam.fy * cssH; }
+
+/** Closed-form whale position, mirroring drawWhales, for camera targeting. */
+function whaleWorldAt(w, t, W, H) {
+  const lane = w.lane;
+  if (!lane) return null;
+  const u = ((lane.phaseU + t / lane.period) % 1.2) - 0.1;
+  return { x: u * W, y: lane.lane * H + Math.sin(t / 23000 + lane.phaseY) * H * 0.05 };
+}
+
+function followCreature(id, ms) { follow = { kind: 'creature', id, until: clock() + ms, z: 2.4 }; }
+function followWhale(addr, ms) { follow = { kind: 'whale', addr, until: clock() + ms, z: 2.2 }; }
+function focusPoint(x, y, ms, z = 2.2) { follow = { kind: 'point', x, y, until: clock() + ms, z }; }
+
+function setCausalCard(key, params) {
+  const el = document.getElementById('causal-card');
+  if (!el) return;
+  if (!key) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = t(key, params);
+}
+
+function camGoal(now, snap) {
+  if (causal) {
+    const el = now - causal.t0;
+    if (el < 3500) {
+      setCausalCard('causalPay', causal.meta);
+      return { fx: causal.x / snap.width, fy: causal.y / snap.height, z: 2.4 };
+    }
+    if (el < 7500 && causal.creatureId != null) {
+      const c = snap.byId.get(causal.creatureId);
+      if (c) {
+        setCausalCard('causalEat', { name: c.name ?? `#${c.id}` });
+        return { fx: c.x / snap.width, fy: c.y / snap.height, z: 2.0 };
+      }
+    }
+    if (el < 9500) { setCausalCard(null); return { fx: 0.5, fy: 0.5, z: 1 }; }
+    causal = null;
+    setCausalCard(null);
+  }
+  if (follow) {
+    if (now >= follow.until) follow = null;
+    else if (follow.kind === 'creature') {
+      const c = snap.byId.get(follow.id);
+      if (c) return { fx: c.x / snap.width, fy: c.y / snap.height, z: follow.z };
+    } else if (follow.kind === 'whale') {
+      const w = chainWhales.find((x) => x.address === follow.addr);
+      const at = w ? whaleWorldAt(w, now - (clockOffset ?? 0), snap.width, snap.height) : null;
+      if (at) return { fx: at.x / snap.width, fy: at.y / snap.height, z: follow.z };
+    } else {
+      return { fx: follow.x / snap.width, fy: follow.y / snap.height, z: follow.z };
+    }
+  }
+  return { fx: 0.5, fy: 0.5, z: 1 };
+}
+
+/** First visit: ride one real transfer from chain to plankton to predator. */
+function startCausal() {
+  const snap = latestSnap;
+  if (!snap) return;
+  const real = impacts.filter((i) => i.meta).slice(-1)[0];
+  if (!real) return;
+  let best = null;
+  let bd = Infinity;
+  for (const c of snap.byId.values()) {
+    const d = (c.x - real.x) ** 2 + (c.y - real.y) ** 2;
+    if (d < bd) { bd = d; best = c; }
+  }
+  causal = { t0: clock(), x: real.x, y: real.y, meta: real.meta, creatureId: best?.id ?? null };
+}
+
 /** Local clock minus server clock (ms); null until first estimate. */
 let clockOffset = null;
 /** How far the offset may creep back up per poll, to follow real clock drift. */
@@ -1324,9 +1408,18 @@ async function openAddrCard(address) {
   // Resolve at open time: the server-provided explorer URL may not have
   // arrived yet on the very first render.
   card.querySelector('a.explore').href = explorerTxUrl.replace(/\/tx\/?$/, '/address/') + address;
+  // Jump back into the tank: follow this address's whale if the window ranks
+  // it, otherwise the button stays hidden (no whale, nothing to follow).
+  const jump = document.getElementById('addr-world');
+  jump.hidden = !chainWhales.some((w) => w.address.toLowerCase() === addr);
   card.hidden = false;
 }
 
+document.getElementById('addr-world').addEventListener('click', () => {
+  if (!addrCardAddr) return;
+  setView('world');
+  followWhale(addrCardAddr, 8000);
+});
 document.querySelector('#addr-card .tx-close').addEventListener('click', () => {
   addrCardAddr = null;
   document.getElementById('addr-card').hidden = true;
@@ -1899,6 +1992,13 @@ function render() {
   const easeK = 1 - Math.exp(-frameDt / 38);
   const sx = cssW / latestSnap.width;
   const sy = cssH / latestSnap.height;
+  // Ease the camera toward whatever the causal lens or a follow shot wants;
+  // identity focus keeps every other frame pixel-identical to before.
+  const goal = camGoal(now, latestSnap);
+  const ck = 1 - Math.exp(-frameDt / 260);
+  cam.fx += (goal.fx - cam.fx) * ck;
+  cam.fy += (goal.fy - cam.fy) * ck;
+  cam.z += (goal.z - cam.z) * ck;
 
   // Screen shake (kill cam): small decaying offset, toggleable. The jitter is
   // keyed to wall-clock time instead of Math.random() so the same instant
@@ -1986,7 +2086,7 @@ function render() {
   wctx.globalAlpha = foodVib;
   for (const f of latestSnap.foods) {
     const sprite = foodSprite(Math.abs(f.x * 7 + f.y * 13) % 3);
-    wctx.setTransform(DPR, 0, 0, DPR, (f.x * sx + shX) * DPR, (f.y * sy + shY) * DPR);
+    wctx.setTransform(DPR, 0, 0, DPR, (vx(f.x * sx) + shX) * DPR, (vy(f.y * sy) + shY) * DPR);
     wctx.drawImage(sprite, -15, -15, 30, 30);
   }
   wctx.globalAlpha = 1;
@@ -2061,8 +2161,8 @@ function render() {
         rp.x = ((rp.x % s2.width) + s2.width) % s2.width;
         rp.y = ((rp.y % s2.height) + s2.height) % s2.height;
       }
-      const px = rp.x * sx + shX;
-      const py = rp.y * sy + shY;
+      const px = vx(rp.x * sx) + shX;
+      const py = vy(rp.y * sy) + shY;
 
       // Creatures dim and hunch slightly when the chain goes cold.
       const vib = 0.55 + 0.45 * ct;
@@ -2070,7 +2170,7 @@ function render() {
       const frame = frames.length > 1
         ? frames[Math.floor(now / 160 + c.phase * 10) % frames.length]
         : frames[0];
-      const base = (c.radius * 0.9 + Math.min(2, c.energy / 60)) * sx / SPRITE_BODY * (0.82 + 0.18 * ct) * CREATURE_VISUAL_SCALE;
+      const base = (c.radius * 0.9 + Math.min(2, c.energy / 60)) * sx * cam.z / SPRITE_BODY * (0.82 + 0.18 * ct) * CREATURE_VISUAL_SCALE;
       let angle = heading;
       let scaleX = base;
       let scaleY = base;
@@ -2159,9 +2259,9 @@ function render() {
     for (const e of state.activeEffects) {
       const sprite = e.kind === 'poison' ? CLOUD_PURPLE : e.kind === 'feast' ? CLOUD_GREEN : null;
       if (!sprite) continue;
-      const px = e.x * sx + shX;
-      const py = e.y * sy + shY;
-      const pr = e.radius * sx * 2;
+      const px = vx(e.x * sx) + shX;
+      const py = vy(e.y * sy) + shY;
+      const pr = e.radius * sx * cam.z * 2;
       const pulse = 0.8 + 0.2 * Math.sin(now / 400);
       wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
       wctx.globalAlpha = 0.5 * pulse;
@@ -2183,8 +2283,8 @@ function render() {
     const k = age / e.dur;
     if (e.kind === 'burst') {
       for (const part of e.parts) {
-        const px = (e.x + part.vx * age / 16) * sx + shX;
-        const py = (e.y + part.vy * age / 16) * sy + shY;
+        const px = vx((e.x + part.vx * age / 16) * sx) + shX;
+        const py = vy((e.y + part.vy * age / 16) * sy) + shY;
         const s = part.size * (1 - k * 0.6);
         wctx.globalAlpha = 1 - k;
         wctx.drawImage(part.sprite, px - 8 * s, py - 8 * s, 16 * s, 16 * s);
@@ -2194,8 +2294,8 @@ function render() {
       for (const part of e.parts) {
         const p = Math.max(0, Math.min(1, (age - part.delay) / 500));
         if (p <= 0) continue;
-        const px = (e.x + part.ox) * sx + shX;
-        const py = e.y * sy - (1 - bounceOut(p)) * 80 + shY;
+        const px = vx((e.x + part.ox) * sx) + shX;
+        const py = vy(e.y * sy) - (1 - bounceOut(p)) * 80 * cam.z + shY;
         const s = part.size;
         wctx.globalAlpha = 1 - Math.max(0, k - 0.8) * 5;
         wctx.drawImage(DOTS.green, px - 8 * s, py - 8 * s, 16 * s, 16 * s);
@@ -2204,8 +2304,8 @@ function render() {
       // Glowing meteor on a long fall onto its hash-derived landing site;
       // whale-sized txs come down as fireballs with a shockwave ring.
       const fall = (1 - k) * (1 - k);
-      const px = e.x * sx + shX;
-      const py = (e.y - 420 * fall) * sy + shY;
+      const px = vx(e.x * sx) + shX;
+      const py = vy((e.y - 420 * fall) * sy) + shY;
       const s = 0.9 + e.size * 1.8;
       wctx.globalAlpha = 1;
       wctx.setTransform(DPR * s, 0, 0, DPR * s, px * DPR, py * DPR);
@@ -2234,7 +2334,7 @@ function render() {
       wctx.fillStyle = e.color;
       wctx.font = `bold ${12}px monospace`;
       wctx.textAlign = 'center';
-      wctx.fillText(e.text, e.x * sx + shX, (e.y - k * 25) * sy + shY);
+      wctx.fillText(e.text, vx(e.x * sx) + shX, vy((e.y - k * 25) * sy) + shY);
     } else if (e.kind === 'beam') {
       // Energy transfer: particles stream from the prey to the predator.
       const pred = latestSnap.byId.get(e.predatorId);
@@ -2244,8 +2344,8 @@ function render() {
       for (let i = 0; i < 10; i++) {
         const p = (age - i * 35) / 400;
         if (p < 0 || p > 1) continue;
-        const bx = (e.fx + torusDelta(e.fx, tx2, latestSnap.width) * p) * sx + shX;
-        const by = (e.fy + torusDelta(e.fy, ty2, latestSnap.height) * p) * sy + shY;
+        const bx = vx((e.fx + torusDelta(e.fx, latestSnap.width) * p) * sx) + shX;
+        const by = vy((e.fy + torusDelta(e.fy, latestSnap.height) * p) * sy) + shY;
         wctx.globalAlpha = 0.9 * (1 - p * 0.7) * (1 - k);
         wctx.drawImage(DOTS.white, bx - 5, by - 5, 10, 10);
       }
@@ -2254,7 +2354,7 @@ function render() {
       wctx.strokeStyle = e.color;
       wctx.lineWidth = 2;
       wctx.beginPath();
-      wctx.arc(e.x * sx + shX, e.y * sy + shY, Math.max(1, e.radius * sx * (0.15 + 0.85 * k)), 0, Math.PI * 2);
+      wctx.arc(vx(e.x * sx) + shX, vy(e.y * sy) + shY, Math.max(1, e.radius * sx * cam.z * (0.15 + 0.85 * k)), 0, Math.PI * 2);
       wctx.stroke();
     } else if (e.kind === 'edge') {
       wctx.globalAlpha = 0.35 * (1 - k);
@@ -2268,9 +2368,9 @@ function render() {
   // player always sees exactly what a click will affect.
   if (targeting && aimPos) {
     wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    const ax = aimPos.x * sx + shX;
-    const ay = aimPos.y * sy + shY;
-    const ar = 80 * sx;
+    const ax = vx(aimPos.x * sx) + shX;
+    const ay = vy(aimPos.y * sy) + shY;
+    const ar = 80 * sx * cam.z;
     const col = targeting === 'poison' ? '255, 90, 120' : '120, 230, 180';
     wctx.globalAlpha = 0.12;
     wctx.fillStyle = `rgba(${col}, 1)`;
@@ -2679,6 +2779,13 @@ function updateBoard() {
         entry.el.classList.remove('ev-new');
       }
       seen.add(r.id);
+      if (!entry.wired) {
+        entry.wired = true;
+        entry.el.addEventListener('click', () => {
+          selectedId = r.id;
+          followCreature(r.id, 6000);
+        });
+      }
       entry.el.children[0].style.background = ARCHETYPE_COLORS[r.archetype] ?? '#888';
       entry.el.children[1].textContent = r.name;
       if (entry.value !== r.value) {
@@ -3012,8 +3119,8 @@ window.addEventListener('keydown', (ev) => {
 function canvasToWorld(ev) {
   const r = worldCanvas.getBoundingClientRect();
   return {
-    x: ((ev.clientX - r.left) / r.width) * (latestSnap?.width ?? 1000),
-    y: ((ev.clientY - r.top) / r.height) * (latestSnap?.height ?? 1000),
+    x: (baseXFromView(ev.clientX - r.left) / cssW) * (latestSnap?.width ?? 1000),
+    y: (baseYFromView(ev.clientY - r.top) / cssH) * (latestSnap?.height ?? 1000),
   };
 }
 
@@ -3149,8 +3256,10 @@ if (localStorage.getItem('abyssal-seen') !== '1') {
   welcomeEl.hidden = false;
 }
 document.getElementById('enter').addEventListener('click', () => {
+  const first = localStorage.getItem('abyssal-seen') !== '1';
   localStorage.setItem('abyssal-seen', '1');
   welcomeEl.hidden = true;
+  if (first) startCausal();
 });
 // The "?" in the top bar reopens the how-to-play card at any time.
 document.getElementById('help-btn').addEventListener('click', () => {

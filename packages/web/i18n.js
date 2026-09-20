@@ -155,6 +155,9 @@ const dict = {
     payReceiptUsed: 'that burn receipt was already used',
     payBurnMissing: 'no ABYS burn of the asked amount found in that transaction',
     payTxReverted: 'that transaction reverted, nothing was burned',
+    causalPay: '{from} → {to} · {amount} USDC lands as plankton',
+    causalEat: '{name} turns toward the money',
+    viewInTank: 'view in tank',
   },
   fr: {
     day: 'Jour',
@@ -307,6 +310,9 @@ const dict = {
     payReceiptUsed: 'ce reçu de burn a déjà servi',
     payBurnMissing: "aucun burn d'ABYS du montant demandé trouvé dans cette transaction",
     payTxReverted: "cette transaction a revert, rien n'a été brûlé",
+    causalPay: '{from} → {to} · {amount} USDC tombe en plancton',
+    causalEat: "{name} se tourne vers l'argent",
+    viewInTank: 'voir dans le bac',
   },
   de: {
     day: 'Tag',
@@ -459,6 +465,9 @@ const dict = {
     payReceiptUsed: 'dieser Burn-Beleg wurde schon verwendet',
     payBurnMissing: 'kein ABYS-Burn der geforderten Höhe in dieser Transaktion gefunden',
     payTxReverted: 'diese Transaktion ist reverted, nichts wurde verbrannt',
+    causalPay: '{from} → {to} · {amount} USDC landet als Plankton',
+    causalEat: '{name} dreht zum Geld',
+    viewInTank: 'im Becken ansehen',
   },
   zh: {
     day: '天数',
@@ -611,6 +620,9 @@ const dict = {
     payReceiptUsed: '该销毁回执已使用过',
     payBurnMissing: '该交易中未找到足额 ABYS 销毁',
     payTxReverted: '该交易回滚，没有发生销毁',
+    causalPay: '{from} → {to} · {amount} USDC 落为浮游',
+    causalEat: '{name} 转向这笔钱',
+    viewInTank: '在缸中查看',
   },
   ja: {
     day: '日目',
@@ -763,6 +775,9 @@ const dict = {
     payReceiptUsed: 'そのバーン証明は使用済みです',
     payBurnMissing: 'その取引に所要額の ABYS バーンが見つかりません',
     payTxReverted: 'その取引はリバートし、バーンされませんでした',
+    causalPay: '{from} → {to} · {amount} USDC がプランクトンとして着水',
+    causalEat: '{name} がその金へ向きを変える',
+    viewInTank: '水槽で見る',
   },
   ko: {
     day: '일',
@@ -915,6 +930,9 @@ const dict = {
     payReceiptUsed: '해당 소각 영수증은 이미 사용되었습니다',
     payBurnMissing: '해당 트랜잭션에서 요청액의 ABYS 소각을 찾을 수 없습니다',
     payTxReverted: '해당 트랜잭션은 리버트되어 소각되지 않았습니다',
+    causalPay: '{from} → {to} · {amount} USDC가 플랑크톤으로 착수',
+    causalEat: '{name} 이 그 돈을 향해 돌아섭니다',
+    viewInTank: '수조에서 보기',
   },
 };
 

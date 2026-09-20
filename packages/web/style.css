@@ -283,6 +283,22 @@ body.view-observe {
 .icon-btn:hover { border-color: var(--accent); color: var(--fg-1); }
 .icon-btn.active { border-color: var(--accent); color: var(--accent); box-shadow: 0 0 10px var(--accent-dim); }
 
+#causal-card {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--sp) * 16);
+  transform: translateX(-50%);
+  z-index: 35;
+  max-width: min(560px, 86vw);
+  padding: calc(var(--sp) * 2.5) calc(var(--sp) * 4);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--fg-1);
+  text-align: center;
+  pointer-events: none;
+}
+#causal-card[hidden] { display: none; }
+#addr-world { margin-top: calc(var(--sp) * 2); }
 .langs { position: relative; }
 .lang-menu {
   position: absolute;
