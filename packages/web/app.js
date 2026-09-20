@@ -3156,16 +3156,10 @@ function toast(msg, isError = false) {
 
 /* ---------- burn-to-pay: the visitor burns ABYS, the receipt pays ---------- */
 
-// POST /intervene is paid by signing an EIP-3009 authorization that Circle
-// settles on Arc. Until the operator configures a seller key the endpoint
-// answers 503 and the panel says so; there is no unpaid path.
-
-function b64urlJson(obj) {
-  const bytes = new TextEncoder().encode(JSON.stringify(obj));
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
+// POST /intervene is paid by calling burn(amount) on the ABYS token: the
+// wallet sends the transaction, the receipt is the payment proof, and nobody
+// custodies anything. Until the operator exports ABYS_TOKEN_ADDRESS the
+// endpoint answers 503 and the panel says so; there is no unpaid path.
 
 const ARC_CHAINS = {
   5042: {
@@ -3244,6 +3238,7 @@ async function intervene(body) {
       body: JSON.stringify(body),
     });
     let res = await send({});
+    let data = null;
     if (res.status === 503) {
       toast(t('settlementUnconfigured'), true);
       return;

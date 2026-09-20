@@ -305,6 +305,7 @@ nothing.
 ## Token
 
 **ABYS** is the project's payment and discount asset: interventions and the
-paid data tier are quoted in USDC at list price and in ABYS at a ~30% discount.
+paid data tier are quoted in USDC (treasury revenue) or in ABYS at a discount;
+ABYS payments burn by construction, USDC payments fund operations.
 Supply, distribution and auction mechanics are designed in `TOKEN_PLAN.md` and
 are deliberately not restated here.
