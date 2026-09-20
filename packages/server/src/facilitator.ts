@@ -13,6 +13,12 @@
  * the keyless Arc testnet trial (eip155:5042002) with X402_TESTNET=1.
  */
 import { keccak256, recoverTypedDataAddress, toBytes } from 'viem';
+
+// Node exposes webcrypto globally since v19 and Workers always have it; the
+// dynamic import only runs on runtimes that lack both, so it never executes
+// where node:crypto does not exist.
+const rand: { getRandomValues(b: Uint8Array): Uint8Array } =
+  globalThis.crypto ?? (await import('node:crypto')).webcrypto;
 import { privateKeyToAccount } from 'viem/accounts';
 
 export const ARC_TESTNET_CHAIN_ID = 5042002;
@@ -71,7 +77,7 @@ async function sellerProof(
   method: string,
   body: string,
 ): Promise<string> {
-  const nonce = `0x${Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('hex')}`;
+  const nonce = `0x${Buffer.from(rand.getRandomValues(new Uint8Array(32))).toString('hex')}`;
   const issuedAt = Math.floor(Date.now() / 1000);
   const expiresAt = issuedAt + 300;
   const signature = await cfg.account.signTypedData({
