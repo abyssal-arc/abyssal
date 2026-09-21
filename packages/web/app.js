@@ -1220,6 +1220,7 @@ async function poll() {
     if (!chainCopyApplied) applyChainStrings();
     updateTopbar();
     updateBoard();
+    renderFollowing();
     renderProps(snap.world.propositions);
     renderBurners(snap.world.burners);
     renderFactions(snap.world.cheers);
@@ -1261,16 +1262,18 @@ setInterval(() => { if (!document.hidden) poll(); }, POLL_MS);
 
 async function pollAux() {
   try {
-    const [h, j, rep] = await Promise.all([
+    // Names follow the payload they carry: a positional swap here once fed the
+    // battle reports into the extinction lists and silently emptied them.
+    const [hist, culls, rep] = await Promise.all([
       // The charts decimate to CHART_SLOTS points anyway, so asking the server
       // for the undecimated window meant transferring ~10x more JSON than any
       // pixel could show, 456 KB every 10s, larger than the snapshot stream.
       getJSON(`/history?window=${HISTORY_WINDOW}&slots=${CHART_SLOTS}`),
-      getJSON('/reports'),
       getJSON('/judgments'),
+      getJSON('/reports'),
     ]);
-    lastStats = h.stats;
-    lastCulls = j.judgments;
+    lastStats = hist.stats;
+    lastCulls = culls.judgments;
     renderReports(rep?.reports);
     // Badges and rank move slower than the tank: refresh on the aux cadence.
     if (myAddr && Date.now() - meFetchedAt > 30_000) fetchMe();
@@ -2420,6 +2423,16 @@ function drawAbyssFrame(now, ct) {
         wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.75, 0, TAU);
         wctx.stroke();
       }
+      if (watched.size > 0 && watched.has(c.id)) {
+        // A followed creature stays findable in a tank of a hundred. Wider than
+        // the tax rim so a taxed species you follow shows both.
+        wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        wctx.strokeStyle = 'rgba(111, 214, 255, 0.5)';
+        wctx.lineWidth = 1.5;
+        wctx.beginPath();
+        wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.95, 0, TAU);
+        wctx.stroke();
+      }
       if (myCheer && c.archetype === myCheer) {
         // Your faction wears a dot in its own colour, so a rally is something
         // you can see in the water and not only in a drawer.
@@ -3506,9 +3519,7 @@ function renderCard(c) {
   `;
   // Bound after the markup exists: rebuilding the card throws the old node away.
   el.querySelector('#watch-btn').onclick = () => {
-    if (watched.has(c.id)) watched.delete(c.id);
-    else watched.add(c.id);
-    localStorage.setItem('abyssal-watch', JSON.stringify([...watched]));
+    setWatched(c.id, !watched.has(c.id));
     renderCard(c);
   };
 }
@@ -3533,6 +3544,68 @@ function renderProps(p) {
         p.yesterday.map((y) => `${t(PROP_KEYS[y.id] ?? y.id)} ${mark(y.ok)}`).join(' · ') + '</div>'
       : '');
 }
+
+/* ---------- following: a watched life is one click away ---------- */
+
+const WATCH_CAP = 12;
+
+function setWatched(id, on) {
+  if (on) {
+    watched.add(id);
+    // Oldest first out, so the list cannot grow without bound.
+    while (watched.size > WATCH_CAP) watched.delete(watched.values().next().value);
+  } else {
+    watched.delete(id);
+  }
+  localStorage.setItem('abyssal-watch', JSON.stringify([...watched]));
+  renderFollowing();
+}
+
+let followingSig = '';
+function renderFollowing() {
+  const group = document.getElementById('following-group');
+  const el = document.getElementById('following');
+  if (!group || !el) return;
+  if (watched.size === 0) {
+    group.hidden = true;
+    followingSig = '';
+    return;
+  }
+  group.hidden = false;
+  const rows = [...watched].map((id) => {
+    const c = latestSnap?.byId.get(id);
+    return c
+      ? { id, name: c.name ?? `#${id}`, color: ARCHETYPE_COLORS[c.archetype] ?? '#888', alive: true }
+      : { id, name: prevAlive.get(id)?.name ?? `#${id}`, color: 'var(--fg-3)', alive: false };
+  });
+  // Signature guard: the panel reconciles instead of rebuilding, so a followed
+  // creature does not blink every 400ms poll while nothing about it changed.
+  const sig = rows.map((r) => `${r.id}:${r.name}:${r.alive}`).join('|');
+  if (sig === followingSig) return;
+  followingSig = sig;
+  el.innerHTML = rows
+    .map((r) => `<div class="row${r.alive ? '' : ' gone'}" data-follow="${r.id}" title="${r.alive ? t('followingTip') : t('watchedGone')}">` +
+      `<i class="odot" style="background:${r.color}"></i>` +
+      `<span class="nm">${r.name}</span>` +
+      `<span class="val">${r.alive ? '' : `<b data-unwatch="${r.id}">×</b>`}</span></div>`)
+    .join('');
+}
+
+document.getElementById('following')?.addEventListener('click', (ev) => {
+  const off = ev.target.closest('[data-unwatch]');
+  if (off) {
+    setWatched(Number(off.dataset.unwatch), false);
+    return;
+  }
+  const row = ev.target.closest('[data-follow]');
+  if (!row) return;
+  const id = Number(row.dataset.follow);
+  const c = latestSnap?.byId.get(id);
+  if (!c) return;
+  selectedId = id;
+  renderCard(c);
+  followCreature(id, 8000);
+});
 
 /* ---------- who you are in the tank ---------- */
 
@@ -3565,7 +3638,7 @@ async function resolveMe() {
     } else {
       // Wallet gone: drop the standing and stop wearing its colours.
       myCheer = null;
-      document.getElementById('me-wrap').hidden = true;
+      renderMe();
       renderFactions(null);
     }
   } catch { /* no wallet, or it refused */ }
@@ -3591,11 +3664,16 @@ function badgeChips(ids, tiny = false) {
 }
 
 function renderMe() {
-  const wrap = document.getElementById('me-wrap');
   const el = document.getElementById('me-card');
-  if (!wrap || !el) return;
-  if (!myAddr) { wrap.hidden = true; return; }
-  wrap.hidden = false;
+  const none = document.getElementById('me-none');
+  if (!el) return;
+  if (!myAddr) {
+    el.hidden = true;
+    if (none) none.hidden = false;
+    return;
+  }
+  el.hidden = false;
+  if (none) none.hidden = true;
   const w = myWho;
   const line = (k, v) => `<div class="prop"><span>${t(k)}</span><b>${v}</b></div>`;
   el.innerHTML =
@@ -3798,8 +3876,8 @@ document.querySelectorAll('[data-collapse]').forEach((head) => {
   });
 });
 
-// Bottom dock: obituaries / analytics drawers (mutually exclusive).
-const drawers = { obits: 'drawer-obits', analytics: 'drawer-analytics' };
+// Bottom dock: deaths / data / standing drawers (mutually exclusive).
+const drawers = { obits: 'drawer-obits', analytics: 'drawer-analytics', you: 'drawer-you' };
 function toggleDrawer(which) {
   for (const [key, id] of Object.entries(drawers)) {
     const el = document.getElementById(id);
@@ -3814,6 +3892,13 @@ function toggleDrawer(which) {
 }
 document.getElementById('dock-obits').addEventListener('click', () => toggleDrawer('obits'));
 document.getElementById('dock-analytics').addEventListener('click', () => toggleDrawer('analytics'));
+document.getElementById('dock-you').addEventListener('click', () => {
+  toggleDrawer('you');
+  // Opening the drawer is the moment a visitor expects to see their own row,
+  // even if the last background refresh was a while ago.
+  if (myAddr) fetchMe();
+  else resolveMe();
+});
 
 // First-visit welcome layer.
 const welcomeEl = document.getElementById('welcome');
@@ -3841,6 +3926,8 @@ document.addEventListener('langchange', () => {
   }
   if (lastStats) drawCharts();
   if (lastCulls) renderObituaries(lastCulls);
+  followingSig = '';
+  renderFollowing();
   renderMe();
   renderFactions(null);
   if (selectedId != null && latestSnap) {

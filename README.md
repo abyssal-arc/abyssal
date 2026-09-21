@@ -154,6 +154,10 @@ calmer pre/after-market, near-zero on weekends). See
 
 ## Reading the tank
 
+The bottom dock opens three drawers so none of them has to hold everything:
+deaths (memorials and the cull lists), data (the day in review, battle reports,
+charts, exports), and you (your standing, factions, the contribution board).
+
 - **Daily propositions**: three standings resolved from the world itself (does
   ALGO lead predation, does one species hold over half the tank, did predation
   beat yesterday). No oracle and no market: anybody can recompute them from
@@ -164,8 +168,9 @@ calmer pre/after-market, near-zero on weekends). See
   children it left and its largest meal, plus the titles it earned by what it
   actually did: eight kills is apex, four children is lineage bearer, dying
   inside a paid poison is poison ghost. The ring keeps the newest 24.
-- **Following one life**: the creature card has a watch button. The list stays
-  in local storage and a death or a birth raises a toast.
+- **Following one life**: the creature card has a watch button, the followed
+  creatures are listed in the left panel for a one-click ride along, they wear
+  a ring in the water, and a death or a birth raises a toast.
 - **Battle reports**: a paid intervention is scored 400 ticks after the burn,
   poison by how many of the creatures it caught are dead, feed by how many
   lived, weather by the population swing.
@@ -174,7 +179,7 @@ calmer pre/after-market, near-zero on weekends). See
   lineage.
 - **Replay**: the pulse chart replays the last 90 seconds with a playhead and a
   per-bucket readout.
-- **Contribution board**: the analytics drawer ranks who has burned for the
+- **Contribution board**: the standing drawer ranks who has burned for the
   tank, with their badges and the faction they rally for, and every
   intervention zone stays signed on the water.
 - **Your standing**: `GET /who?addr=` answers with what an address burned, its

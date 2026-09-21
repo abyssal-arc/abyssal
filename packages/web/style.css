@@ -449,6 +449,12 @@ button.chip.faction.mine {
 .board-list .row .odot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; box-shadow: 0 0 6px currentColor; }
 .board-list .row .val { margin-left: auto; color: var(--fg-2); font-family: var(--font-display); font-variant-numeric: tabular-nums; }
 .board-list .empty { color: var(--fg-3); font-size: 11px; }
+/* followed creatures: clickable, and a dead one can be dropped from the list */
+#following .row { cursor: pointer; }
+#following .row:hover .nm { color: var(--fg-1); }
+#following .row.gone .nm { color: var(--fg-3); text-decoration: line-through; }
+#following .row .val b { cursor: pointer; padding: 0 3px; color: var(--fg-3); font-weight: 400; }
+#following .row .val b:hover { color: var(--danger); }
 
 /* ---------- intervention buttons ---------- */
 .hint { font-size: 11px; color: var(--fg-3); line-height: 1.6; margin-bottom: calc(var(--sp) * 2.5); }

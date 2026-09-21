@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   mulberry32, hashSeed, mixSeed, unitNoise, buildFrameGeometry,
 } from '../src/geom.js';
@@ -47,4 +49,17 @@ test('format helpers', () => {
   assert.equal(fmtUsd(3_000_000_000), '$3.00B');
   assert.equal(shortAddr('0x1234567890abcdef'), '0x1234…cdef');
   assert.equal(hsla(180, 50, 50, 0.5), 'hsla(180, 50%, 50%, 0.5)');
+});
+
+test('pollAux keeps its three payloads in the order it destructures them', () => {
+  // A positional swap here once handed the battle reports to the extinction
+  // lists, which read `.judgments` off them and quietly showed "no culls yet".
+  const src = readFileSync(fileURLToPath(new URL('../app.js', import.meta.url)), 'utf8');
+  const body = src.slice(src.indexOf('async function pollAux'), src.indexOf('async function pollObserve'));
+  const asked = [...body.matchAll(/getJSON\(`?'?([^'`)]+)/g)].map((m) => m[1].split('?')[0]);
+  assert.deepEqual(asked.slice(0, 3), ['/history', '/judgments', '/reports']);
+  const [names] = body.match(/const \[([^\]]+)\] = await Promise\.all/).slice(1);
+  assert.deepEqual(names.split(',').map((s) => s.trim()), ['hist', 'culls', 'rep']);
+  assert.match(body, /lastCulls = culls\.judgments/);
+  assert.match(body, /renderReports\(rep\?\.reports\)/);
 });

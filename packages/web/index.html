@@ -121,6 +121,10 @@
       <span class="ph-title" data-i18n="leaderboard">Leaderboard</span><i class="chev"></i>
     </div>
     <div class="panel-body">
+      <div class="board-group" id="following-group" hidden>
+        <div class="board-title" data-i18n="followingTitle" data-i18n-title="followingTip" title="Creatures you follow. Click one to ride along with it.">Following</div>
+        <div id="following" class="board-list"></div>
+      </div>
       <div class="board-group">
         <div class="board-title" data-i18n="topPredators" data-i18n-title="predTip" title="Kills steal 50% of the victim's energy — predators grow, the weak get culled.">Top Predators</div>
         <div id="lb-predators" class="board-list"></div>
@@ -172,10 +176,13 @@
   <div id="dock" class="glass rise">
     <button id="dock-obits" class="dock-btn"><span data-i18n="extinctionLists">Extinction lists</span></button>
     <button id="dock-analytics" class="dock-btn"><span data-i18n="analytics">Analytics</span></button>
+    <button id="dock-you" class="dock-btn"><span data-i18n="dockYou">You</span></button>
     <span class="token" id="dock-token" data-i18n="tokenTbd">Token: TBD</span>
   </div>
 
   <div id="drawer-obits" class="drawer glass" hidden>
+    <div class="section-title"><span data-i18n="memorialsTitle">Memorials</span></div>
+    <div id="memorials"></div>
     <div class="section-title"><span data-i18n="extinctionLists">Extinction lists</span><span class="legend"><i class="dot harvest"></i><span data-i18n="harvest">harvest</span> <i class="dot judgment"></i><span data-i18n="judgment">judgment</span></span></div>
     <div id="death-stats"></div>
     <div id="judgments" data-i18n="noCulls">No culls yet</div>
@@ -197,18 +204,8 @@
       <button class="dock-btn" data-export="digest" data-i18n="exportDigest">Day digest</button>
       <div class="section-title" data-i18n="dailyTitle">Today in the abyss</div>
       <div id="daily-report" class="daily"></div>
-      <div id="me-wrap" hidden>
-        <div class="section-title" data-i18n="yourStanding">Your standing</div>
-        <div id="me-card" class="daily"></div>
-      </div>
-      <div class="section-title" data-i18n="factionsTitle">Factions</div>
-      <div id="factions" class="chips"></div>
-      <div class="section-title" data-i18n="burnersTitle">Top burners</div>
-      <div id="burners"></div>
       <div class="section-title" data-i18n="reportsTitle">Battle reports</div>
       <div id="reports"></div>
-      <div class="section-title" data-i18n="memorialsTitle">Memorials</div>
-      <div id="memorials"></div>
       <div id="chart-wrap">
         <div class="section-title" data-i18n="popHistory">Population history</div>
         <canvas id="chart"></canvas>
@@ -218,6 +215,16 @@
         <canvas id="temps"></canvas>
       </div>
     </div>
+  </div>
+
+  <div id="drawer-you" class="drawer glass" hidden>
+    <div class="section-title" data-i18n="yourStanding">Your standing</div>
+    <div id="me-card" class="daily" hidden></div>
+    <div id="me-none" class="addr-empty" data-i18n="standingNone">Burn ABYS from your wallet and your standing appears here.</div>
+    <div class="section-title" data-i18n="factionsTitle">Factions</div>
+    <div id="factions" class="chips"></div>
+    <div class="section-title" data-i18n="burnersTitle">Top burners</div>
+    <div id="burners"></div>
   </div>
 
   <div id="welcome" hidden>
