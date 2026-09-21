@@ -1222,6 +1222,7 @@ async function poll() {
     updateBoard();
     renderProps(snap.world.propositions);
     renderBurners(snap.world.burners);
+    renderFactions(snap.world.cheers);
     renderDaily(snap.world.daily);
     renderMemorials(snap.world.obituaries);
     if (snap.events.length > 0) {
@@ -1271,6 +1272,8 @@ async function pollAux() {
     lastStats = h.stats;
     lastCulls = j.judgments;
     renderReports(rep?.reports);
+    // Badges and rank move slower than the tank: refresh on the aux cadence.
+    if (myAddr && Date.now() - meFetchedAt > 30_000) fetchMe();
     drawCharts();
     renderObituaries(lastCulls);
   } catch { /* keep stale aux data */ }
@@ -1443,7 +1446,42 @@ async function openAddrCard(address) {
   // it, otherwise the button stays hidden (no whale, nothing to follow).
   const jump = document.getElementById('addr-world');
   jump.hidden = !chainWhales.some((w) => w.address.toLowerCase() === addr);
+  renderAddrTank(address);
   card.hidden = false;
+}
+
+/**
+ * The tank half of an address: what it burned, what it earned, and how its
+ * interventions turned out. Hidden for an address the tank has never seen, so
+ * a plain chain whale does not get an empty standing block.
+ */
+async function renderAddrTank(address) {
+  const wrap = document.getElementById('addr-tank');
+  const body = document.getElementById('addr-tank-body');
+  wrap.hidden = true;
+  try {
+    const res = await fetch(`/who?addr=${encodeURIComponent(address)}`);
+    if (!res.ok) return;
+    const w = await res.json();
+    if (addrCardAddr !== address.toLowerCase()) return;
+    if (!w.known && !w.pass?.active && !w.cheer) return;
+    const line = (k, v) => `<div class="prop"><span>${t(k)}</span><b>${v}</b></div>`;
+    body.innerHTML =
+      line('burnedTotal', `${w.burned.toLocaleString()} ABYS`) +
+      line('burnCount', w.burns) +
+      (w.rank ? line('boardRank', `#${w.rank}`) : '') +
+      (w.pass?.active ? line('passLabel', `D${Math.floor(w.pass.until / 19200)}`) : '') +
+      (w.cheer ? line('rallyingFor', w.cheer) : '') +
+      (w.badges?.length ? `<div class="chips">${badgeChips(w.badges)}</div>` : '') +
+      (w.reports?.length
+        ? `<div class="addr-sub">${t('reportsTitle')}</div>` +
+          w.reports
+            .map((r) => `<div class="prop"><span>${r.type} · ${r.affected}</span>` +
+              `<b>${r.score === undefined ? '…' : `${r.score} ${r.score > 0 ? t('scoreWorth') : t('scoreWaste')}`}</b></div>`)
+            .join('')
+        : '');
+    wrap.hidden = false;
+  } catch { /* the chain half is enough on its own */ }
 }
 
 document.getElementById('addr-world').addEventListener('click', () => {
@@ -2382,6 +2420,17 @@ function drawAbyssFrame(now, ct) {
         wctx.arc(px, py, SPRITE_BODY * base * cam.z * 0.75, 0, TAU);
         wctx.stroke();
       }
+      if (myCheer && c.archetype === myCheer) {
+        // Your faction wears a dot in its own colour, so a rally is something
+        // you can see in the water and not only in a drawer.
+        wctx.setTransform(DPR, 0, 0, DPR, px * DPR, (py - SPRITE_BODY * base * sy / sx - 20) * DPR);
+        wctx.globalAlpha = 0.85;
+        wctx.fillStyle = ARCHETYPE_COLORS[c.archetype];
+        wctx.beginPath();
+        wctx.arc(0, 0, 2.5, 0, TAU);
+        wctx.fill();
+        wctx.globalAlpha = 1;
+      }
       if (c.id === selectedId) {
         // Soft double ring, drawn in sprite space so it tracks rotation/scale.
         const r = SPRITE_BODY + 14;
@@ -3312,6 +3361,8 @@ async function intervene(body) {
     } else {
       toast(t('applied', { receipt: data.receipt }));
     }
+    // A paid action can mint a badge: refresh the standing right away.
+    if (res.ok) resolveMe().then(fetchMe);
   } catch (err) {
     toast(t('requestFailed', { error: err }), true);
   }
@@ -3483,6 +3534,129 @@ function renderProps(p) {
       : '');
 }
 
+/* ---------- who you are in the tank ---------- */
+
+// Badge ids in the server's bit order (BADGES in packages/server/src/handler.ts).
+const BADGE_IDS = ['firstBurn', 'weathermaker', 'executioner', 'benefactor', 'whalefall', 'patron', 'passHolder'];
+const FACTIONS = Object.keys(ARCHETYPE_COLORS);
+const badgeKey = (id) => `badge${id[0].toUpperCase()}${id.slice(1)}`;
+
+let myAddr = null;
+let myCheer = null;
+let myWho = null;
+let meFetchedAt = 0;
+let factionCounts = {};
+
+/**
+ * The connected address, without prompting: eth_accounts only answers once the
+ * visitor has approved this site, which the burn flow already asks for.
+ */
+async function resolveMe() {
+  const eth = window.ethereum;
+  if (!eth) return;
+  try {
+    const acc = await eth.request({ method: 'eth_accounts' });
+    const next = acc?.[0]?.toLowerCase() ?? null;
+    if (next === myAddr) return;
+    myAddr = next;
+    myWho = null;
+    if (next) {
+      await fetchMe();
+    } else {
+      // Wallet gone: drop the standing and stop wearing its colours.
+      myCheer = null;
+      document.getElementById('me-wrap').hidden = true;
+      renderFactions(null);
+    }
+  } catch { /* no wallet, or it refused */ }
+}
+
+async function fetchMe() {
+  if (!myAddr) return;
+  try {
+    const res = await fetch(`/who?addr=${encodeURIComponent(myAddr)}`);
+    if (!res.ok) return;
+    myWho = await res.json();
+    meFetchedAt = Date.now();
+    myCheer = myWho.cheer;
+    renderMe();
+    renderFactions(factionCounts);
+  } catch { /* offline: keep the last card */ }
+}
+
+function badgeChips(ids, tiny = false) {
+  return (ids ?? [])
+    .map((id) => `<span class="chip badge${tiny ? ' tiny' : ''}">${t(badgeKey(id))}</span>`)
+    .join('');
+}
+
+function renderMe() {
+  const wrap = document.getElementById('me-wrap');
+  const el = document.getElementById('me-card');
+  if (!wrap || !el) return;
+  if (!myAddr) { wrap.hidden = true; return; }
+  wrap.hidden = false;
+  const w = myWho;
+  const line = (k, v) => `<div class="prop"><span>${t(k)}</span><b>${v}</b></div>`;
+  el.innerHTML =
+    line('you', `<a class="who-link" data-addr="${myAddr}">${shortAddr(myAddr)}</a>`) +
+    (w ? line('burnedTotal', `${w.burned.toLocaleString()} ABYS`) : '') +
+    (w?.burns ? line('burnCount', w.burns) : '') +
+    (w?.rank ? line('boardRank', `#${w.rank}`) : '') +
+    (w?.pass?.active ? line('passLabel', `D${Math.floor(w.pass.until / (latestSnap?.ticksPerDay ?? 19200))}`) : '') +
+    (w?.cheer ? line('rallyingFor', w.cheer) : '') +
+    (w?.badges?.length ? `<div class="chips">${badgeChips(w.badges)}</div>` : '');
+  el.querySelector('.who-link')?.addEventListener('click', () => openAddrCard(myAddr));
+}
+
+function renderFactions(cheers) {
+  const el = document.getElementById('factions');
+  if (!el) return;
+  if (cheers) factionCounts = cheers;
+  el.innerHTML = FACTIONS
+    .map((s) => `<button class="chip faction${myCheer === s ? ' mine' : ''}" data-faction="${s}" ` +
+      `style="--chip:${ARCHETYPE_COLORS[s]}"><i class="cdot"></i>${s} <b>${factionCounts[s] ?? 0}</b></button>`)
+    .join('');
+}
+
+async function cheerFor(species) {
+  if (!myAddr) await resolveMe();
+  if (!myAddr) { toast(t('needWallet'), true); return; }
+  try {
+    const res = await fetch('/cheer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ addr: myAddr, species }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const key = res.status === 429 ? 'cheerSoon' : res.status === 403 ? 'cheerUnknown' : null;
+      toast(key ? t(key) : t('failed', { error: data.error ?? res.status }), true);
+      return;
+    }
+    myCheer = data.cheer;
+    renderFactions(data.cheers);
+    fetchMe();
+    toast(t('cheered', { species }));
+  } catch (err) {
+    toast(t('requestFailed', { error: err }), true);
+  }
+}
+
+document.getElementById('factions')?.addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-faction]');
+  if (btn) cheerFor(btn.dataset.faction);
+});
+
+document.getElementById('burners')?.addEventListener('click', (ev) => {
+  const row = ev.target.closest('[data-addr]');
+  if (row) openAddrCard(row.dataset.addr);
+});
+
+resolveMe();
+window.addEventListener('focus', () => resolveMe());
+window.ethereum?.on?.('accountsChanged', () => resolveMe());
+
 function renderBurners(list) {
   const el = document.getElementById('burners');
   if (!el) return;
@@ -3490,9 +3664,17 @@ function renderBurners(list) {
     el.innerHTML = `<div class="addr-empty">${t('burnersEmpty')}</div>`;
     return;
   }
+  const bitsToIds = (bits) => BADGE_IDS.filter((_, i) => bits & (1 << i));
   el.innerHTML = list
-    .map((b, i) => `<div class="af in"><span class="who">${i + 1}. ${shortAddr(b.address)}</span>` +
-      `<span class="amt">${b.total.toLocaleString()} ABYS</span></div>`)
+    .map((b, i) => {
+      const mine = myAddr && b.address.toLowerCase() === myAddr;
+      return `<div class="af in${mine ? ' me' : ''}" data-addr="${b.address}">` +
+        `<span class="who">${i + 1}. ${shortAddr(b.address)}${mine ? ` · ${t('you')}` : ''}</span>` +
+        `<span class="amt">${b.total.toLocaleString()} ABYS</span>` +
+        (b.cheer ? `<span class="chip tiny" style="--chip:${ARCHETYPE_COLORS[b.cheer] ?? '#888'}">${b.cheer}</span>` : '') +
+        `<span class="chips">${badgeChips(bitsToIds(b.badges ?? 0), true)}</span>` +
+        `</div>`;
+    })
     .join('');
 }
 
@@ -3659,6 +3841,8 @@ document.addEventListener('langchange', () => {
   }
   if (lastStats) drawCharts();
   if (lastCulls) renderObituaries(lastCulls);
+  renderMe();
+  renderFactions(null);
   if (selectedId != null && latestSnap) {
     const c = latestSnap.byId.get(selectedId);
     renderCard(c ?? null);

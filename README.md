@@ -160,10 +160,30 @@ calmer pre/after-market, near-zero on weekends). See
   `/history`, and yesterday's results stay visible after the day rolls.
 - **Fate line**: every creature card names its birth day, generation and
   parent, so an individual is a biography rather than a dot.
+- **Memorials**: a death is written up with its cause, its generation, how many
+  children it left and its largest meal, plus the titles it earned by what it
+  actually did: eight kills is apex, four children is lineage bearer, dying
+  inside a paid poison is poison ghost. The ring keeps the newest 24.
+- **Following one life**: the creature card has a watch button. The list stays
+  in local storage and a death or a birth raises a toast.
+- **Battle reports**: a paid intervention is scored 400 ticks after the burn,
+  poison by how many of the creatures it caught are dead, feed by how many
+  lived, weather by the population swing.
+- **The day in review**: biggest fall, top predator, deaths by cause, and an
+  MVP on each side of the tank: strongest hunter, biggest burner, saddest
+  lineage.
 - **Replay**: the pulse chart replays the last 90 seconds with a playhead and a
   per-bucket readout.
-- **Burners**: the observatory lists who has burned for the tank, and their
-  intervention zones stay signed on the water.
+- **Contribution board**: the analytics drawer ranks who has burned for the
+  tank, with their badges and the faction they rally for, and every
+  intervention zone stays signed on the water.
+- **Your standing**: `GET /who?addr=` answers with what an address burned, its
+  badges, its day pass, its board rank and its own battle reports. Badges are
+  derived from that record on every read and never stored, so a rule change
+  re-grades everybody at once.
+- **Factions**: `POST /cheer` is a free vote for a species, one per address and
+  one change a minute, open only to an address the tank or the chain has
+  actually seen. Your faction wears a dot in its own colour in the water.
 - **Day pass and export**: burning the pass price gates `GET /export`, which
   streams the window's pulse buckets and flows as CSV. Passes expire when the
   day rolls; buying another is the whole subscription model.
@@ -217,7 +237,11 @@ tank it is looking at.
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/observe` | Arc USDC flow observatory: window stats, endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
+| GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
+| GET | `/who?addr=0x…` | One address in the tank: burns, badges, day pass, board rank, its own battle reports |
+| GET | `/export?pass=0x…&kind=` | Day-pass download of the observation window: `csv`, `replay` or `digest` |
 | POST | `/intervene` | intervention gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
+| POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | debug only: disabled unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
 | GET | `/ui` | Redirects to `/` |
 

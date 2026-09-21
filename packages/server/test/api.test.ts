@@ -753,3 +753,144 @@ test('the render payload carries the daily report, the memorial ring and the eat
   assert.equal(typeof w.eaters, 'object');
   assert.ok(w.creatures.every((c) => typeof c.offspring === 'number' && typeof c.maxMeal === 'number'));
 });
+
+type Who = {
+  known: boolean; burned: number; burns: number; byType: Record<string, number>;
+  badges: string[]; rank: number | null; cheer: string | null;
+  pass: { active: boolean; until: number | null };
+  reports: { tx: string; type: string; affected: number; score?: number }[];
+};
+
+test('/who reports one address standing, badges and rank', async () => {
+  const app = createApp({ seed: 1 });
+  const payer = '0x' + 'ab'.repeat(20);
+  const hash = '0x' + 'e2'.repeat(32);
+  const paid = await app.fetch(
+    post('/intervene', { type: 'feed', x: 500, y: 500, radius: 300 }, { 'x-payment-tx': hash }),
+  );
+  assert.equal(paid.status, 200);
+
+  const who = async (addr: string) =>
+    (await (await app.fetch(new Request(`http://localhost/who?addr=${addr}`))).json()) as Who;
+
+  const me = await who(payer);
+  assert.equal(me.known, true);
+  assert.equal(me.burned, 100_000);
+  assert.equal(me.burns, 1);
+  assert.equal(me.byType.feed, 1);
+  assert.ok(me.badges.includes('firstBurn'));
+  assert.equal(me.rank, 1);
+  assert.equal(me.reports[0].tx, hash);
+  assert.equal(me.reports[0].affected > 0, true);
+
+  const stranger = await who('0x' + '99'.repeat(20));
+  assert.equal(stranger.known, false);
+  assert.equal(stranger.burned, 0);
+  assert.deepEqual(stranger.badges, []);
+  assert.equal(stranger.rank, null);
+
+  const bad = await app.fetch(new Request('http://localhost/who?addr=0x123'));
+  assert.equal(bad.status, 400);
+});
+
+test('badges are derived from the record, never stored', async () => {
+  const { badgesFor, badgeBits, normalizeProfile, BADGES } = await import('../src/handler.js');
+  assert.deepEqual(badgesFor(normalizeProfile(null), false), []);
+  // A row written before actions were counted still proves at least one burn.
+  assert.deepEqual(badgesFor(normalizeProfile({ total: 5, last: 1 }), false), ['firstBurn']);
+
+  const killer = normalizeProfile({
+    burns: 3,
+    byType: { poison: 3 },
+    bestByType: { poison: 12, feed: 2 },
+    maxAffected: 60,
+    total: 1_200_000,
+  });
+  const got = badgesFor(killer, true);
+  for (const id of ['firstBurn', 'executioner', 'whalefall', 'patron', 'passHolder']) {
+    assert.ok(got.includes(id), `${id} should be earned`);
+  }
+  assert.ok(!got.includes('benefactor'), 'a feed that saved two is not patronage');
+  assert.ok(!got.includes('weathermaker'), 'no weather bought, no weather badge');
+
+  const bits = badgeBits(killer, true);
+  assert.deepEqual(BADGES.filter((_, i) => bits & (1 << i)), got, 'the bitmask follows BADGES order');
+});
+
+test('cheering is free, but only an address the tank has seen may vote', async () => {
+  const app = createApp({ seed: 1 });
+  const payer = '0x' + 'ab'.repeat(20);
+  const cheer = (addr: string, species: string, headers: Record<string, string> = {}) =>
+    app.fetch(new Request('http://localhost/cheer', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ addr, species }),
+    }));
+
+  const stranger = await cheer('0x' + '55'.repeat(20), 'WHALE');
+  assert.equal(stranger.status, 403, 'no footprint, no vote');
+
+  await app.fetch(
+    post('/intervene', { type: 'feed', x: 400, y: 400, radius: 200 }, { 'x-payment-tx': '0x' + 'e3'.repeat(32) }),
+  );
+  const first = await cheer(payer, 'WHALE');
+  assert.equal(first.status, 200);
+  const body = (await first.json()) as { cheer: string; cheers: Record<string, number> };
+  assert.equal(body.cheer, 'WHALE');
+  assert.equal(body.cheers.WHALE, 1);
+
+  const same = await cheer(payer, 'WHALE');
+  assert.equal(same.status, 200, 'repeating your own vote is a no-op, not a rate limit');
+
+  const flip = await cheer(payer, 'APE');
+  assert.equal(flip.status, 429, 'switching sides waits out the cooldown');
+
+  const bogus = await cheer(payer, 'UNICORN');
+  assert.equal(bogus.status, 400);
+
+  const foreign = await cheer(payer, 'APE', { origin: 'https://evil.example' });
+  assert.equal(foreign.status, 403, 'a foreign page cannot vote for you');
+});
+
+test('the board in the payload carries burns, badge bits and the faction tally', async () => {
+  const app = createApp({ seed: 1 });
+  const payer = '0x' + 'ab'.repeat(20);
+  await app.fetch(
+    post('/intervene', { type: 'feed', x: 300, y: 300, radius: 100 }, { 'x-payment-tx': '0x' + 'e4'.repeat(32) }),
+  );
+  await app.fetch(new Request('http://localhost/cheer', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ addr: payer, species: 'ALGO' }),
+  }));
+  const w = (await (await app.fetch(new Request('http://localhost/world'))).json()) as {
+    burners: { address: string; total: number; burns: number; cheer: string | null; badges: number }[];
+    cheers: Record<string, number>;
+  };
+  const row = w.burners.find((b) => b.address === payer);
+  assert.ok(row, 'the payer belongs on the board');
+  assert.equal(row.burns, 1);
+  assert.equal(row.cheer, 'ALGO');
+  assert.equal(typeof row.badges, 'number');
+  assert.equal(row.badges & 1, 1, 'the firstBurn bit is set');
+  assert.deepEqual(w.cheers, { ALGO: 1 });
+});
+
+test('a store row from before profiles existed loads as a full one', async () => {
+  const mem: { passes: [string, number][]; burners: [string, { total: number; last: number }][] } = {
+    passes: [],
+    burners: [['0x' + 'ab'.repeat(20), { total: 250_000, last: 1 }]],
+  };
+  const store = {
+    load: async () => mem,
+    save: (s: { passes: [string, number][]; burners: [string, unknown][] }) => { mem.passes = s.passes; },
+  };
+  const app = createApp({ seed: 1, store });
+  await app.hydrate();
+  const who = (await (await app.fetch(
+    new Request(`http://localhost/who?addr=0x${'ab'.repeat(20)}`),
+  )).json()) as Who;
+  assert.equal(who.burned, 250_000);
+  assert.equal(who.burns, 1);
+  assert.ok(who.badges.includes('firstBurn'));
+});

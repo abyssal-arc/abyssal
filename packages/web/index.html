@@ -89,15 +89,15 @@
         <div class="obs-head"><span data-i18n="endpointsTitle">Top endpoints</span><span class="obs-sub" data-i18n="endpointsSub">by USDC volume</span></div>
         <div id="endpoints"></div>
       </section>
-      <section class="glass obs-card">
-        <div class="obs-head"><span data-i18n="burnersTitle">Top burners</span></div>
-        <div id="burners"></div>
-      </section>
     </div>
     <div id="addr-card" class="glass" hidden>
       <span class="tx-close">×</span>
       <div class="addr-h"></div>
       <div id="addr-stats"></div>
+      <div id="addr-tank" hidden>
+        <div class="addr-sub" data-i18n="tankStanding">In the tank</div>
+        <div id="addr-tank-body"></div>
+      </div>
       <div class="addr-sub" data-i18n="addrRecent">Recent flows</div>
       <div id="addr-flows"></div>
       <a class="explore" href="#" target="_blank" rel="noopener" data-i18n="addrExplorer">View on explorer</a>
@@ -197,6 +197,14 @@
       <button class="dock-btn" data-export="digest" data-i18n="exportDigest">Day digest</button>
       <div class="section-title" data-i18n="dailyTitle">Today in the abyss</div>
       <div id="daily-report" class="daily"></div>
+      <div id="me-wrap" hidden>
+        <div class="section-title" data-i18n="yourStanding">Your standing</div>
+        <div id="me-card" class="daily"></div>
+      </div>
+      <div class="section-title" data-i18n="factionsTitle">Factions</div>
+      <div id="factions" class="chips"></div>
+      <div class="section-title" data-i18n="burnersTitle">Top burners</div>
+      <div id="burners"></div>
       <div class="section-title" data-i18n="reportsTitle">Battle reports</div>
       <div id="reports"></div>
       <div class="section-title" data-i18n="memorialsTitle">Memorials</div>

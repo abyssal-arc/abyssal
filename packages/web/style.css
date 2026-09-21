@@ -329,6 +329,31 @@ body.view-observe {
 .daily .prop, #reports .prop { padding: 1px 0; }
 .memorial { padding: calc(var(--sp)) 0; border-bottom: 1px solid var(--glass-border); }
 .memorial .epitaph { color: var(--fg-3); font-size: 9px; margin-top: 2px; }
+/* badges, factions and the contribution board */
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 3px 0; }
+.chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px;
+  border: 1px solid var(--glass-border); border-radius: 999px;
+  background: rgba(120, 160, 220, 0.06); color: var(--fg-2);
+  font-family: var(--font-display); font-size: 9px; line-height: 14px;
+}
+.chip.tiny { font-size: 8px; line-height: 12px; padding: 0 5px; }
+.chip.badge { color: var(--amber); border-color: rgba(224, 163, 77, 0.28); }
+.chip b { color: var(--fg-1); font-weight: 500; font-variant-numeric: tabular-nums; }
+.chip .cdot { width: 5px; height: 5px; border-radius: 50%; background: var(--chip, var(--accent)); flex: 0 0 auto; }
+button.chip.faction { cursor: pointer; transition: border-color var(--ease), color var(--ease); }
+button.chip.faction:hover { border-color: var(--chip, var(--accent)); color: var(--fg-1); }
+button.chip.faction.mine {
+  border-color: var(--chip, var(--accent)); color: var(--fg-1);
+  background: rgba(120, 160, 220, 0.14);
+}
+#burners .af { flex-wrap: wrap; cursor: pointer; }
+#burners .af .chips { flex-basis: 100%; margin: 0 0 3px; }
+#burners .af:hover .who { color: var(--fg-1); }
+#burners .af.me .who { color: var(--accent); }
+.who-link { color: var(--accent); cursor: pointer; border-bottom: 1px solid transparent; }
+.who-link:hover { border-bottom-color: var(--accent); }
+#addr-tank { margin-top: calc(var(--sp) * 2); }
 .rules-hint {
   margin-top: calc(var(--sp) * 2);
   font-size: 9px;

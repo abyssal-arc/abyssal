@@ -10,6 +10,8 @@ import {
   tick as tickWorld,
   txLanding,
   WHALE_BOOM_SIZE,
+  ARCHETYPE_LIST,
+  type Archetype,
   type Intervention,
   type World,
 } from '@abyssal/sim';
@@ -29,9 +31,88 @@ import {
   type InterventionType,
 } from './payments.js';
 
+/**
+ * What the tank remembers about one address. Persisted through the store so a
+ * restart cannot wipe anybody's standing; rows written before this shape carry
+ * only {total,last} and are filled in on load.
+ */
+export interface BurnerProfile {
+  /** ABYS burned in whole units, day pass included. */
+  total: number;
+  /** Epoch ms of the last burn. */
+  last: number;
+  /** How many paid actions this address has taken. */
+  burns: number;
+  /** Paid actions per intervention type. */
+  byType: Record<string, number>;
+  /** Best scored battle report per intervention type. */
+  bestByType: Record<string, number>;
+  /** Widest single intervention, in creatures caught. */
+  maxAffected: number;
+  /** Species this address rallies for, and when it last changed. */
+  cheer?: string;
+  cheerAt?: number;
+}
+
+export function normalizeProfile(p?: Partial<BurnerProfile> | null): BurnerProfile {
+  return {
+    total: p?.total ?? 0,
+    last: p?.last ?? 0,
+    // Rows written before actions were counted still prove at least one burn.
+    burns: p?.burns ?? ((p?.total ?? 0) > 0 ? 1 : 0),
+    byType: p?.byType ?? {},
+    bestByType: p?.bestByType ?? {},
+    maxAffected: p?.maxAffected ?? 0,
+    cheer: p?.cheer,
+    cheerAt: p?.cheerAt,
+  };
+}
+
+/**
+ * Badges are derived, never stored: they follow from the record, so a rule
+ * change re-grades everybody at once and no stale award survives it.
+ */
+export const BADGES = [
+  'firstBurn',
+  'weathermaker',
+  'executioner',
+  'benefactor',
+  'whalefall',
+  'patron',
+  'passHolder',
+] as const;
+
+export function badgesFor(p: BurnerProfile, passActive: boolean): string[] {
+  const out: string[] = [];
+  if (p.burns >= 1) out.push('firstBurn');
+  if ((p.byType.bloom ?? 0) + (p.byType.drought ?? 0) >= 1) out.push('weathermaker');
+  if ((p.bestByType.poison ?? 0) >= 10) out.push('executioner');
+  if ((p.bestByType.feed ?? 0) >= 10) out.push('benefactor');
+  if (p.maxAffected >= 50) out.push('whalefall');
+  if (p.total >= 1_000_000) out.push('patron');
+  if (passActive) out.push('passHolder');
+  return out;
+}
+
+/**
+ * The same badges as a bitmask in BADGES order: the poll carries the board
+ * every 400ms, and eight rows of spelled-out award names are pure overhead
+ * when one integer says the same thing.
+ */
+export function badgeBits(p: BurnerProfile, passActive: boolean): number {
+  let bits = 0;
+  for (const id of badgesFor(p, passActive)) bits |= 1 << BADGES.indexOf(id as (typeof BADGES)[number]);
+  return bits;
+}
+
+/** One vote per address, and not twice inside this window. */
+const CHEER_COOLDOWN_MS = 60_000;
+
+const ADDRESS_RE = /^0x[0-9a-f]{40}$/;
+
 export interface WorldStore {
-  load(): Promise<{ passes?: [string, number][]; burners?: [string, { total: number; last: number }][] }>;
-  save(s: { passes: [string, number][]; burners: [string, { total: number; last: number }][] }): void;
+  load(): Promise<{ passes?: [string, number][]; burners?: [string, Partial<BurnerProfile>][] }>;
+  save(s: { passes: [string, number][]; burners: [string, BurnerProfile][] }): void;
 }
 
 export interface AppOptions {
@@ -240,6 +321,17 @@ export function createApp(options: AppOptions = {}) {
     return at === -1 ? txRain : txRain.slice(at + 1);
   }
 
+  /**
+   * Reads are a public data API (CORS *); writes are not. Browsers send Origin
+   * on same-origin POSTs too, so this only turns away foreign pages.
+   */
+  function foreignOrigin(req: Request): boolean {
+    const origin = req.headers.get('origin');
+    if (!origin) return false;
+    const allowlist = (process.env.CORS_ORIGINS ?? '').split(',').filter(Boolean);
+    return origin !== new URL(req.url).origin && !allowlist.includes(origin);
+  }
+
   function json(data: unknown, status = 200): Response {
     return new Response(JSON.stringify(data), {
       status,
@@ -395,7 +487,7 @@ export function createApp(options: AppOptions = {}) {
   }
 
   // Who has burned for the tank, and day-pass holders (export gate).
-  const burners = new Map<string, { total: number; last: number }>();
+  const burners = new Map<string, BurnerProfile>();
   // Intervention battle reports, scored 400 ticks after the burn.
   const reports: {
     tx: string; type: string; payer?: string; paid?: string; atTick: number;
@@ -416,6 +508,11 @@ export function createApp(options: AppOptions = {}) {
           : r.type === 'feed'
             ? survivors
             : world.creatures.length - r.popAt;
+      // An address is graded on its best shot, not its last one.
+      const p = r.payer ? burners.get(r.payer) : undefined;
+      if (p && r.score > (p.bestByType[r.type] ?? Number.NEGATIVE_INFINITY)) {
+        p.bestByType[r.type] = r.score;
+      }
     }
   }
 
@@ -453,12 +550,23 @@ export function createApp(options: AppOptions = {}) {
     };
   }
   const passes = new Map<string, number>();
-  function noteBurn(payer: string | undefined, whole: number) {
+  function passActive(addr: string): boolean {
+    return world.tick < (passes.get(addr) ?? 0);
+  }
+  function noteBurn(payer: string | undefined, whole: number, type: string) {
     if (!payer) return;
-    const b = burners.get(payer) ?? { total: 0, last: 0 };
+    const b = burners.get(payer) ?? normalizeProfile(null);
     b.total += whole;
     b.last = Date.now();
+    b.burns += 1;
+    b.byType[type] = (b.byType[type] ?? 0) + 1;
     burners.set(payer, b);
+  }
+  /** How many addresses rally for each species. */
+  function cheers(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const p of burners.values()) if (p.cheer) out[p.cheer] = (out[p.cheer] ?? 0) + 1;
+    return out;
   }
 
   function worldPayload() {
@@ -481,10 +589,20 @@ export function createApp(options: AppOptions = {}) {
       tax: dominantTax(world),
       propositions: propositions(),
       daily: dailyReport(),
+      // The contribution board: what each address burned and what it earned.
       burners: [...burners.entries()]
         .sort((x, y) => y[1].total - x[1].total)
         .slice(0, 8)
-        .map(([address, b]) => ({ address, total: b.total, last: b.last })),
+        .map(([address, b]) => ({
+          address,
+          total: b.total,
+          last: b.last,
+          burns: b.burns,
+          cheer: b.cheer ?? null,
+          badges: badgeBits(b, passActive(address)),
+        })),
+      // How many addresses rally for each species.
+      cheers: cheers(),
       chainTemp,
       marketTemp,
       creatures: world.creatures.map((c) => ({
@@ -547,6 +665,8 @@ export function createApp(options: AppOptions = {}) {
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
+        'GET /who': 'one address in the tank: ?addr=<0x..> returns burns, badges, pass, rank and its battle reports',
+        'POST /cheer': 'rally for a species: {addr, species}, free, one vote per known address',
         'GET /export': 'day-pass download of the observation window: ?pass=<address>&kind=csv|replay|digest',
         'GET /observe': 'Arc USDC flow observatory: stats, endpoint ranking, pulse, recent flows (available:false off-Arc)',
         'POST /intervene': 'intervention (feed/poison/bloom/drought) paid by burning ABYS on Arc; the burn receipt is the payment proof; 503 until ABYS_TOKEN_ADDRESS is set',
@@ -639,6 +759,41 @@ export function createApp(options: AppOptions = {}) {
       return json({ reports: reports.slice(-12).reverse() });
     }
 
+    // One address's standing in the tank: what it burned, what it earned, and
+    // how its interventions turned out.
+    if (req.method === 'GET' && path === '/who') {
+      const addr = (url.searchParams.get('addr') ?? '').toLowerCase();
+      if (!ADDRESS_RE.test(addr)) return json({ error: 'address required' }, 400);
+      const p = burners.get(addr) ?? normalizeProfile(null);
+      const active = passActive(addr);
+      const rank = [...burners.entries()]
+        .sort((a, b) => b[1].total - a[1].total)
+        .findIndex(([a]) => a === addr);
+      return json({
+        address: addr,
+        known: burners.has(addr),
+        burned: p.total,
+        burns: p.burns,
+        byType: p.byType,
+        maxAffected: p.maxAffected,
+        pass: { active, until: active ? passes.get(addr) ?? null : null },
+        badges: badgesFor(p, active),
+        cheer: p.cheer ?? null,
+        rank: rank === -1 ? null : rank + 1,
+        reports: reports
+          .filter((r) => r.payer === addr)
+          .slice(-8)
+          .reverse()
+          .map((r) => ({
+            tx: r.tx,
+            type: r.type,
+            atTick: r.atTick,
+            affected: r.affectedIds.length,
+            score: r.score,
+          })),
+      });
+    }
+
     if (req.method === 'GET' && path === '/export') {
       const payer = (url.searchParams.get('pass') ?? '').toLowerCase();
       const until = passes.get(payer) ?? 0;
@@ -697,6 +852,44 @@ export function createApp(options: AppOptions = {}) {
       return json({ ok: true, tick: world.tick });
     }
 
+    // Rally for a species. Free, one vote per address, and only for an address
+    // the tank or the chain has actually seen, so the tally cannot be stuffed
+    // with inventions.
+    if (req.method === 'POST' && path === '/cheer') {
+      if (foreignOrigin(req)) {
+        return json({ error: 'cross-origin cheers are not allowed' }, 403);
+      }
+      let body: Record<string, unknown>;
+      try {
+        body = (await req.json()) as Record<string, unknown>;
+      } catch {
+        return json({ error: 'invalid JSON body' }, 400);
+      }
+      const addr = String(body.addr ?? '').toLowerCase();
+      const species = String(body.species ?? '').toUpperCase();
+      if (!ADDRESS_RE.test(addr)) return json({ error: 'address required' }, 400);
+      if (!ARCHETYPE_LIST.includes(species as Archetype)) {
+        return json({ error: 'unknown species', species: ARCHETYPE_LIST }, 400);
+      }
+      const onChain = arcFeed ? arcFeed.addressPayload(addr).stats.count : 0;
+      if (!burners.has(addr) && !passActive(addr) && onChain === 0) {
+        return json(
+          { error: 'unknown address', hint: 'burn ABYS, hold a day pass, or move USDC on Arc first' },
+          403,
+        );
+      }
+      const p = burners.get(addr) ?? normalizeProfile(null);
+      if (p.cheer !== species) {
+        const wait = CHEER_COOLDOWN_MS - (Date.now() - (p.cheerAt ?? 0));
+        if (p.cheerAt && wait > 0) return json({ error: 'too soon', retryInMs: wait }, 429);
+        p.cheer = species;
+        p.cheerAt = Date.now();
+        burners.set(addr, p);
+        saveStore();
+      }
+      return json({ ok: true, cheer: p.cheer ?? null, cheers: cheers() });
+    }
+
     if (req.method === 'POST' && path === '/intervene') {
       let body: Record<string, unknown>;
       try {
@@ -704,11 +897,8 @@ export function createApp(options: AppOptions = {}) {
       } catch {
         return json({ error: 'invalid JSON body' }, 400);
       }
-      // Reads are a public data API (CORS *); writes are not. Browsers send
-  // Origin on same-origin POSTs too, so this only blocks foreign pages.
-      const origin = req.headers.get('origin');
-      const allowlist = (process.env.CORS_ORIGINS ?? '').split(',').filter(Boolean);
-      if (origin && origin !== new URL(req.url).origin && !allowlist.includes(origin)) {
+      // Reads are a public data API (CORS *); writes are not.
+      if (foreignOrigin(req)) {
         return json({ error: 'cross-origin interventions are not allowed' }, 403);
       }
       const type = body?.type as InterventionType;
@@ -743,7 +933,7 @@ export function createApp(options: AppOptions = {}) {
       // be spent on a simulation action by accident.
       if (type === 'pass') {
         recordBurnReceipt(txHash);
-        noteBurn(verdict.payer, Number(ABYS_PRICES.pass));
+        noteBurn(verdict.payer, Number(ABYS_PRICES.pass), 'pass');
         if (verdict.payer) {
           passes.set(verdict.payer, (Math.floor(world.tick / world.config.ticksPerDay) + 1) * world.config.ticksPerDay);
         }
@@ -764,20 +954,23 @@ export function createApp(options: AppOptions = {}) {
       // Record only after the paid action succeeded: a burned receipt that
       // bought nothing must stay spendable.
       recordBurnReceipt(txHash);
-      noteBurn(verdict.payer, Number(ABYS_PRICES[type]));
-      saveStore();
+      noteBurn(verdict.payer, Number(ABYS_PRICES[type]), type);
       if (intervention && 'x' in intervention) {
+        const affectedIds = idsInZone(world, intervention.x, intervention.y, intervention.radius);
         reports.push({
           tx: txHash,
           type,
           payer: verdict.payer,
           paid: `${ABYS_PRICES[type]} ABYS`,
           atTick: world.tick,
-          affectedIds: idsInZone(world, intervention.x, intervention.y, intervention.radius),
+          affectedIds,
           popAt: world.creatures.length,
         });
         if (reports.length > 40) reports.splice(0, reports.length - 40);
+        const p = verdict.payer ? burners.get(verdict.payer) : undefined;
+        if (p) p.maxAffected = Math.max(p.maxAffected, affectedIds.length);
       }
+      saveStore();
       return json({
         ok: true,
         receipt: result.message,
@@ -803,7 +996,7 @@ export function createApp(options: AppOptions = {}) {
       if (!options.store) return;
       const s = await options.store.load();
       for (const [addr, until] of s.passes ?? []) passes.set(addr, until);
-      for (const [addr, b] of s.burners ?? []) burners.set(addr, b);
+      for (const [addr, b] of s.burners ?? []) burners.set(addr, normalizeProfile(b));
     })();
     return hydrated;
   }
