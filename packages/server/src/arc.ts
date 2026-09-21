@@ -276,7 +276,7 @@ export class ArcUsdcFeed implements ChainFeed {
     this.pollEveryMs = opts.pollEveryMs ?? 2000;
     this.backfillBlocks = opts.backfillBlocks ?? 3600;
     this.maxFlows = opts.maxFlows ?? 6000;
-    this.maxPulse = opts.maxPulse ?? 2160;
+    this.maxPulse = opts.maxPulse ?? 5760; // 24h of 15s buckets, for /history/pulse
   }
 
   /** Market-feed view: turbulence of the USDC flow (0..1). */
@@ -309,6 +309,56 @@ export class ArcUsdcFeed implements ChainFeed {
       return txs;
     }
     return this.pendingTxs.splice(0, 6);
+  }
+
+  /**
+   * Re-bucket the in-memory 15s pulse series into coarser columns covering
+   * `rangeMs`. Used by /history/pulse to serve 1h (60s buckets) and 24h
+   * (15min buckets) without touching the live /observe payload. Returns
+   * dense buckets (every slot in the window, empty ones zeroed) so the chart
+   * draws a continuous timeline instead of skipping quiet minutes.
+   */
+  historyPulse(rangeMs: number, bucketMs: number): { t: number; volume: number; count: number; x402Volume: number }[] {
+    const now = Date.now();
+    // Anchor the right edge to a bucket boundary so refreshes don't jitter
+    // the chart's rightmost column.
+    const endBucket = Math.floor(now / bucketMs) * bucketMs;
+    const startBucket = endBucket - rangeMs + bucketMs;
+    const slots = Math.max(1, Math.round(rangeMs / bucketMs));
+    const out: { t: number; volume: number; count: number; x402Volume: number }[] = [];
+    for (let i = 0; i < slots; i++) {
+      out.push({ t: startBucket + i * bucketMs, volume: 0, count: 0, x402Volume: 0 });
+    }
+    // The flows ring carries per-transfer x402 flags but is capped far short
+    // of 24h, so x402Volume falls back to a count-weighted estimate from the
+    // pulse buckets when the flow is too old. Good enough for a gold-cap
+    // overlay; the precise number lives in the live /observe stream.
+    const flowByBucket = new Map<number, { vol: number; x402Vol: number }>();
+    for (const f of this.flows) {
+      if (f.t < startBucket) continue;
+      const key = Math.floor(f.t / bucketMs) * bucketMs;
+      let e = flowByBucket.get(key);
+      if (!e) { e = { vol: 0, x402Vol: 0 }; flowByBucket.set(key, e); }
+      e.vol += f.amount;
+      if (f.x402) e.x402Vol += f.amount;
+    }
+    for (const p of this.pulse) {
+      if (p.t < startBucket) continue;
+      const idx = Math.floor((p.t - startBucket) / bucketMs);
+      if (idx < 0 || idx >= slots) continue;
+      const b = out[idx];
+      b.volume += p.volume;
+      b.count += p.count;
+      const fb = flowByBucket.get(Math.floor(p.t / bucketMs) * bucketMs);
+      if (fb && fb.vol > 0) {
+        // Prorate this 15s pulse's x402 share against the bucket's flow volume.
+        b.x402Volume += p.count > 0 ? (p.volume * (fb.x402Vol / fb.vol)) : 0;
+      } else if (p.count > 0) {
+        b.x402Volume += p.volume * (p.x402 / p.count);
+      }
+    }
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    return out.map((b) => ({ t: b.t, volume: r2(b.volume), count: b.count, x402Volume: r2(b.x402Volume) }));
   }
 
   /** Snapshot for the GET /observe endpoint. */

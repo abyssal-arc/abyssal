@@ -72,7 +72,13 @@
         </div>
       </section>
       <section class="glass obs-card obs-pulse-card">
-        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><button id="pulse-play" class="icon-btn" data-i18n-title="replay" title="Replay the last 90 seconds">&#9654;</button><span class="obs-sub" id="pulse-sub"></span>
+        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span>
+          <div class="pulse-ranges" role="group" aria-label="Pulse time range">
+            <button class="range-btn active" data-range="live" type="button"><span class="rb-pip"></span>Live</button>
+            <button class="range-btn" data-range="1h" type="button">1h</button>
+            <button class="range-btn" data-range="24h" type="button">24h</button>
+          </div>
+          <button id="pulse-play" class="icon-btn" data-i18n-title="replay" title="Replay the last 90 seconds">&#9654;</button><span class="obs-sub" id="pulse-sub"></span>
           <span class="obs-actions">
             <button class="dock-btn mini" data-export="csv" data-i18n="exportCsv">Export CSV</button>
             <button class="dock-btn mini" data-export="replay" data-i18n="exportReplay">Export replay</button>
@@ -204,6 +210,7 @@
     <div class="day-anchor">
       <span class="da-label" data-i18n="dayAnchor">Day digest</span>
       <code id="day-digest">–</code>
+      <span class="digest-status" id="digest-status"></span>
       <span class="da-note" data-i18n="dayAnchorNote">preview · commits on-chain at day end</span>
       <button class="dock-btn mini" data-export="digest" data-i18n="exportDigest">Export digest</button>
     </div>

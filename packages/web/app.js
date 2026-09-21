@@ -2,16 +2,22 @@
  * Abyssal frontend, zero-framework Canvas 2D renderer.
  *
  * Smoothness model (standard netcode):
- *  - Polls the combined /snapshot endpoint every 400ms into a buffer of the
- *    last ~6 world snapshots.
- *  - Rendering runs at a fixed RENDER_DELAY behind the newest snapshot, so
- *    it always interpolates between two snapshots already in hand; network
- *    jitter is absorbed by the buffer instead of producing stop-and-go.
+ *  - Polls the combined /snapshot endpoint every 500ms into a buffer of the
+ *    last ~6 world snapshots (~3s of history).
+ *  - Rendering runs at a fixed RENDER_DELAY (700ms) behind the newest
+ *    snapshot, so it always interpolates between snapshots already in hand;
+ *    network jitter is absorbed by the buffer instead of producing stop-and-go.
+ *  - Interpolation is a Catmull-Rom spline through four buffered snapshots
+ *    (s0, s1, s2, s3) on the torus, giving C1-continuous curved trajectories
+ *    instead of visible 500ms polyline segments. At the buffer edges (or for
+ *    creatures missing from s0/s3) it falls back to linear between s1 and s2.
  *  - If the buffer starves (packet loss), positions are extrapolated from
- *    the last known velocity (dead reckoning) for at most 1s, then hold.
- *  - Every creature's rendered position is additionally eased toward its
- *    computed target each frame, so recovery after a stall is a smooth
- *    catch-up slide, never a teleport.
+ *    the last known velocity (dead reckoning) for at most 1s, then hold; the
+ *    heading snaps to atan2(vy, vx) so a creature never slides sideways.
+ *  - Every creature's rendered velocity is low-passed toward its computed
+ *    target velocity (~80ms time constant), and the position is integrated
+ *    from that smoothed velocity: recovery after a stall is a smooth
+ *    catch-up slide with no direction kink, never a teleport.
  *  - Heading interpolation takes the shortest arc (handles the -π/π wrap).
  *
  * Performance notes: all glow is baked into pre-rendered sprites (no runtime
@@ -31,7 +37,7 @@ const cctx = chartCanvas.getContext('2d');
 const tempsCanvas = document.getElementById('temps');
 const tctx = tempsCanvas.getContext('2d');
 
-const POLL_MS = 1500;
+const POLL_MS = 500;
 const RENDER_DELAY = 700;     // ms behind the newest snapshot
 const BUFFER_KEEP = 6;
 const DEAD_RECKON_MAX = 1000; // ms of velocity extrapolation before holding
@@ -113,7 +119,12 @@ document.querySelectorAll('.viewtabs button').forEach((b) => {
   b.addEventListener('click', () => setView(b.dataset.view));
 });
 
-/** Per-creature eased render positions (id -> {x, y}), the anti-teleport layer. */
+/**
+ * Per-creature eased render positions (id -> {x, y, vx, vy}), the
+ * anti-teleport layer. Velocities are in world units per second and are
+ * low-passed toward the interpolation's instantaneous velocity so that
+ * direction changes arrive as curves instead of kinks.
+ */
 const renderPos = new Map();
 let lastFrameAt = clock();
 
@@ -211,13 +222,44 @@ function rimStroke(g, hue, alpha = 0.9, width = 1.4) {
   g.stroke();
 }
 
-/* ---------------- WHALE: sleek lantern-whale ---------------- */
+/** Glowing energy vein: a thin additive stroke along a path. */
+function energyVein(g, hue, points, alpha = 0.5, width = 0.7) {
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 72, alpha);
+  g.lineWidth = width;
+  g.beginPath();
+  g.moveTo(points[0][0], points[0][1]);
+  for (let i = 1; i < points.length; i++) {
+    if (i < points.length - 1) {
+      const xc = (points[i][0] + points[i + 1][0]) / 2;
+      const yc = (points[i][1] + points[i + 1][1]) / 2;
+      g.quadraticCurveTo(points[i][0], points[i][1], xc, yc);
+    } else {
+      g.lineTo(points[i][0], points[i][1]);
+    }
+  }
+  g.stroke();
+  g.strokeStyle = hsl(hue, 90, 60, alpha * 0.3);
+  g.lineWidth = width * 3;
+  g.stroke();
+  g.restore();
+}
+
+/** Pulsing node: brightness varies with phase offset. */
+function pulseNode(g, hue, x, y, r, phase, offset = 0, alpha = 0.85) {
+  const p = 0.6 + 0.4 * Math.sin((phase + offset) * Math.PI * 2);
+  dot(g, hue, x, y, r * p, alpha * p);
+}
+
+/* ---------------- WHALE: abyssal leviathan ---------------- */
 function drawWhale(g, hue, ph) {
   const beat = Math.sin(ph * Math.PI * 2);
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
 
-  // Crescent tail fluke, thin tapered blades.
+  // Crescent tail fluke with energy wake.
   g.save();
   g.translate(-32, 0);
   g.rotate(beat * 0.16);
@@ -230,12 +272,24 @@ function drawWhale(g, hue, ph) {
   g.closePath();
   g.fillStyle = hsl(hue, 60, 46, 0.5);
   g.fill();
-  g.strokeStyle = hsl(hue, 90, 82, 0.55);
+  g.strokeStyle = hsl(hue, 90, 82, 0.6);
   g.lineWidth = 1;
   g.stroke();
+  // Tail energy wake — gradient fade trailing behind
+  g.globalCompositeOperation = 'lighter';
+  const wakeGr = g.createLinearGradient(-11, 0, -26, 0);
+  wakeGr.addColorStop(0, hsl(hue, 100, 70, 0.4 * pulse));
+  wakeGr.addColorStop(1, hsl(hue, 100, 60, 0));
+  g.fillStyle = wakeGr;
+  g.beginPath();
+  g.moveTo(-11, -5);
+  g.quadraticCurveTo(-20, -3, -26, 0);
+  g.quadraticCurveTo(-20, 3, -11, 5);
+  g.closePath();
+  g.fill();
   g.restore();
 
-  // Long pectoral blade sweeping back.
+  // Long pectoral blade with edge glow.
   g.beginPath();
   g.moveTo(10, 5);
   g.quadraticCurveTo(2, 12, -10, 17);
@@ -243,11 +297,20 @@ function drawWhale(g, hue, ph) {
   g.closePath();
   g.fillStyle = hsl(hue, 60, 40, 0.55);
   g.fill();
-  g.strokeStyle = hsl(hue, 90, 80, 0.4);
+  g.strokeStyle = hsl(hue, 90, 80, 0.45);
   g.lineWidth = 1;
   g.stroke();
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 75, 0.3 * pulse);
+  g.lineWidth = 2;
+  g.beginPath();
+  g.moveTo(10, 5);
+  g.quadraticCurveTo(2, 12, -10, 17);
+  g.stroke();
+  g.restore();
 
-  // Dorsal fin, small and swept.
+  // Dorsal fin.
   g.beginPath();
   g.moveTo(-2, -10);
   g.quadraticCurveTo(2, -16, 7, -10);
@@ -255,7 +318,7 @@ function drawWhale(g, hue, ph) {
   g.fillStyle = hsl(hue, 60, 50, 0.5);
   g.fill();
 
-  // Sleek body: rounded head, long taper to the peduncle.
+  // Sleek body.
   g.beginPath();
   g.moveTo(34, -3);
   g.bezierCurveTo(30, -9, 18, -11, 4, -11);
@@ -268,7 +331,6 @@ function drawWhale(g, hue, ph) {
   g.fillStyle = glass(g, hue, -12, 11);
   g.fill();
   sheen(g, hue, 8, -6, 20, 5);
-  // Top rim, bright, then an inner dark line for glass thickness.
   g.beginPath();
   g.moveTo(34, -3);
   g.bezierCurveTo(30, -9, 18, -11, 4, -11);
@@ -279,42 +341,96 @@ function drawWhale(g, hue, ph) {
   g.bezierCurveTo(27, -7.5, 17, -9.5, 4, -9.5);
   g.bezierCurveTo(-11, -9.5, -24, -5, -30, -1.5);
   innerLine(g, hue);
-  // Muscle lines.
-  g.strokeStyle = hsl(hue, 60, 78, 0.18);
-  g.lineWidth = 0.8;
+
+  // Bioluminescent energy veins along body.
+  const veinA = 0.25 + 0.2 * pulse;
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 68, veinA);
+  g.lineWidth = 0.6;
   g.beginPath();
-  g.moveTo(26, -4);
-  g.quadraticCurveTo(4, -6, -20, -3);
-  g.moveTo(24, 4);
-  g.quadraticCurveTo(2, 6, -18, 3);
+  g.moveTo(28, -2);
+  g.quadraticCurveTo(14, -6, 0, -5);
+  g.quadraticCurveTo(-14, -4, -28, -1);
   g.stroke();
-  // Belly rim, softer.
+  g.beginPath();
+  g.moveTo(26, 2);
+  g.quadraticCurveTo(10, 6, -6, 5);
+  g.quadraticCurveTo(-18, 4, -30, 1);
+  g.stroke();
+  // Branching vein tendrils.
+  g.strokeStyle = hsl(hue, 90, 65, veinA * 0.6);
+  g.lineWidth = 0.4;
+  for (let i = 0; i < 5; i++) {
+    const vx = 22 - i * 11;
+    const vy = -2 + Math.sin(i * 1.2 + ph * Math.PI * 2) * 2;
+    g.beginPath();
+    g.moveTo(vx, vy);
+    g.quadraticCurveTo(vx - 3, vy - 4, vx - 6, vy - 5);
+    g.stroke();
+    g.beginPath();
+    g.moveTo(vx, vy + 3);
+    g.quadraticCurveTo(vx - 3, vy + 6, vx - 5, vy + 7);
+    g.stroke();
+  }
+  // Soft vein halo.
+  g.strokeStyle = hsl(hue, 85, 60, veinA * 0.15);
+  g.lineWidth = 3;
+  g.beginPath();
+  g.moveTo(28, -2);
+  g.quadraticCurveTo(0, -5, -28, -1);
+  g.stroke();
+  g.restore();
+
+  // Belly rim.
   g.beginPath();
   g.moveTo(-33, 1.5);
   g.bezierCurveTo(-26, 6, -12, 10, 4, 10);
   g.bezierCurveTo(18, 10, 30, 7, 34, 3);
-  g.strokeStyle = hsl(hue, 80, 78, 0.35);
+  g.strokeStyle = hsl(hue, 80, 78, 0.4);
   g.lineWidth = 1;
   g.stroke();
 
-  // Spine line and photophores along the belly.
-  g.strokeStyle = hsl(hue, 70, 80, 0.28);
-  g.lineWidth = 0.8;
-  g.beginPath();
-  g.moveTo(30, 0);
-  g.quadraticCurveTo(0, 1.5, -30, 0);
-  g.stroke();
-  core(g, hue, 10, -1, 13, 0.26);
-  for (let i = 0; i < 4; i++) dot(g, hue, 20 - i * 12, 6.5 - i * 0.6, 1.1, 0.75);
-  dot(g, hue, 26, -3, 1.7, 1); // eye
+  // Enhanced photophore array along belly.
+  const photoBase = 0.6 + 0.35 * pulse;
+  for (let i = 0; i < 6; i++) {
+    const px = 24 - i * 10;
+    const py = 6.5 - i * 0.5 + Math.sin(i * 0.8 + ph * Math.PI * 2) * 0.5;
+    dot(g, hue, px, py, 1.3 - i * 0.08, photoBase);
+    if (i < 3) dot(g, hue, px + 2, py - 1, 0.7, photoBase * 0.5);
+  }
+  // Internal energy cores.
+  core(g, hue, 10, -1, 14, 0.22 + 0.12 * pulse);
+  core(g, hue, -8, 1, 10, 0.15 + 0.08 * pulse);
+  // Eye — intense layered glow.
+  dot(g, hue, 26, -3, 2.0, 1);
+  core(g, hue, 26, -3, 5, 0.4 + 0.15 * pulse);
   g.restore();
 }
 
 /* ---------------- ALGO: crystalline dart ---------------- */
 function drawAlgo(g, hue, ph) {
   const beat = Math.sin(ph * Math.PI * 2);
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
+
+  // Thruster tail flame — bright core + gradient cone pulsing at the rear.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  const flameGr = g.createLinearGradient(-28, 0, -46, 0);
+  flameGr.addColorStop(0, hsl(hue, 100, 78, 0.5 * pulse));
+  flameGr.addColorStop(0.5, hsl(hue, 100, 66, 0.22 * pulse));
+  flameGr.addColorStop(1, hsl(hue, 100, 60, 0));
+  g.fillStyle = flameGr;
+  g.beginPath();
+  g.moveTo(-28, -4);
+  g.quadraticCurveTo(-40, -2 - beat, -46, 0);
+  g.quadraticCurveTo(-40, 2 + beat, -28, 4);
+  g.closePath();
+  g.fill();
+  g.restore();
+  core(g, hue, -28, 0, 8, 0.35 * pulse);
 
   // Swept wing fins.
   for (const s of [-1, 1]) {
@@ -328,6 +444,16 @@ function drawAlgo(g, hue, ph) {
     g.strokeStyle = hsl(hue, 90, 82, 0.5);
     g.lineWidth = 1;
     g.stroke();
+    // Wing edge glow — neon leading edge along the swept wing.
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    g.strokeStyle = hsl(hue, 95, 78, 0.4 * pulse);
+    g.lineWidth = 1.4;
+    g.beginPath();
+    g.moveTo(8, s * 7);
+    g.quadraticCurveTo(-2, s * (16 + beat), -14, s * (19 + beat));
+    g.stroke();
+    g.restore();
   }
 
   // Trailing filaments.
@@ -375,13 +501,30 @@ function drawAlgo(g, hue, ph) {
   g.moveTo(-4, 0);
   g.lineTo(-28, 0);
   g.stroke();
-  core(g, hue, 8, 0, 12, 0.3);
-  // Visor slit.
+
+  // Crystal refraction lines — faceted glow along the crystal planes.
+  const refrA = 0.3 + 0.25 * pulse;
+  energyVein(g, hue, [[30, 0], [14, -7], [-4, 0], [-26, 0]], refrA, 0.7);
+  energyVein(g, hue, [[-4, 0], [14, 7], [28, 0]], refrA * 0.8, 0.6);
+  energyVein(g, hue, [[14, -8], [-4, 0], [14, 8]], refrA * 0.55, 0.5);
+
+  core(g, hue, 8, 0, 12, 0.3 + 0.12 * pulse);
+
+  // Speed particles — energy flowing aft along the body, offset by phase.
+  for (let i = 0; i < 3; i++) {
+    const sp = (ph + i * 0.33) % 1;
+    const sx = 30 - sp * 56;
+    const sy = Math.sin(sp * Math.PI * 2 + i) * 2.5;
+    dot(g, hue, sx, sy, 0.8 - i * 0.1, 0.5 + 0.3 * Math.sin(sp * Math.PI * 2));
+  }
+
+  // Visor slit — brighter, with a pulsing core glowing behind it.
+  core(g, hue, 22, -1, 7, 0.3 + 0.25 * pulse);
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.fillStyle = hsl(hue, 100, 82, 0.95);
+  g.fillStyle = hsl(hue, 100, 88, 0.95);
   g.beginPath();
-  g.ellipse(22, -1, 5, 1.6, 0, 0, Math.PI * 2);
+  g.ellipse(22, -1, 5, 1.6 * (0.8 + 0.3 * pulse), 0, 0, Math.PI * 2);
   g.fill();
   g.restore();
   dot(g, hue, -16, 0, 1.2, 0.7);
@@ -391,6 +534,7 @@ function drawAlgo(g, hue, ph) {
 /* ---------------- APE: armored glider ---------------- */
 function drawApe(g, hue, ph) {
   const step = Math.sin(ph * Math.PI * 2);
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
 
@@ -405,6 +549,8 @@ function drawApe(g, hue, ph) {
     g.moveTo(x, 8);
     g.quadraticCurveTo(x - 4, 12 + sw * 0.4, x - 8, 14 + sw * 0.6);
     g.stroke();
+    // Joint energy node at each leg attachment, staggered around the body.
+    pulseNode(g, hue, x, 8, 1.3, ph, i * 0.33, 0.8);
   }
 
   // Antennae, fine curves.
@@ -416,6 +562,9 @@ function drawApe(g, hue, ph) {
   g.moveTo(20, 2);
   g.quadraticCurveTo(30, 4, 38, 6 - step);
   g.stroke();
+  // Antenna glowing tips.
+  dot(g, hue, 38, -9 + step, 1.2, 0.95);
+  dot(g, hue, 38, 6 - step, 1.2, 0.95);
 
   // Tail fan.
   g.beginPath();
@@ -426,6 +575,17 @@ function drawApe(g, hue, ph) {
   g.closePath();
   g.fillStyle = hsl(hue, 60, 46, 0.5);
   g.fill();
+  // Tail fan energy edge.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 78, 0.5 * pulse);
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(-30, -6);
+  g.lineTo(-28, 0);
+  g.lineTo(-30, 6);
+  g.stroke();
+  g.restore();
 
   // Shell: pointed front, rounded back.
   g.beginPath();
@@ -458,9 +618,25 @@ function drawApe(g, hue, ph) {
     g.quadraticCurveTo(x - 4, 0, x, 10 - i * 0.6);
     g.stroke();
   }
-  core(g, hue, 4, 0, 12, 0.26);
-  dot(g, hue, 18, -4, 1.5, 1);
-  dot(g, hue, 18, 3, 1.2, 0.8);
+  // Shell seam glow — energy leaking through the armor cracks.
+  const seamA = 0.3 + 0.3 * pulse;
+  for (let i = 0; i < 4; i++) {
+    const x = 12 - i * 8;
+    const flick = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2 + i);
+    energyVein(g, hue, [[x, -9 + i * 0.6], [x - 4, 0], [x, 9 - i * 0.6]], seamA * flick, 0.7);
+  }
+  // Shell bioluminescent spots — deterministic scatter across the carapace.
+  for (let i = 0; i < 4; i++) {
+    const sx = 14 - i * 8;
+    const sy = (i % 2 === 0 ? -5 : 5) + (i === 1 ? 2 : -1);
+    dot(g, hue, sx, sy, 0.9, 0.5 + 0.2 * Math.sin(ph * Math.PI * 2 + i * 1.3));
+  }
+  core(g, hue, 4, 0, 12, 0.26 + 0.1 * pulse);
+  // Eyes — layered glow with a core burning behind each.
+  core(g, hue, 18, -4, 4, 0.35 * pulse);
+  core(g, hue, 18, 3, 4, 0.3 * pulse);
+  dot(g, hue, 18, -4, 1.7, 1);
+  dot(g, hue, 18, 3, 1.4, 0.9);
   g.restore();
 }
 
@@ -468,6 +644,7 @@ function drawApe(g, hue, ph) {
 function drawInsider(g, hue, ph) {
   g.save();
   g.translate(64, 64);
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
   const N = 28;
   const xs = [];
   const ys = [];
@@ -484,64 +661,79 @@ function drawInsider(g, hue, ph) {
     const len = Math.hypot(dx, dy) || 1;
     return [-dy / len, dx / len];
   };
+  // Closed ribbon body path (reused for the fill and its additive glow pass).
+  const ribbonPath = () => {
+    g.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const [nx, ny] = perp(i);
+      const px = xs[i] + nx * ws[i] * 2;
+      const py = ys[i] + ny * ws[i] * 2;
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    }
+    for (let i = N; i >= 0; i--) {
+      const [nx, ny] = perp(i);
+      g.lineTo(xs[i] - nx * ws[i] * 2, ys[i] - ny * ws[i] * 2);
+    }
+    g.closePath();
+  };
+  // Open edge path at a given offset multiplier (2 dorsal, -2 ventral, etc.).
+  const edgePath = (mul) => {
+    g.beginPath();
+    for (let i = 0; i <= N; i++) {
+      const [nx, ny] = perp(i);
+      const px = xs[i] + nx * ws[i] * mul;
+      const py = ys[i] + ny * ws[i] * mul;
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    }
+    g.stroke();
+  };
   // Ribbon body.
-  g.beginPath();
-  for (let i = 0; i <= N; i++) {
-    const [nx, ny] = perp(i);
-    const px = xs[i] + nx * ws[i] * 2;
-    const py = ys[i] + ny * ws[i] * 2;
-    if (i === 0) g.moveTo(px, py);
-    else g.lineTo(px, py);
-  }
-  for (let i = N; i >= 0; i--) {
-    const [nx, ny] = perp(i);
-    g.lineTo(xs[i] - nx * ws[i] * 2, ys[i] - ny * ws[i] * 2);
-  }
-  g.closePath();
+  ribbonPath();
   g.fillStyle = glass(g, hue, -8, 8);
   g.fill();
-  // Luminous dorsal edge.
+  // Whole-ribbon glow increase — additive second pass, bright at the head.
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 82, 0.8);
-  g.lineWidth = 1.4;
-  g.beginPath();
-  for (let i = 0; i <= N; i++) {
-    const [nx, ny] = perp(i);
-    const px = xs[i] + nx * ws[i] * 2;
-    const py = ys[i] + ny * ws[i] * 2;
-    if (i === 0) g.moveTo(px, py);
-    else g.lineTo(px, py);
-  }
-  g.stroke();
-  g.restore();
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 80, 0.3);
+  ribbonPath();
+  const bodyGr = g.createLinearGradient(32, 0, -38, 0);
+  bodyGr.addColorStop(0, hsl(hue, 100, 72, 0.28 * pulse));
+  bodyGr.addColorStop(1, hsl(hue, 100, 62, 0.05));
+  g.fillStyle = bodyGr;
+  g.fill();
+  // Edge-lit dorsal & ventral: a wide soft glow underneath each bright core.
+  g.strokeStyle = hsl(hue, 95, 70, 0.18);
+  g.lineWidth = 3.2;
+  edgePath(2);
+  g.strokeStyle = hsl(hue, 95, 86, 0.9);
+  g.lineWidth = 1.5;
+  edgePath(2);
+  g.strokeStyle = hsl(hue, 95, 80, 0.34);
   g.lineWidth = 0.9;
-  g.beginPath();
-  for (let i = 0; i <= N; i++) {
-    const [nx, ny] = perp(i);
-    const px = xs[i] + nx * ws[i] * 1.1;
-    const py = ys[i] + ny * ws[i] * 1.1;
-    if (i === 0) g.moveTo(px, py);
-    else g.lineTo(px, py);
+  edgePath(1.1);
+  g.strokeStyle = hsl(hue, 90, 68, 0.16);
+  g.lineWidth = 3;
+  edgePath(-2);
+  g.strokeStyle = hsl(hue, 92, 84, 0.62);
+  g.lineWidth = 1.3;
+  edgePath(-2);
+  // Ethereal wisps — short energy tendrils branching off the ribbon.
+  g.strokeStyle = hsl(hue, 95, 78, 0.22 * pulse);
+  g.lineWidth = 0.8;
+  for (let i = 0; i < 3; i++) {
+    const wi = 5 + i * 8;
+    const [nx, ny] = perp(wi);
+    const bx = xs[wi] + nx * ws[wi] * 2;
+    const by = ys[wi] + ny * ws[wi] * 2;
+    const dir = i % 2 === 0 ? 1 : -1;
+    g.beginPath();
+    g.moveTo(bx, by);
+    g.quadraticCurveTo(bx - 5, by + dir * 7, bx - 11, by + dir * (9 + Math.sin(ph * Math.PI * 2 + i) * 2));
+    g.stroke();
   }
-  g.stroke();
   g.restore();
-  // Ventral edge, soft.
-  g.strokeStyle = hsl(hue, 80, 76, 0.3);
-  g.lineWidth = 0.9;
-  g.beginPath();
-  for (let i = 0; i <= N; i++) {
-    const [nx, ny] = perp(i);
-    const px = xs[i] - nx * ws[i] * 2;
-    const py = ys[i] - ny * ws[i] * 2;
-    if (i === 0) g.moveTo(px, py);
-    else g.lineTo(px, py);
-  }
-  g.stroke();
-  // Head teardrop with eye, and photophores along the centreline.
+  // Head teardrop with eye.
   g.beginPath();
   g.moveTo(32, ys[0] - 4);
   g.quadraticCurveTo(40, ys[0] - 1, 39, ys[0] + 1);
@@ -549,9 +741,14 @@ function drawInsider(g, hue, ph) {
   g.closePath();
   g.fillStyle = hsl(hue, 60, 52, 0.6);
   g.fill();
-  core(g, hue, 26, ys[2], 8, 0.22);
-  for (let i = 4; i < N - 2; i += 5) dot(g, hue, xs[i], ys[i], 1.1, 0.8);
-  dot(g, hue, 34, ys[0] - 1.5, 1.5, 1);
+  // Head concentrated light — intense focal point at the leading edge.
+  core(g, hue, 30, ys[1], 11, 0.3 + 0.18 * pulse);
+  core(g, hue, 33, ys[0], 6, 0.4 * pulse);
+  // Energy pulse nodes — staggered offsets create a traveling pulse.
+  for (let i = 4, k = 0; i < N - 2; i += 5, k++) {
+    pulseNode(g, hue, xs[i], ys[i], 1.3, ph, k * 0.2, 0.85);
+  }
+  dot(g, hue, 34, ys[0] - 1.5, 1.7, 1);
   g.restore();
 }
 
@@ -746,8 +943,10 @@ function creatureGlow(hueBucket) {
   c.width = c.height = 96;
   const g = c.getContext('2d');
   const grad = g.createRadialGradient(48, 48, 0, 48, 48, 48);
-  grad.addColorStop(0, hsla(hue, 100, 72, 0.5));
-  grad.addColorStop(0.4, hsla(hue, 100, 60, 0.16));
+  grad.addColorStop(0, hsla(hue, 100, 72, 0.65));
+  grad.addColorStop(0.15, hsla(hue, 100, 80, 0.4));
+  grad.addColorStop(0.4, hsla(hue, 100, 60, 0.22));
+  grad.addColorStop(0.6, hsla(hue + 20, 90, 55, 0.06));
   grad.addColorStop(1, hsla(hue, 100, 60, 0));
   g.fillStyle = grad;
   g.fillRect(0, 0, 96, 96);
@@ -1551,6 +1750,9 @@ async function pollObserve() {
     const empty = document.getElementById('observe-empty');
     if (!observeAvailable) {
       obsData = null;
+      tickerFlows = [];
+      tickerSig = '';
+      tickerRendered = '';
       empty.hidden = false;
       document.getElementById('ticker').hidden = true;
       return;
@@ -1730,27 +1932,87 @@ document.querySelector('#addr-card .tx-close').addEventListener('click', () => {
   document.getElementById('addr-card').hidden = true;
 });
 
-/** Rotating single-line ticker of the newest real flows. */
-let tickerIdx = 0;
+/** Seamless news-style ticker of the newest real flows, dual-track looping. */
+const TICKER_MAX = 20;
+let tickerFlows = [];   // newest last; mirrored into two identical .tick-track copies
+let tickerSig = '';
+let tickerRendered = '';   // sig of the content currently in the DOM
 function buildTicker() {
   renderTickerItem();
 }
 function renderTickerItem() {
-  const flows = obsData?.flows;
   const el = document.getElementById('ticker');
-  if (!flows || flows.length === 0) {
+  const flows = obsData?.flows;
+  if (!flows) return;
+  if (flows.length === 0) {
     el.hidden = true;
     return;
   }
-  const f = flows[flows.length - 1 - (tickerIdx % flows.length)];
-  tickerIdx++;
-  el.innerHTML =
-    `<span class="tick ${f.x402 === true ? 'x402' : ''}">` +
-    `<i class="dot"></i>${shortAddr(f.from)} <span class="arrow">→</span> ${shortAddr(f.to)}` +
-    ` <span class="amt">${f.amount >= 1000 ? fmtUsd(f.amount) : `${f.amount.toFixed(2)} USDC`}</span>` +
-    (f.x402 === true ? ' <span class="arrow">x402</span>' : '') +
-    `</span>`;
-  el.onclick = () => showTxCard(f);
+  // Roll the flow window forward only when the feed actually changed, so the
+  // animation keeps its phase across the 2.6s resize/adjust ticks.
+  const sig = `${flows.length}:${tickerKey(flows[flows.length - 1])}`;
+  if (sig !== tickerSig) {
+    tickerSig = sig;
+    const known = new Set(tickerFlows.map(tickerKey));
+    const fresh = flows.filter((f) => !known.has(tickerKey(f)));
+    tickerFlows = (fresh.length ? tickerFlows.concat(fresh) : flows).slice(-TICKER_MAX);
+  }
+  if (tickerFlows.length === 0) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = view !== 'observe' || !observeAvailable;
+  if (el.hidden) return;
+  // Rebuild the DOM only when the content actually changed; the 2.6s tick
+  // otherwise just re-measures, keeping the animation phase untouched.
+  const justRebuilt = tickerRendered !== sig;
+  if (justRebuilt) {
+    tickerRendered = sig;
+    const trackHTML =
+      `<span class="tick-track">` +
+      tickerFlows
+        .map(
+          (f, i) =>
+            `<span class="tick ${f.x402 === true ? 'x402' : ''}" data-i="${i}">` +
+            `<i class="dot"></i>${shortAddr(f.from)} <span class="arrow">→</span> ${shortAddr(f.to)}` +
+            ` <span class="amt">${f.amount >= 1000 ? fmtUsd(f.amount) : `${f.amount.toFixed(2)} USDC`}</span>` +
+            (f.x402 === true ? ' <span class="arrow">x402</span>' : '') +
+            `</span>`
+        )
+        .join('') +
+      `</span>`;
+    // Two identical copies side by side: translateX(-50%) lands exactly where
+    // the loop restarts, so the seam is invisible.
+    el.innerHTML = trackHTML + trackHTML.replace('class="tick-track"', 'class="tick-track" aria-hidden="true"');
+    if (!el.dataset.bound) {
+      el.dataset.bound = '1';
+      el.addEventListener('click', (ev) => {
+        const tick = ev.target.closest?.('.tick');
+        if (!tick) return;
+        const f = tickerFlows[Number(tick.dataset.i)];
+        if (f) showTxCard(f);
+      });
+    }
+  }
+  const track = el.firstElementChild;
+  // Short content: no scroll, just rest centered. Overflowing content: speed
+  // scales with track width so the pace stays constant as the list grows.
+  const need = track.scrollWidth + 16 > el.clientWidth;
+  if (need) {
+    el.style.setProperty('--tick-dur', `${Math.round(Math.max(20, Math.min(90, track.scrollWidth / 50)))}s`);
+    el.classList.remove('static');
+    if (justRebuilt) {
+      // Restart the loop cleanly after the content swap.
+      track.style.animation = 'none';
+      void track.offsetWidth;
+      track.style.animation = '';
+    }
+  } else {
+    el.classList.add('static');
+  }
+}
+function tickerKey(f) {
+  return `${f.tx || ''}:${f.t || 0}:${f.from}:${f.to}:${f.amount}`;
 }
 setInterval(() => {
   if (view === 'observe' && observeAvailable) renderTickerItem();
@@ -1877,6 +2139,16 @@ let pulseHover = -1;
 /** Display columns: raw 15s buckets merged so the chart stays around 96 bars. */
 let pulseBars = [];
 
+/* ---- Time-travel (Task #6): historical range + brush selection ---- */
+/** 'live' | '1h' | '24h'. Live keeps the rolling /observe stream untouched. */
+let pulseRange = 'live';
+/** Last /history/pulse payload: { range, bucketMs, buckets:[{t,volume,count,x402Volume}] }. */
+let pulseHistory = null;
+/** Brush selection as inclusive bar indices; null when nothing is selected. */
+let brushA = null;
+let brushB = null;
+let brushing = false;
+
 function computePulseBars(pts) {
   const group = Math.max(1, Math.ceil(pts.length / 96));
   const bars = [];
@@ -1891,6 +2163,34 @@ function computePulseBars(pts) {
     });
   }
   return bars;
+}
+
+/**
+ * Historical buckets arrive already at display resolution; normalize them to
+ * the live bar shape and carry the x402 portion as a 0..1 fraction (live bars
+ * derive it from x402/count instead).
+ */
+function computeHistoryBars(hist) {
+  const span = Math.max(1, Math.round((hist.bucketMs || 60000) / 1000));
+  return hist.buckets.map((b) => ({
+    t: b.t,
+    span,
+    volume: b.volume,
+    count: b.count,
+    x402: 0,
+    x402Share: b.volume > 0 ? Math.min(1, Math.max(0, (b.x402Volume || 0) / b.volume)) : 0,
+  }));
+}
+
+/** x402 fraction of a bar, from whichever source produced it. */
+function x402ShareOf(p) {
+  if (p.x402Share !== undefined) return p.x402Share;
+  return p.count > 0 ? Math.min(1, p.x402 / p.count) : 0;
+}
+
+/** True when a fetched historical range is on screen (brushing is allowed). */
+function pulseHistorical() {
+  return pulseRange !== 'live' && !!pulseHistory && !!pulseHistory.buckets && pulseHistory.buckets.length > 0;
 }
 
 /** Rounded-top column; radius clamped so hairline bars stay crisp, not bulbous. */
@@ -1908,13 +2208,16 @@ function capBar(ctx, x, y, w, h, r) {
 }
 
 function drawPulse() {
-  if (!obsData?.pulse?.length || pulseCanvas.width === 0) return;
+  if (pulseCanvas.width === 0) return;
+  const historical = pulseHistorical();
+  if (!historical && !obsData?.pulse?.length) return;
   const w = pulseCanvas.width / DPR;
   const h = pulseCanvas.height / DPR;
   pctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   pctx.clearRect(0, 0, w, h);
-  const bars = (pulseBars = computePulseBars(obsData.pulse));
-  if (replayOn && clock() - replayStart > REPLAY_MS) {
+  const bars = (pulseBars = historical ? computeHistoryBars(pulseHistory) : computePulseBars(obsData.pulse));
+  // Replay sweeps the rolling live window; it has no meaning on frozen history.
+  if (replayOn && !historical && clock() - replayStart > REPLAY_MS) {
     replayOn = false;
     const btn = document.getElementById('pulse-play');
     if (btn) btn.textContent = '\u25B6';
@@ -1955,7 +2258,7 @@ function drawPulse() {
   const gold = pctx.createLinearGradient(0, top, 0, base);
   gold.addColorStop(0, 'rgba(255, 224, 140, 1)');
   gold.addColorStop(1, 'rgba(255, 190, 90, 0.6)');
-  if (pulseHover >= 0 && pulseHover < bars.length) {
+  if (pulseHover >= 0 && pulseHover < bars.length && !brushing) {
     pctx.fillStyle = 'rgba(140, 190, 255, 0.09)';
     pctx.fillRect(pulseHover * bw, top, bw, plotH);
   }
@@ -1965,17 +2268,18 @@ function drawPulse() {
     const bh = Math.max(1.5, Math.pow(p.volume / max, 0.72) * plotH);
     const x = i * bw + (bw - barW) / 2;
     const y = base - bh;
+    const share = x402ShareOf(p);
     pctx.fillStyle = grad;
     capBar(pctx, x, y, barW, bh, barW / 2);
-    if (p.x402 > 0 && p.count > 0) {
+    if (share > 0) {
       // Gold segment proportional to the x402 share of the column.
-      const xh = Math.max(1.5, bh * (p.x402 / p.count));
+      const xh = Math.max(1.5, bh * share);
       pctx.fillStyle = gold;
       capBar(pctx, x, y, barW, xh, barW / 2);
     }
     // Bright cap dot, additive so busy columns read as a glowing skyline.
     pctx.globalCompositeOperation = 'lighter';
-    pctx.fillStyle = p.x402 > 0 && p.count > 0
+    pctx.fillStyle = share > 0
       ? 'rgba(255, 236, 180, 0.7)'
       : 'rgba(190, 246, 255, 0.5)';
     pctx.beginPath();
@@ -1984,7 +2288,12 @@ function drawPulse() {
     pctx.globalCompositeOperation = 'source-over';
   }
 
-  if (replayOn && bars.length) {
+  // Brush selection overlay: only on a frozen historical range.
+  if (historical && brushA !== null && brushB !== null) {
+    drawBrush(bars, bw, top, plotH, base, w);
+  }
+
+  if (replayOn && !historical && bars.length) {
     const playhead = clock() - REPLAY_MS + (clock() - replayStart);
     let idx = 0;
     for (let i = 0; i < bars.length; i++) if ((bars[i].t ?? 0) <= playhead) idx = i;
@@ -1997,7 +2306,7 @@ function drawPulse() {
     pctx.stroke();
     const b = bars[idx];
     pctx.fillStyle = 'rgba(255, 236, 180, 0.9)';
-    pctx.fillText(`${fmtUsd(b.volume)} · ${Math.round((b.x402 / Math.max(1, b.count)) * 100)}% x402`, x + 4, 0);
+    pctx.fillText(`${fmtUsd(b.volume)} · ${Math.round(x402ShareOf(b) * 100)}% x402`, x + 4, 0);
   }
 
   pctx.fillStyle = 'rgba(201, 214, 232, 0.45)';
@@ -2006,31 +2315,181 @@ function drawPulse() {
   pctx.textAlign = 'left';
   pctx.fillText(`peak ${fmtUsd(max)}`, 3, 0);
   // Window ends as clock time.
-  const clock = (t) => new Date(t).toTimeString().slice(0, 8);
+  const hhmmss = (t) => new Date(t).toTimeString().slice(0, 8);
   pctx.fillStyle = 'rgba(201, 214, 232, 0.32)';
   pctx.textBaseline = 'bottom';
-  pctx.fillText(clock(bars[0].t), 3, h - 2);
+  pctx.fillText(hhmmss(bars[0].t), 3, h - 2);
   pctx.textAlign = 'right';
-  pctx.fillText(clock(bars[bars.length - 1].t + bars[bars.length - 1].span * 1000), w - 3, h - 2);
+  pctx.fillText(hhmmss(bars[bars.length - 1].t + bars[bars.length - 1].span * 1000), w - 3, h - 2);
 }
 
-// Column inspector: the pulse chart reads as noise until you can probe a bar.
+/** Small rounded-rect path helper for the brush stats panel. */
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+/**
+ * Translucent highlight over the brushed bars plus a glass stats panel with
+ * the selection's total volume, transfer count, x402 share and time span.
+ */
+function drawBrush(bars, bw, top, plotH, base, w) {
+  const lo = Math.min(brushA, brushB);
+  const hi = Math.max(brushA, brushB);
+  const x0 = lo * bw;
+  const x1 = (hi + 1) * bw;
+  const g = pctx.createLinearGradient(0, top, 0, base);
+  g.addColorStop(0, 'rgba(111, 214, 255, 0.22)');
+  g.addColorStop(1, 'rgba(111, 214, 255, 0.05)');
+  pctx.fillStyle = g;
+  pctx.fillRect(x0, top, x1 - x0, plotH);
+  pctx.strokeStyle = 'rgba(126, 224, 240, 0.85)';
+  pctx.lineWidth = 1;
+  pctx.beginPath();
+  pctx.moveTo(Math.round(x0) + 0.5, top); pctx.lineTo(Math.round(x0) + 0.5, base);
+  pctx.moveTo(Math.round(x1) - 0.5, top); pctx.lineTo(Math.round(x1) - 0.5, base);
+  pctx.stroke();
+
+  let vol = 0, cnt = 0, x402Vol = 0;
+  for (let i = lo; i <= hi; i++) {
+    vol += bars[i].volume;
+    cnt += bars[i].count;
+    x402Vol += bars[i].volume * x402ShareOf(bars[i]);
+  }
+  const t0 = bars[lo].t;
+  const t1 = bars[hi].t + bars[hi].span * 1000;
+  const spanMin = Math.max(1, Math.round((t1 - t0) / 60000));
+  const hhmm = (t) => new Date(t).toTimeString().slice(0, 5);
+  const x402Pct = vol > 0 ? Math.round((x402Vol / vol) * 100) : 0;
+  const lines = [
+    `${hhmm(t0)}\u2013${hhmm(t1)}  \u00b7  ${spanMin}m`,
+    `${fmtUsd(vol)}  \u00b7  ${cnt.toLocaleString()} tx`,
+    `x402 ${x402Pct}%`,
+  ];
+  pctx.save();
+  pctx.font = '10px monospace';
+  const padX = 8, padY = 6, lh = 13;
+  const pw = Math.max(...lines.map((s) => pctx.measureText(s).width)) + padX * 2;
+  const ph = lines.length * lh + padY * 2 - 3;
+  let px = x0 + (x1 - x0) / 2 - pw / 2;
+  px = Math.max(4, Math.min(px, w - pw - 4));
+  const py = top + 4;
+  pctx.fillStyle = 'rgba(6, 16, 22, 0.88)';
+  pctx.strokeStyle = 'rgba(126, 224, 240, 0.4)';
+  pctx.lineWidth = 1;
+  roundRectPath(pctx, px, py, pw, ph, 6);
+  pctx.fill();
+  pctx.stroke();
+  pctx.textBaseline = 'top';
+  pctx.textAlign = 'left';
+  lines.forEach((s, i) => {
+    pctx.fillStyle = i === 0 ? 'rgba(126, 224, 240, 0.95)' : 'rgba(201, 214, 232, 0.82)';
+    pctx.fillText(s, px + padX, py + padY + i * lh);
+  });
+  pctx.restore();
+}
+
+/** Bar index under a client X coordinate, or -1 when there is nothing to hit. */
+function pulseIndexAt(clientX) {
+  const bars = pulseBars;
+  if (!bars.length) return -1;
+  const r = pulseCanvas.getBoundingClientRect();
+  if (r.width === 0) return -1;
+  return Math.min(bars.length - 1, Math.max(0, Math.floor(((clientX - r.left) / r.width) * bars.length)));
+}
+
+// Column inspector + brush. Hover probes a single bar; on a historical range,
+// dragging instead sweeps a selection whose aggregate the overlay reports.
 pulseCanvas.addEventListener('mousemove', (ev) => {
   const bars = pulseBars;
   if (bars.length === 0) return;
-  const r = pulseCanvas.getBoundingClientRect();
-  const i = Math.min(bars.length - 1, Math.max(0, Math.floor(((ev.clientX - r.left) / r.width) * bars.length)));
+  const i = pulseIndexAt(ev.clientX);
+  if (i < 0) return;
+  if (brushing) {
+    if (i !== brushB) { brushB = i; drawPulse(); }
+    tipEl.hidden = true;
+    return;
+  }
   if (i !== pulseHover) { pulseHover = i; drawPulse(); }
   const p = bars[i];
-  const clock = (t) => new Date(t).toTimeString().slice(0, 8);
-  const when = p.span > 15 ? `${clock(p.t)}–${clock(p.t + p.span * 1000)}` : clock(p.t);
+  const hhmmss = (t) => new Date(t).toTimeString().slice(0, 8);
+  const when = p.span > 15 ? `${hhmmss(p.t)}\u2013${hhmmss(p.t + p.span * 1000)}` : hhmmss(p.t);
   tipEl.hidden = false;
-  tipEl.innerHTML = `<b>${when}</b> · ${fmtUsd(p.volume)}<br>` +
-    `${t('obsTransfers')} ${p.count} · x402 ${p.x402}`;
+  tipEl.innerHTML = `<b>${when}</b> \u00b7 ${fmtUsd(p.volume)}<br>` +
+    `${t('obsTransfers')} ${p.count} \u00b7 x402 ${Math.round(x402ShareOf(p) * 100)}%`;
   tipEl.style.left = `${Math.min(ev.clientX + 14, window.innerWidth - tipEl.offsetWidth - 8)}px`;
   tipEl.style.top = `${Math.min(ev.clientY + 14, window.innerHeight - tipEl.offsetHeight - 8)}px`;
 });
-pulseCanvas.addEventListener('mouseleave', () => { tipEl.hidden = true; pulseHover = -1; drawPulse(); });
+pulseCanvas.addEventListener('mouseleave', () => { tipEl.hidden = true; pulseHover = -1; if (!brushing) drawPulse(); });
+
+// Brush: drag to select a time span (historical ranges only).
+pulseCanvas.addEventListener('mousedown', (ev) => {
+  if (!pulseHistorical()) return;
+  const i = pulseIndexAt(ev.clientX);
+  if (i < 0) return;
+  brushing = true;
+  brushA = brushB = i;
+  tipEl.hidden = true;
+  pulseCanvas.classList.add('brushing');
+  drawPulse();
+  ev.preventDefault();
+});
+window.addEventListener('mouseup', () => {
+  if (!brushing) return;
+  brushing = false;
+  pulseCanvas.classList.remove('brushing');
+  drawPulse();
+});
+// Double-click clears the selection.
+pulseCanvas.addEventListener('dblclick', () => {
+  if (brushA === null && brushB === null) return;
+  brushA = brushB = null;
+  drawPulse();
+});
+
+/* ---- Range switching + historical fetch ---- */
+async function fetchPulseHistory(range) {
+  try {
+    const d = await getJSON(`/history/pulse?range=${range}`);
+    // Drop a stale response if the viewer switched ranges mid-flight.
+    if (pulseRange !== range) return;
+    if (d && Array.isArray(d.buckets)) { pulseHistory = d; drawPulse(); }
+  } catch { /* keep whatever history we already have */ }
+}
+
+function setPulseRange(range) {
+  if (range === pulseRange) return;
+  pulseRange = range;
+  document.querySelectorAll('.range-btn').forEach((b) => b.classList.toggle('active', b.dataset.range === range));
+  // A fresh range starts with no selection.
+  brushA = brushB = null;
+  brushing = false;
+  pulseCanvas.classList.remove('brushing');
+  const historical = range !== 'live';
+  pulseCanvas.classList.toggle('brushable', historical);
+  // Replay is a live-window affordance; drop it when time-travelling.
+  if (historical && replayOn) {
+    replayOn = false;
+    const btn = document.getElementById('pulse-play');
+    if (btn) btn.textContent = '\u25B6';
+  }
+  if (historical) fetchPulseHistory(range);
+  else drawPulse();
+}
+
+document.querySelectorAll('.range-btn').forEach((b) =>
+  b.addEventListener('click', () => setPulseRange(b.dataset.range)));
+
+// Keep a historical view fresh without hammering the edge: 30s cadence, only
+// while OBSERVE is actually on screen.
+setInterval(() => {
+  if (view === 'observe' && !document.hidden && pulseRange !== 'live') fetchPulseHistory(pulseRange);
+}, 30000);
 
 /* ---------- tx provenance card (shared by both views) ---------- */
 
@@ -2163,14 +2622,37 @@ function updateTopbar() {
   marketDot.style.background = `hsl(${140 - m * 140}, 80%, 55%)`;
   marketDot.style.color = marketDot.style.background;
 
-  document.getElementById('harvest-val').textContent =
-    fmtCountdown(state.harvest.ticksRemaining, ticksPerHour);
-  document.getElementById('judgment-val').textContent =
-    fmtCountdown(state.judgment.ticksRemaining, ticksPerHour);
+  if (state.harvest)
+    document.getElementById('harvest-val').textContent =
+      fmtCountdown(state.harvest.ticksRemaining, ticksPerHour);
+  if (state.judgment)
+    document.getElementById('judgment-val').textContent =
+      fmtCountdown(state.judgment.ticksRemaining, ticksPerHour);
 
   if (state.dayAnchor) {
     document.getElementById('day-digest').textContent =
       `D${state.dayAnchor.day} · ${state.dayAnchor.digest}`;
+  }
+
+  // Day Digest on-chain status indicator
+  const digestEl = document.getElementById('digest-status');
+  const dc = state.digestChain;
+  if (!dc) {
+    digestEl.innerHTML = '';
+    digestEl.className = 'digest-status';
+  } else if (dc.status === 'confirmed') {
+    digestEl.className = 'digest-status confirmed';
+    const short = dc.txHash ? dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4) : '';
+    digestEl.innerHTML = `<span class="ds-dot"></span><a class="ds-link" href="${explorerTxUrl}${dc.txHash}" target="_blank" rel="noopener" title="View on explorer">✓ ${short}</a>`;
+  } else if (dc.status === 'pending') {
+    digestEl.className = 'digest-status pending';
+    digestEl.innerHTML = '<span class="ds-dot"></span>Committing…';
+  } else if (dc.status === 'failed') {
+    digestEl.className = 'digest-status failed';
+    digestEl.innerHTML = '<span class="ds-dot"></span>Retry…';
+  } else {
+    digestEl.className = 'digest-status unconfigured';
+    digestEl.innerHTML = '<span class="ds-dot"></span>Off-chain';
   }
 }
 
@@ -2186,6 +2668,36 @@ function lerpAngle(a, b, k) {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return a + d * k;
+}
+
+/**
+ * Uniform Catmull-Rom spline through p1→p2 with tangents from p0 and p3.
+ * C1-continuous across segments: as (s1,s2) rolls forward, the outgoing
+ * tangent of one segment equals the incoming tangent of the next, so
+ * trajectories curve instead of kinking at snapshot boundaries.
+ */
+function catmullRom(p0, p1, p2, p3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return 0.5 * (
+    (2 * p1) +
+    (-p0 + p2) * t +
+    (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 +
+    (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+  );
+}
+
+/**
+ * Catmull-Rom on a torus axis. Successive control points are unwrapped
+ * relative to their predecessor (shortest way round), the spline runs in
+ * that continuous space, and the result is wrapped back into [0, size).
+ */
+function catmullRomTorus(x0, x1, x2, x3, size, t) {
+  const u1 = x0 + torusDelta(x0, x1, size);
+  const u2 = u1 + torusDelta(x1, x2, size);
+  const u3 = u2 + torusDelta(x2, x3, size);
+  const r = catmullRom(x0, u1, u2, u3, t);
+  return ((r % size) + size) % size;
 }
 
 /**
@@ -2356,12 +2868,8 @@ function render() {
   }
   if (!latestSnap || cssW === 0) return;
   const now = clock();
-  // Frame-rate independent easing: relax by the same amount per millisecond,
-  // so a 60Hz viewer and a 144Hz viewer trace the same positions (≈0.35 per
-  // 16.7ms frame, which is what the old per-frame constant amounted to).
   const frameDt = Math.min(100, Math.max(1, now - lastFrameAt));
   lastFrameAt = now;
-  const easeK = 1 - Math.exp(-frameDt / 38);
   const tax = latestSnap.tax ?? null;
   const sx = cssW / latestSnap.width;
   const sy = cssH / latestSnap.height;
@@ -2420,22 +2928,27 @@ function render() {
 
   // 5) Creatures from the snapshot buffer.
   //    Render time sits RENDER_DELAY behind the newest snapshot, so we always
-  //    interpolate between two snapshots we already hold. On buffer starvation
-  //    we extrapolate by velocity (dead reckoning, capped), then hold.
-  //    If the buffered timeline runs ahead of the local clock (a late poll
-  //    inflating the anchor, see poll()) then every entry is newer than
-  //    renderAt and the search below would silently fall back to the OLDEST
-  //    snapshot we hold: a tank frozen seconds behind its own panels and behind
-  //    the cursor. Clamp to the newest instead.
+  //    interpolate between snapshots we already hold — and, when possible,
+  //    through a Catmull-Rom spline spanning four of them (s0, s1, s2, s3) so
+  //    trajectories curve instead of visibly kinking at snapshot boundaries.
+  //    On buffer starvation we extrapolate by velocity (dead reckoning,
+  //    capped), then hold. If the buffered timeline runs ahead of the local
+  //    clock (a late poll inflating the anchor, see poll()) then every entry
+  //    is newer than renderAt and the search below would silently fall back
+  //    to the OLDEST snapshot we hold: a tank frozen seconds behind its own
+  //    panels and behind the cursor. Clamp to the newest instead.
   const wanted = now - RENDER_DELAY;
   const renderAt = wanted < snapBuffer[0].at ? snapBuffer[snapBuffer.length - 1].at : wanted;
-  let s1 = snapBuffer[0];
-  let s2 = null;
+  // Locate s1 = newest snapshot with .at <= renderAt (or snapBuffer[0] if none).
+  let i1 = 0;
   for (let i = 0; i < snapBuffer.length; i++) {
-    if (snapBuffer[i].at <= renderAt) s1 = snapBuffer[i];
-    else { s2 = snapBuffer[i]; break; }
+    if (snapBuffer[i].at <= renderAt) i1 = i;
+    else break;
   }
-  if (!s2) s2 = snapBuffer[snapBuffer.length - 1];
+  const s0 = i1 > 0 ? snapBuffer[i1 - 1] : null;
+  const s1 = snapBuffer[i1];
+  const s2 = snapBuffer[i1 + 1] ?? snapBuffer[snapBuffer.length - 1];
+  const s3 = snapBuffer[i1 + 2] ?? null;
   let alpha = 0;
   let deadReckonMs = 0;
   if (s1 && s2 && s1 !== s2) {
@@ -2455,33 +2968,59 @@ function render() {
   }
   creatureHits.length = 0;
   if (s2) {
+    const dtSec = frameDt / 1000;
+    // Velocity-lowpass time constant. Longer than the old 38ms position-ease
+    // so direction changes round off instead of kinking, but short enough
+    // that recovery from a stall still visibly catches up within ~200ms.
+    const velK = 1 - Math.exp(-frameDt / 80);
     for (const c of s2.byId.values()) {
-      const p = s1 && s1 !== s2 ? s1.byId.get(c.id) : undefined;
+      const p1 = s1 && s1 !== s2 ? s1.byId.get(c.id) : undefined;
+      // Catmull-Rom only fires when all four control points know this
+      // creature; newborns and buffer edges degrade to linear.
+      const p0 = p1 && s0 ? s0.byId.get(c.id) : undefined;
+      const p3 = p1 && s3 ? s3.byId.get(c.id) : undefined;
       let x;
       let y;
       let heading = c.heading;
-      if (p) {
-        x = torusLerp(p.x, c.x, s2.width, alpha);
-        y = torusLerp(p.y, c.y, s2.height, alpha);
-        heading = lerpAngle(p.heading, c.heading, alpha);
+      if (p1 && p0 && p3) {
+        x = catmullRomTorus(p0.x, p1.x, c.x, p3.x, s2.width, alpha);
+        y = catmullRomTorus(p0.y, p1.y, c.y, p3.y, s2.height, alpha);
+        heading = lerpAngle(p1.heading, c.heading, alpha);
+      } else if (p1) {
+        x = torusLerp(p1.x, c.x, s2.width, alpha);
+        y = torusLerp(p1.y, c.y, s2.height, alpha);
+        heading = lerpAngle(p1.heading, c.heading, alpha);
       } else {
         x = c.x + c.vx * deadReckonMs;
         y = c.y + c.vy * deadReckonMs;
+        // Dead reckoning: heading comes from the velocity we are actually
+        // extrapolating along, so a creature never appears to slide sideways
+        // through its own trajectory while the buffer is starved.
+        if (deadReckonMs > 0 && (c.vx !== 0 || c.vy !== 0)) {
+          heading = Math.atan2(c.vy, c.vx);
+        }
       }
-      // Ease the rendered position toward the target: this is what turns
-      // post-stall recovery into a smooth slide instead of a teleport.
+      // Velocity-based smoothing: rather than low-passing position (which
+      // lets direction snap when the target kinks), track a smoothed
+      // velocity and integrate position from it. torusDelta keeps the
+      // target velocity wrap-aware across the seam.
       let rp = renderPos.get(c.id);
       if (!rp) {
-        rp = { x, y };
+        // c.vx/c.vy are world units per millisecond (see processSnapshot);
+        // renderPos velocities are per second.
+        rp = { x, y, vx: c.vx * 1000, vy: c.vy * 1000 };
         renderPos.set(c.id, rp);
       } else {
-        rp.x += torusDelta(rp.x, x, s2.width) * easeK;
-        rp.y += torusDelta(rp.y, y, s2.height) * easeK;
-        // The eased position lives on the torus too. torusDelta always takes the
-        // short way round, so a creature that crosses a seam ends up chasing the
-        // copy of its target one world-width away: without this wrap it slides
-        // off-canvas and never comes back, and the tank empties within a couple
-        // of minutes (measured: 113 of 122 creatures off-world after 110s).
+        const targetVx = torusDelta(rp.x, x, s2.width) / dtSec;
+        const targetVy = torusDelta(rp.y, y, s2.height) / dtSec;
+        rp.vx += (targetVx - rp.vx) * velK;
+        rp.vy += (targetVy - rp.vy) * velK;
+        rp.x += rp.vx * dtSec;
+        rp.y += rp.vy * dtSec;
+        // The eased position lives on the torus too. Without this wrap a
+        // creature that crosses a seam ends up chasing the copy of its
+        // target one world-width away and slides off-canvas for good
+        // (measured: 113 of 122 creatures off-world after 110s).
         rp.x = ((rp.x % s2.width) + s2.width) % s2.width;
         rp.y = ((rp.y % s2.height) + s2.height) % s2.height;
       }

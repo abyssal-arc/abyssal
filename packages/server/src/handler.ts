@@ -31,6 +31,8 @@ import {
   verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
+import { createWalletClient, http, toHex } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 
 /**
  * What the tank remembers about one address. Persisted through the store so a
@@ -303,6 +305,23 @@ export function createApp(options: AppOptions = {}) {
       if (t.size > dayMaxFall.size) dayMaxFall = { day, size: t.size, hash: t.hash };
     }
     scoreReports();
+
+    // Day Digest on-chain commit: detect day boundary and submit.
+    if (day > 0 && day !== lastCommittedDay) {
+      // A new day started — commit the *previous* day's digest.
+      const prevDay = day - 1;
+      if (prevDay !== lastCommittedDay) {
+        lastCommittedDay = prevDay;
+        const prevHash = fnv1a(
+          [prevDay, world.tick, world.creatures.length, Math.round(world.creatures.reduce((s, c) => s + c.energy, 0)), world.totalBorn, world.totalDied, world.totalPredations].join('|'),
+        );
+        void commitDayDigest(prevDay, prevHash);
+      }
+    }
+    // Check pending digest confirmation or retry failed commits.
+    void checkDigestConfirmation();
+    void retryDigestCommit();
+
     lastAdvanceAt = Date.now();
   }
 
@@ -448,6 +467,13 @@ export function createApp(options: AppOptions = {}) {
         paid: e.paid,
       })),
       totals: { born: world.totalBorn, died: world.totalDied, predations: world.totalPredations },
+      digestChain: digestChain ? {
+        day: digestChain.day,
+        hash: digestChain.hash,
+        status: digestChain.status,
+        txHash: digestChain.txHash,
+        confirmedAt: digestChain.confirmedAt,
+      } : null,
       network: NETWORK,
       chainId: CHAIN_ID,
       instance: options.instance ?? instanceId,
@@ -504,6 +530,108 @@ export function createApp(options: AppOptions = {}) {
     score?: number; survivors?: number;
   }[] = [];
   let dayMaxFall = { day: -1, size: 0, hash: '' };
+
+  /* ---------- Day Digest on-chain commit ---------- */
+
+  interface DigestChainState {
+    day: number;
+    hash: string;
+    status: 'unconfigured' | 'pending' | 'confirmed' | 'failed';
+    txHash: string | null;
+    confirmedAt: number | null;
+    retries: number;
+    /** Stats snapshot at commit time. */
+    stats: {
+      born: number;
+      died: number;
+      predations: number;
+      population: number;
+      topPredator: string | null;
+      totalEnergy: number;
+    } | null;
+  }
+
+  let digestChain: DigestChainState | null = null;
+  let lastCommittedDay = -1;
+  let digestCommitInFlight = false;
+
+  function digestKey(): `0x${string}` | null {
+    const pk = process.env.ARC_DIGEST_KEY;
+    if (!pk || !/^0x[0-9a-fA-F]{64}$/.test(pk)) return null;
+    return pk as `0x${string}`;
+  }
+
+  function buildDigestPayload(day: number): DigestChainState['stats'] {
+    const killsBy: Record<string, number> = {};
+    for (const c of world.creatures) killsBy[c.archetype] = (killsBy[c.archetype] ?? 0) + c.kills;
+    const winner = Object.entries(killsBy).sort((a, b) => b[1] - a[1])[0];
+    return {
+      born: world.totalBorn,
+      died: world.totalDied,
+      predations: world.totalPredations,
+      population: world.creatures.length,
+      topPredator: winner ? `${winner[0]}:${winner[1]}` : null,
+      totalEnergy: Math.round(world.creatures.reduce((s, c) => s + c.energy, 0)),
+    };
+  }
+
+  async function commitDayDigest(day: number, hash: string): Promise<void> {
+    if (digestCommitInFlight) return;
+    const pk = digestKey();
+    const rpc = options.rpc ?? process.env.ARC_RPC_URL;
+    if (!pk || !rpc) {
+      digestChain = { day, hash, status: 'unconfigured', txHash: null, confirmedAt: null, retries: 0, stats: buildDigestPayload(day) };
+      return;
+    }
+    digestCommitInFlight = true;
+    try {
+      const account = privateKeyToAccount(pk);
+      const client = createWalletClient({ account, transport: http(rpc) });
+      // Encode digest as calldata: magic "ABYS" + day(u32) + hash + JSON stats
+      const stats = buildDigestPayload(day);
+      const payload = JSON.stringify({ day, hash, ts: Date.now(), ...stats });
+      const data = ('0x41425953' + toHex(payload).slice(2)) as `0x${string}`;
+      const txHash = await client.sendTransaction({
+        to: account.address,
+        value: 0n,
+        data,
+        chain: { id: CHAIN_ID, name: 'Arc', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 }, rpcUrls: { default: { http: [rpc] } } } as any,
+      });
+      digestChain = { day, hash, status: 'pending', txHash, confirmedAt: null, retries: 0, stats };
+    } catch {
+      const retries = (digestChain?.day === day ? digestChain.retries : 0) + 1;
+      digestChain = { day, hash, status: retries >= 3 ? 'failed' : 'pending', txHash: null, confirmedAt: null, retries, stats: buildDigestPayload(day) };
+      if (retries >= 3) digestChain.status = 'failed';
+    } finally {
+      digestCommitInFlight = false;
+    }
+  }
+
+  async function checkDigestConfirmation(): Promise<void> {
+    if (!digestChain || digestChain.status !== 'pending' || !digestChain.txHash) return;
+    const rpc = options.rpc ?? process.env.ARC_RPC_URL;
+    if (!rpc) return;
+    try {
+      const res = await globalThis.fetch(rpc, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [digestChain.txHash] }),
+      });
+      const json = (await res.json()) as { result?: { status?: string } | null };
+      if (json.result && json.result.status === '0x1') {
+        digestChain.status = 'confirmed';
+        digestChain.confirmedAt = Date.now();
+      } else if (json.result && json.result.status === '0x0') {
+        digestChain.status = 'failed';
+      }
+    } catch { /* will retry next tick */ }
+  }
+
+  /** Retry a failed digest commit (up to 3 total attempts). */
+  async function retryDigestCommit(): Promise<void> {
+    if (!digestChain || digestChain.status !== 'failed' || digestChain.retries >= 3) return;
+    await commitDayDigest(digestChain.day, digestChain.hash);
+  }
 
   function scoreReports() {
     for (const r of reports) {
@@ -675,6 +803,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /world': 'render snapshot: creatures (with archetype), foods, world size',
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
+        'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
@@ -733,6 +862,30 @@ export function createApp(options: AppOptions = {}) {
       const slots = Math.min(positiveInt(url.searchParams.get('slots'), 0), window);
       const stats = world.statsLog.slice(-window);
       return json({ stats: slots > 0 ? decimate(stats, slots) : stats }, 200, 3);
+    }
+
+    if (req.method === 'GET' && path === '/history/pulse') {
+      // Time-travel for the OBSERVE pulse chart: re-buckets the chain feed's
+      // in-memory 15s series into 1h@60s or 24h@900s columns. Off-Arc the
+      // observatory is silent and so is this; the client falls back to live.
+      if (!arcFeed) return json({ available: false, range: 'none', bucketMs: 0, buckets: [] }, 200, 3);
+      const range = url.searchParams.get('range') ?? '1h';
+      const cfg = range === '24h'
+        ? { rangeMs: 24 * 60 * 60 * 1000, bucketMs: 15 * 60 * 1000 }
+        : range === '1h'
+          ? { rangeMs: 60 * 60 * 1000, bucketMs: 60 * 1000 }
+          : null;
+      if (!cfg) return json({ error: 'unknown range', accepts: ['1h', '24h'] }, 400);
+      try {
+        return json({
+          available: true,
+          range,
+          bucketMs: cfg.bucketMs,
+          buckets: arcFeed.historyPulse(cfg.rangeMs, cfg.bucketMs),
+        }, 200, 10);
+      } catch {
+        return json({ error: 'history unavailable' }, 503);
+      }
     }
 
     if (req.method === 'GET' && path === '/judgments') {
