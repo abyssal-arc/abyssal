@@ -121,6 +121,7 @@ let lastFrameAt = clock();
 
 const SPRITE = 128;         // sprite canvas size (glow included)
 const SPRITE_BODY = 30;     // body radius inside the sprite, in sprite px
+const TAU = Math.PI * 2;
 const HUE_BUCKETS = 24;
 // Visual-only magnification: the sim's collision radius stays small, but on
 // screen each creature is drawn large enough that its jewel-body art reads.
