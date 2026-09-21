@@ -152,6 +152,22 @@ chain this week rather than against a fixed number. Off Arc it defaults to
 calmer pre/after-market, near-zero on weekends). See
 `packages/server/src/market.ts`.
 
+## Reading the tank
+
+- **Daily propositions**: three standings resolved from the world itself (does
+  ALGO lead predation, does one species hold over half the tank, did predation
+  beat yesterday). No oracle and no market: anybody can recompute them from
+  `/history`, and yesterday's results stay visible after the day rolls.
+- **Fate line**: every creature card names its birth day, generation and
+  parent, so an individual is a biography rather than a dot.
+- **Replay**: the pulse chart replays the last 90 seconds with a playhead and a
+  per-bucket readout.
+- **Burners**: the observatory lists who has burned for the tank, and their
+  intervention zones stay signed on the water.
+- **Day pass and export**: burning the pass price gates `GET /export`, which
+  streams the window's pulse buckets and flows as CSV. Passes expire when the
+  day rolls; buying another is the whole subscription model.
+
 ## Deploy (Cloudflare Workers)
 
 The handler carries no node builtins, so the same code runs as a Worker: the
@@ -159,6 +175,11 @@ world lives in one Durable Object (`AbyssalWorld`), a one-minute cron alarm
 keeps time flowing with zero viewers, and snapshots persist in the object's
 storage between isolates. The web client ships as Workers Static Assets; any
 path that is not a file routes into the object.
+
+The Arc RPC endpoint is configurable: `ARC_RPC_URL` (a provider URL with a key)
+is read from a Worker **secret** (`npx wrangler secret put ARC_RPC_URL`) in
+production and from a gitignored `.env` locally, so a provider key never enters
+the repository. Unset, the worker falls back to the public Arc RPC.
 
 ```bash
 npx wrangler login                 # once, browser OAuth

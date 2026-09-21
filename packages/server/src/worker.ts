@@ -20,6 +20,8 @@ interface DoBinding {
 interface Env {
   WORLD: DoBinding;
   ABYS_TOKEN_ADDRESS?: string;
+  /** Set with `wrangler secret put ARC_RPC_URL`, so it never enters the repo. */
+  ARC_RPC_URL?: string;
 }
 
 const SNAP_KEY = 'world';
@@ -41,7 +43,12 @@ export class AbyssalWorld {
         instance = crypto.randomUUID();
         await this.ctx.storage.put(INSTANCE_KEY, instance);
       }
-      this.app = createApp({ snapshot: snapshot ?? undefined, instance, token: this.env.ABYS_TOKEN_ADDRESS });
+      this.app = createApp({
+        snapshot: snapshot ?? undefined,
+        instance,
+        token: this.env.ABYS_TOKEN_ADDRESS,
+        rpc: this.env.ARC_RPC_URL,
+      });
     }
     return this.app;
   }

@@ -1196,6 +1196,8 @@ async function poll() {
     if (!chainCopyApplied) applyChainStrings();
     updateTopbar();
     updateBoard();
+    renderProps(snap.world.propositions);
+    renderBurners(snap.world.burners);
     if (snap.events.length > 0) {
       for (const e of snap.events) lastEventSeq = Math.max(lastEventSeq, e.seq);
       if (bootstrap) {
@@ -1610,6 +1612,11 @@ function drawPulse() {
   pctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   pctx.clearRect(0, 0, w, h);
   const bars = (pulseBars = computePulseBars(obsData.pulse));
+  if (replayOn && clock() - replayStart > REPLAY_MS) {
+    replayOn = false;
+    const btn = document.getElementById('pulse-play');
+    if (btn) btn.textContent = '\u25B6';
+  }
   const max = Math.max(...bars.map((p) => p.volume), 0.001);
   const top = 10;
   const plotH = h - top - 15;
@@ -1673,6 +1680,22 @@ function drawPulse() {
     pctx.arc(x + barW / 2, y, Math.max(0.9, barW / 2), 0, Math.PI * 2);
     pctx.fill();
     pctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (replayOn && bars.length) {
+    const playhead = clock() - REPLAY_MS + (clock() - replayStart);
+    let idx = 0;
+    for (let i = 0; i < bars.length; i++) if ((bars[i].t ?? 0) <= playhead) idx = i;
+    const x = idx * bw + bw / 2;
+    pctx.strokeStyle = 'rgba(255, 236, 180, 0.8)';
+    pctx.lineWidth = 1;
+    pctx.beginPath();
+    pctx.moveTo(x, top);
+    pctx.lineTo(x, base);
+    pctx.stroke();
+    const b = bars[idx];
+    pctx.fillStyle = 'rgba(255, 236, 180, 0.9)';
+    pctx.fillText(`${fmtUsd(b.volume)} · ${Math.round((b.x402 / Math.max(1, b.count)) * 100)}% x402`, x + 4, 0);
   }
 
   pctx.fillStyle = 'rgba(201, 214, 232, 0.45)';
@@ -3362,9 +3385,91 @@ function renderCard(c) {
     <div>${t('devouredLabel')}: ${(c.devouredTotal ?? 0).toFixed(1)}</div>
     <div>${t('age')}: ${ageTicks}${t('ticks')}</div>
     <div>${t('generation')}: G${c.generation}</div>
+    <div>${t('fateLabel')}: D${Math.floor(c.bornTick / (latestSnap?.ticksPerDay ?? 19200))} · ${c.parentId != null ? (latestSnap.byId.get(c.parentId)?.name ?? '—') : t('fateOrphan')}</div>
     <div>${t('genomeFingerprint')}: [${c.genes.join(', ')}] · hue ${c.hue.toFixed(2)}</div>
   `;
 }
+
+/* ---------- daily propositions, burners, replay, export ---------- */
+
+const PROP_KEYS = { 'algo-top': 'propAlgoTop', mono: 'propMono', pred: 'propPred' };
+
+function renderProps(p) {
+  const el = document.getElementById('props');
+  if (!el) return;
+  if (!p?.standings?.length) { el.hidden = true; return; }
+  el.hidden = false;
+  const mark = (ok) => (ok ? t('propYes') : t('propNo'));
+  el.innerHTML = `<div class="props-h">${t('propsTitle')} · D${p.day}</div>` +
+    p.standings
+      .map((s) => `<div class="prop"><span>${t(PROP_KEYS[s.id] ?? s.id)}</span>` +
+        `<b>${s.value}${s.id === 'mono' ? '%' : ''} ${mark(s.ok)}</b></div>`)
+      .join('') +
+    (p.yesterday?.length
+      ? `<div class="props-y">${t('propYesterday')}: ` +
+        p.yesterday.map((y) => `${t(PROP_KEYS[y.id] ?? y.id)} ${mark(y.ok)}`).join(' · ') + '</div>'
+      : '');
+}
+
+function renderBurners(list) {
+  const el = document.getElementById('burners');
+  if (!el) return;
+  if (!list?.length) {
+    el.innerHTML = `<div class="addr-empty">${t('burnersEmpty')}</div>`;
+    return;
+  }
+  el.innerHTML = list
+    .map((b, i) => `<div class="af in"><span class="who">${i + 1}. ${shortAddr(b.address)}</span>` +
+      `<span class="amt">${b.total.toLocaleString()} ABYS</span></div>`)
+    .join('');
+}
+
+// 90s replay over the pulse buckets: a playhead sweeping the last six bars.
+let replayOn = false;
+let replayStart = 0;
+const REPLAY_MS = 90_000;
+
+function downloadCsv(text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'abyssal-window.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+document.getElementById('pulse-play')?.addEventListener('click', (ev) => {
+  replayOn = !replayOn;
+  replayStart = clock();
+  ev.currentTarget.textContent = replayOn ? '\u23F8' : '\u25B6';
+});
+
+document.getElementById('export-csv')?.addEventListener('click', async () => {
+  const eth = window.ethereum;
+  let payer = null;
+  if (eth) {
+    try {
+      const acc = await eth.request({ method: 'eth_accounts' });
+      payer = acc?.[0]?.toLowerCase() ?? null;
+    } catch { /* no wallet connected */ }
+  }
+  if (!payer) { toast(t('needWallet'), true); return; }
+  const grab = async () => {
+    const r = await fetch(`/export?pass=${payer}`);
+    if (!r.ok) throw r.status;
+    return r.text();
+  };
+  try {
+    downloadCsv(await grab());
+  } catch (status) {
+    if (status === 402) {
+      await intervene({ type: 'pass' });
+      try { downloadCsv(await grab()); } catch { toast(t('exportCsv') + ': 402', true); }
+    } else {
+      toast(t('failed', { error: status }), true);
+    }
+  }
+});
 
 /* ---------- panel collapse, dock drawers, welcome layer ---------- */
 

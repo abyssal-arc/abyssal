@@ -50,6 +50,8 @@ export interface Creature {
   id: number;
   /** Deterministic codename, e.g. MOBY-042. */
   name: string;
+  /** Who spawned this creature, for the fate line; null for colonists. */
+  parentId: number | null;
   x: number;
   y: number;
   energy: number;
@@ -78,7 +80,8 @@ export type Intervention =
   | { type: 'feed'; x: number; y: number; radius: number; amount?: number }
   | { type: 'poison'; x: number; y: number; radius: number; durationTicks?: number }
   | { type: 'bloom'; durationTicks?: number }
-  | { type: 'drought'; durationTicks?: number };
+  | { type: 'drought'; durationTicks?: number }
+  | { type: 'pass' };
 
 export interface TimedEffect {
   /** `boom` = a whale's own transfer landed plankton here and pulls locally. */
@@ -250,6 +253,7 @@ function makeCreature(
   y: number,
   energy: number,
   generation: number,
+  parentId: number | null = null,
 ): Creature {
   const archetype = archetypeOf(genome);
   const id = world.nextCreatureId++;
@@ -267,6 +271,7 @@ function makeCreature(
     huntReadyAt: 0,
     generation,
     bornTick: world.tick,
+    parentId,
   };
 }
 
@@ -759,6 +764,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
           wrap(c.y + rng.range(-10, 10), cfg.height),
           cfg.reproduceCost,
           c.generation + 1,
+          c.id,
         ),
       );
     }
@@ -1011,6 +1017,11 @@ export function applyIntervention(
         affected: world.creatures.length,
       };
     }
+    case 'pass': {
+      // A day pass changes nothing in the ecology: it is a receipt that gates
+      // data export, not a lever on the tank.
+      return { message: 'pass: day pass active until the day rolls', affected: 0 };
+    }
     case 'drought': {
       const duration = intervention.durationTicks ?? 2400;
       world.effects = world.effects.filter((e) => e.kind !== 'bloom');
@@ -1052,6 +1063,7 @@ export function fromJSON(json: string): World {
     // wipes the prey layer each restart. Load them as freshly fed instead.
     c.huntReadyAt ??= rest.tick + (rest.config?.huntCooldown ?? DEFAULT_CONFIG.huntCooldown);
     c.name ??= creatureName(c.archetype, c.id);
+    c.parentId ??= null;
   }
   for (const cull of rest.culls ?? []) {
     for (const victim of cull.culled) {

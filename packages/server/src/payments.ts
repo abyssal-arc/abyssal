@@ -15,7 +15,7 @@
  * environment after the imports are evaluated.
  */
 
-export type InterventionType = 'feed' | 'poison' | 'bloom' | 'drought';
+export type InterventionType = 'feed' | 'poison' | 'bloom' | 'drought' | 'pass';
 
 /** The one network this build targets. */
 export const NETWORK = 'arc';
@@ -37,6 +37,7 @@ export const ABYS_PRICES: Record<InterventionType, string> = {
   poison: '150000',
   bloom: '200000',
   drought: '200000',
+  pass: '20000',
 };
 
 /** Null until the operator deploys ABYS and exports ABYS_TOKEN_ADDRESS. */

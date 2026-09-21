@@ -23,6 +23,19 @@ const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..',
 const webRoot = join(repoRoot, 'packages', 'web');
 const stateFile = process.env.WORLD_STATE ?? join(repoRoot, '.data', 'world.json');
 
+/**
+ * Optional local secrets, so a rate-limited RPC never has to go through shell
+ * history or the repository. `.env` is gitignored; real deployments use
+ * `wrangler secret put` instead.
+ */
+try {
+  for (const line of readFileSync(join(repoRoot, '.env'), 'utf8').split('\n')) {
+    const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2];
+  }
+} catch { /* no .env is the normal case */ }
+
+
 function loadSnapshot(): string | undefined {
   try {
     return readFileSync(stateFile, 'utf8');

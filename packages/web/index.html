@@ -72,7 +72,7 @@
         </div>
       </section>
       <section class="glass obs-card obs-pulse-card">
-        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><span class="obs-sub" id="pulse-sub"></span></div>
+        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><button id="pulse-play" class="icon-btn" data-i18n-title="replay" title="Replay the last 90 seconds">&#9654;</button><span class="obs-sub" id="pulse-sub"></span></div>
         <canvas id="pulse"></canvas>
         <div class="flowmap-legend">
           <span><i class="lg-plain"></i><span data-i18n="pulseLegendV">USDC volume per bucket</span></span>
@@ -88,6 +88,10 @@
       <section class="glass obs-card obs-endpoints-card">
         <div class="obs-head"><span data-i18n="endpointsTitle">Top endpoints</span><span class="obs-sub" data-i18n="endpointsSub">by USDC volume</span></div>
         <div id="endpoints"></div>
+      </section>
+      <section class="glass obs-card">
+        <div class="obs-head"><span data-i18n="burnersTitle">Top burners</span></div>
+        <div id="burners"></div>
       </section>
     </div>
     <div id="addr-card" class="glass" hidden>
@@ -129,6 +133,7 @@
         <div class="board-title" data-i18n="elders">Elders</div>
         <div id="lb-elders" class="board-list"></div>
       </div>
+      <div id="props" class="props" hidden></div>
       <div id="world-legend" hidden>
         <span><i class="lg-creature"></i><span data-i18n="legendCreature">creature — hover to inspect</span></span>
         <span><i class="lg-food"></i><span data-i18n="legendFood">food — chain-fed plankton</span></span>
@@ -144,10 +149,11 @@
     </div>
     <div class="panel-body">
       <p class="hint" data-i18n="panelHint">Interventions are paid on Arc: USDC at list price or ABYS at a ~30% discount (x402 flow). In dev mode a click just works.</p>
-      <button class="iv" data-type="feed"><span data-i18n="feed">Feed</span> <span class="price">100 ABYS</span></button>
-      <button class="iv" data-type="poison"><span data-i18n="poison">Poison</span> <span class="price">250 ABYS</span></button>
-      <button class="iv" data-type="bloom"><span data-i18n="bloom">Bloom</span> <span class="price">500 ABYS</span></button>
-      <button class="iv" data-type="drought"><span data-i18n="drought">Drought</span> <span class="price">500 ABYS</span></button>
+      <button class="iv" data-type="feed"><span data-i18n="feed">Feed</span> <span class="price">100000 ABYS</span></button>
+      <button class="iv" data-type="poison"><span data-i18n="poison">Poison</span> <span class="price">150000 ABYS</span></button>
+      <button class="iv" data-type="bloom"><span data-i18n="bloom">Bloom</span> <span class="price">200000 ABYS</span></button>
+      <button class="iv" data-type="drought"><span data-i18n="drought">Drought</span> <span class="price">200000 ABYS</span></button>
+      <button class="iv" data-type="pass"><span data-i18n="passLabel">Day pass</span> <span class="price">20000 ABYS</span></button>
       <p class="hint" id="target-hint" data-i18n="targetHint" hidden>Click the canvas to pick a target area; click the button again to cancel.</p>
       <div id="toast" hidden></div>
       <div id="creature-card" hidden></div>
@@ -185,6 +191,7 @@
       <div><i class="sg-dot market"></i><span data-i18n="marketHelp">MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter</span></div>
     </div>
     <div class="analytics-body">
+      <button id="export-csv" class="dock-btn" data-i18n="exportCsv">Export CSV</button>
       <div id="chart-wrap">
         <div class="section-title" data-i18n="popHistory">Population history</div>
         <canvas id="chart"></canvas>

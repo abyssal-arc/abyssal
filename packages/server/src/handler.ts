@@ -37,6 +37,12 @@ export interface AppOptions {
   /** Payment token contract; defaults to the ABYS_TOKEN_ADDRESS env var. */
   token?: string;
   /**
+   * Arc JSON-RPC endpoint. Workers pass the ARC_RPC_URL binding (a secret, so
+   * a rate-limited provider URL never lands in the repo); the node adapter
+   * falls back to .env and then to the public RPC.
+   */
+  rpc?: string;
+  /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
    * the same handler runs inside a Cloudflare Worker where static assets come
@@ -49,14 +55,15 @@ export interface AppOptions {
   marketFeed?: MarketFeed;
 }
 
-const INTERVENTION_TYPES: InterventionType[] = ['feed', 'poison', 'bloom', 'drought'];
+const INTERVENTION_TYPES: InterventionType[] = ['feed', 'poison', 'bloom', 'drought', 'pass'];
 
-function defaultChainFeedFromEnv(): ChainFeed {
+const PUBLIC_ARC_RPC = 'https://rpc.mainnet.arc.io';
+
+function defaultChainFeedFromEnv(rpc?: string): ChainFeed {
   // Arc is the product; the offline rain is an explicit opt-out for working
   // without network (and for hermetic tests), not the default.
   if (process.env.CHAIN_FEED === 'synthetic') return new SyntheticFeed();
-  const url = process.env.ARC_RPC_URL ?? 'https://rpc.mainnet.arc.io';
-  return new ArcUsdcFeed(url, process.env.ARC_USDC_ADDRESS ?? ARC_USDC_ADDRESS);
+  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, process.env.ARC_USDC_ADDRESS ?? ARC_USDC_ADDRESS);
 }
 
 function round1(v: number): number {
@@ -100,7 +107,7 @@ export function createApp(options: AppOptions = {}) {
   const world: World = options.snapshot
     ? resumeWorld(options.snapshot)
     : createWorld(options.seed ?? 1337);
-  const chainFeed: ChainFeed = options.chainFeed ?? defaultChainFeedFromEnv();
+  const chainFeed: ChainFeed = options.chainFeed ?? defaultChainFeedFromEnv(options.rpc ?? process.env.ARC_RPC_URL);
   /** Non-null when running against Arc: powers /observe and the market feed. */
   const arcFeed = chainFeed instanceof ArcUsdcFeed ? chainFeed : null;
   const marketFeed: MarketFeed =
@@ -111,7 +118,7 @@ export function createApp(options: AppOptions = {}) {
   // Interventions are paid by burning ABYS: no seller key, no facilitator,
   // the receipt is the proof. Until the token address is configured there is
   // nothing to burn and /intervene answers 503. There is no demo path.
-  const rpcUrl = process.env.ARC_RPC_URL ?? 'https://rpc.mainnet.arc.io';
+  const rpcUrl = options.rpc ?? process.env.ARC_RPC_URL ?? PUBLIC_ARC_RPC;
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastAdvanceAt = Date.now();
   const instanceId = crypto.randomUUID();
@@ -330,6 +337,50 @@ export function createApp(options: AppOptions = {}) {
     };
   }
 
+  // Three daily propositions resolved from the world itself at day roll: no
+  // oracle and no market, just standings anybody can recompute from /history.
+  let dayStartDay = -1;
+  let dayStartPredations = 0;
+  let prevDayPredations = 0;
+  let prevDayResults: { id: string; ok: boolean }[] = [];
+  let lastStandings: { id: string; ok: boolean; value: number }[] = [];
+  function propositions() {
+    const cfg = world.config;
+    const day = Math.floor(world.tick / cfg.ticksPerDay);
+    if (day !== dayStartDay) {
+      prevDayResults = lastStandings.map((x) => ({ id: x.id, ok: x.ok }));
+      prevDayPredations = world.totalPredations - dayStartPredations;
+      dayStartDay = day;
+      dayStartPredations = world.totalPredations;
+    }
+    const killsOf = (a: string) =>
+      world.creatures.filter((c) => c.archetype === a).reduce((sum, c) => sum + c.kills, 0);
+    const counts: Record<string, number> = { APE: 0, WHALE: 0, ALGO: 0, INSIDER: 0 };
+    for (const c of world.creatures) counts[c.archetype]++;
+    const pop = Math.max(1, world.creatures.length);
+    const top = Object.entries(counts).sort((x, y) => y[1] - x[1])[0];
+    const algo = killsOf('ALGO');
+    const share = Math.round((top[1] / pop) * 100);
+    const predToday = world.totalPredations - dayStartPredations;
+    lastStandings = [
+      { id: 'algo-top', ok: algo > 0 && algo >= Math.max(killsOf('APE'), killsOf('WHALE'), killsOf('INSIDER')), value: algo },
+      { id: 'mono', ok: share > 50, value: share },
+      { id: 'pred', ok: predToday > prevDayPredations, value: predToday },
+    ];
+    return { day, standings: lastStandings, yesterday: prevDayResults };
+  }
+
+  // Who has burned for the tank, and day-pass holders (export gate).
+  const burners = new Map<string, { total: number; last: number }>();
+  const passes = new Map<string, number>();
+  function noteBurn(payer: string | undefined, whole: number) {
+    if (!payer) return;
+    const b = burners.get(payer) ?? { total: 0, last: 0 };
+    b.total += whole;
+    b.last = Date.now();
+    burners.set(payer, b);
+  }
+
   function worldPayload() {
     return {
       tick: world.tick,
@@ -343,6 +394,11 @@ export function createApp(options: AppOptions = {}) {
       whales: arcFeed ? arcFeed.whalesPayload() : [],
       // The two hidden rules, surfaced so the tank is never a black box.
       tax: dominantTax(world),
+      propositions: propositions(),
+      burners: [...burners.entries()]
+        .sort((x, y) => y[1].total - x[1].total)
+        .slice(0, 8)
+        .map(([address, b]) => ({ address, total: b.total, last: b.last })),
       chainTemp,
       marketTemp,
       creatures: world.creatures.map((c) => ({
@@ -369,7 +425,7 @@ export function createApp(options: AppOptions = {}) {
 
   function buildIntervention(body: Record<string, unknown>): Intervention | null {
     const type = body.type as InterventionType;
-    if (type === 'bloom' || type === 'drought') {
+    if (type === 'bloom' || type === 'drought' || type === 'pass') {
       return { type };
     }
     if (type === 'feed' || type === 'poison') {
@@ -488,6 +544,22 @@ export function createApp(options: AppOptions = {}) {
       });
     }
 
+    if (req.method === 'GET' && path === '/export') {
+      const payer = (url.searchParams.get('pass') ?? '').toLowerCase();
+      const until = passes.get(payer) ?? 0;
+      if (!payer || world.tick >= until) {
+        return json({ error: 'day pass required', accepts: [await burnOffer(rpcUrl, 'pass', options.token)] }, 402);
+      }
+      const obs = arcFeed?.observePayload();
+      const rows = ['t,volume,count,x402'];
+      for (const p of obs?.pulse ?? []) rows.push(`${p.t},${p.volume},${p.count},${p.x402}`);
+      rows.push('t,from,to,amount,x402');
+      for (const f of obs?.flows ?? []) rows.push(`${f.t},${f.from},${f.to},${f.amount},${f.x402 === true ? 1 : 0}`);
+      return new Response(rows.join('\n'), {
+        headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="abyssal-window.csv"' },
+      });
+    }
+
     if (req.method === 'GET' && path === '/observe') {
       if (!arcFeed) return json({ available: false });
       const addr = url.searchParams.get('addr');
@@ -543,6 +615,10 @@ export function createApp(options: AppOptions = {}) {
       const verdict = await verifyBurnReceipt(rpcUrl, offer, txHash);
       if (!verdict.ok) {
         return json({ error: 'payment required', accepts: [offer], reason: verdict.reason }, 402);
+      }
+      noteBurn(verdict.payer, Number(ABYS_PRICES[type]));
+      if (type === 'pass' && verdict.payer) {
+        passes.set(verdict.payer, (Math.floor(world.tick / world.config.ticksPerDay) + 1) * world.config.ticksPerDay);
       }
       const result = applyIntervention(world, intervention, {
         payer: verdict.payer,
