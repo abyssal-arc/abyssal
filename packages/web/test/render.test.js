@@ -162,22 +162,30 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 await import(root + 'app.js');
 await sleep(1200);
 
-test('the render loop paints a living tank without throwing', () => {
+test('the render loop paints a living tank without throwing', (t) => {
   let frames = 0;
-  let t = 1000;
+  let clock = 1000;
   for (let i = 0; i < 8; i++) {
     const cbs = rafQ.splice(0, rafQ.length);
     if (!cbs.length) break;
-    t += 16;
+    clock += 16;
     for (const cb of cbs) {
       try {
-        cb(t);
+        cb(clock);
         frames++;
       } catch (err) {
         renderThrows.push(String(err.stack ?? err));
       }
     }
   }
+  // Clear the app's polling timers even when an assertion fails, or the test
+  // process never exits.
+  t.after(() => {
+    for (const id of timerIds) {
+      clearInterval(id);
+      clearTimeout(id);
+    }
+  });
   assert.ok(frames >= 4, `expected several frames, got ${frames}`);
   assert.deepEqual(renderThrows.slice(0, 1), [], 'the render loop threw');
   assert.deepEqual(pageErrors.slice(0, 1), [], 'the page reported an error');
@@ -190,11 +198,6 @@ test('the render loop paints a living tank without throwing', () => {
   }
   // Water alone lights most of the frame; a blank canvas lights none.
   assert.ok(lit > 100_000, `the tank painted almost nothing (${lit} lit pixels)`);
-
-  for (const id of timerIds) {
-    clearInterval(id);
-    clearTimeout(id);
-  }
 });
 
 server.close();

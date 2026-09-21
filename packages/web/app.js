@@ -129,440 +129,381 @@ const HUE_BUCKETS = 24;
 const CREATURE_VISUAL_SCALE = 1.3;
 const spriteCache = new Map();
 
-/* ---------- procedural creature sprites (v7 "field guide") ---------- */
+/* ---------- procedural creature sprites (v8 "glasslight") ---------- */
 /**
- * v7 "field guide" creature painters. Bodies fill their footprint, real anatomy,
- * dark back / light belly, one rim light and one accent organ, so a silhouette
- * still reads at 18px. Facing +x, centred on (64,64) in a 128px sprite.
+ * v8 "glasslight": translucent glass bodies with one bright rim, an inner glow
+ * core and photophore dots. Silhouettes are slender and tapered so nothing
+ * aliases into noise at the 18-40px the tank draws most bodies at, and the
+ * value contrast (bright rim, dark interior, one accent) keeps each species
+ * readable as an animal rather than a shape.
  */
 const hsl = hsla;
-
-function lg(g, x0, y0, x1, y1, stops) {
-  const gr = g.createLinearGradient(x0, y0, x1, y1);
-  for (const [o, c] of stops) gr.addColorStop(o, c);
+/**
+ * v8 "glasslight": translucent glass bodies, one bright rim, an inner glow core
+ * and photophore dots. Silhouettes are slender and tapered; nothing spiky that
+ * would alias away at the 18-40px the tank draws.
+ */
+/** Translucent glass fill, top-lit. */
+function glass(g, hue, y0, y1) {
+  const gr = g.createLinearGradient(0, y0, 0, y1);
+  gr.addColorStop(0, hsl(hue, 55, 62, 0.34));
+  gr.addColorStop(0.45, hsl(hue, 62, 30, 0.62));
+  gr.addColorStop(1, hsl(hue, 70, 74, 0.22));
   return gr;
 }
 
-/** Stroke a path again as a top-edge rim light. */
-function rim(g, hue, width = 1.6, alpha = 0.55) {
+/** Additive inner core so the animal carries its own light. */
+function core(g, hue, x, y, r, a = 0.3) {
   g.save();
-  g.clip();
-  g.strokeStyle = hsl(hue, 95, 84, alpha);
-  g.lineWidth = width * 2;
-  g.translate(0, -width);
-  g.stroke();
+  g.globalCompositeOperation = 'lighter';
+  const gr = g.createRadialGradient(x, y, 0, x, y, r);
+  gr.addColorStop(0, hsl(hue, 100, 72, a));
+  gr.addColorStop(1, hsl(hue, 100, 60, 0));
+  g.fillStyle = gr;
+  g.beginPath();
+  g.arc(x, y, r, 0, Math.PI * 2);
+  g.fill();
   g.restore();
 }
 
-/* ---------------- WHALE: sperm-whale body, flukes, one fin ---------------- */
+/** A bright photophore dot. */
+function dot(g, hue, x, y, r = 1.4, a = 0.9) {
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = hsl(hue, 100, 86, a);
+  g.beginPath();
+  g.arc(x, y, r, 0, Math.PI * 2);
+  g.fill();
+  g.fillStyle = hsl(hue, 100, 70, a * 0.35);
+  g.beginPath();
+  g.arc(x, y, r * 2.6, 0, Math.PI * 2);
+  g.fill();
+  g.restore();
+}
+
+function rimStroke(g, hue, alpha = 0.9, width = 1.4) {
+  g.strokeStyle = hsl(hue, 92, 86, alpha);
+  g.lineWidth = width;
+  g.stroke();
+}
+
+/* ---------------- WHALE: sleek lantern-whale ---------------- */
 function drawWhale(g, hue, ph) {
-  const beat = Math.sin(ph * TAU);
+  const beat = Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
 
-  // Caudal peduncle and flukes, beating around the tail root.
+  // Crescent tail fluke, thin tapered blades.
   g.save();
-  g.translate(-30, 0);
-  g.rotate(beat * 0.22);
+  g.translate(-32, 0);
+  g.rotate(beat * 0.16);
   g.beginPath();
-  g.moveTo(2, -5);
-  g.quadraticCurveTo(-9, -7, -16, -18);
-  g.quadraticCurveTo(-10, -6, -13, 0);
-  g.quadraticCurveTo(-10, 6, -16, 16);
-  g.quadraticCurveTo(-9, 7, 2, 5);
+  g.moveTo(2, -1.5);
+  g.quadraticCurveTo(-8, -4, -15, -13);
+  g.quadraticCurveTo(-9, -4, -11, 0);
+  g.quadraticCurveTo(-9, 4, -14, 11);
+  g.quadraticCurveTo(-8, 4, 2, 1.5);
   g.closePath();
-  g.fillStyle = lg(g, 0, -16, 0, 16, [[0, hsl(hue, 55, 34)], [1, hsl(hue, 45, 22)]]);
+  g.fillStyle = hsl(hue, 60, 46, 0.5);
   g.fill();
-  g.restore();
-
-  // Body mass: blunt head, deep middle, narrow peduncle.
-  g.beginPath();
-  g.moveTo(39, -12);
-  g.bezierCurveTo(30, -18, 10, -20, -6, -17);
-  g.bezierCurveTo(-18, -14, -26, -8, -31, -4);
-  g.lineTo(-31, 4);
-  g.bezierCurveTo(-24, 10, -12, 16, 2, 17);
-  g.bezierCurveTo(16, 18, 32, 15, 38, 9);
-  g.quadraticCurveTo(41, 0, 39, -12);
-  g.closePath();
-  const body = lg(g, 0, -20, 0, 18, [
-    [0, hsl(hue, 62, 40)],
-    [0.45, hsl(hue, 58, 30)],
-    [0.75, hsl(hue, 40, 46)],
-    [1, hsl(hue, 32, 62)],
-  ]);
-  g.fillStyle = body;
-  g.fill();
-
-  // Dorsal ridge.
-  g.beginPath();
-  g.moveTo(-4, -16);
-  g.quadraticCurveTo(2, -22, 8, -15);
-  g.quadraticCurveTo(2, -17, -4, -16);
-  g.closePath();
-  g.fillStyle = hsl(hue, 60, 36);
-  g.fill();
-
-  // Pectoral fin, swept back, flexing with the beat.
-  g.save();
-  g.translate(12, 9);
-  g.rotate(0.55 + beat * 0.14);
-  g.beginPath();
-  g.moveTo(2, -2);
-  g.quadraticCurveTo(-2, 12, -18, 19);
-  g.quadraticCurveTo(-8, 9, -6, -1);
-  g.closePath();
-  g.fillStyle = hsl(hue, 52, 22, 0.98);
-  g.fill();
-  g.strokeStyle = hsl(hue, 70, 60, 0.5);
+  g.strokeStyle = hsl(hue, 90, 82, 0.55);
   g.lineWidth = 1;
   g.stroke();
   g.restore();
-  // Mouth line.
-  g.beginPath();
-  g.moveTo(38, 4);
-  g.quadraticCurveTo(32, 7, 26, 6);
-  g.strokeStyle = hsl(hue, 40, 12, 0.7);
-  g.lineWidth = 1.4;
-  g.stroke();
 
-  // Ventral grooves.
-  g.strokeStyle = hsl(hue, 30, 70, 0.25);
+  // Long pectoral blade sweeping back.
+  g.beginPath();
+  g.moveTo(10, 5);
+  g.quadraticCurveTo(2, 12, -10, 17);
+  g.quadraticCurveTo(-2, 10, 2, 4);
+  g.closePath();
+  g.fillStyle = hsl(hue, 60, 40, 0.55);
+  g.fill();
+  g.strokeStyle = hsl(hue, 90, 80, 0.4);
   g.lineWidth = 1;
-  for (let i = 0; i < 3; i++) {
-    g.beginPath();
-    g.moveTo(30 - i * 4, 12 - i * 2.5);
-    g.quadraticCurveTo(10, 15 - i * 2.5, -14, 8 - i * 2);
-    g.stroke();
-  }
-
-  // Eye.
-  g.beginPath();
-  g.arc(29, -3, 2.7, 0, TAU);
-  g.fillStyle = hsl(hue, 20, 8);
-  g.fill();
-  g.beginPath();
-  g.arc(29.9, -3.9, 1, 0, TAU);
-  g.fillStyle = hsl(hue, 90, 88, 0.9);
-  g.fill();
-
-  // Rim light along the back.
-  g.beginPath();
-  g.moveTo(38, -10);
-  g.bezierCurveTo(30, -17, 10, -19, -6, -16);
-  g.bezierCurveTo(-18, -13, -26, -8, -31, -4);
-  g.strokeStyle = hsl(hue, 95, 82, 0.5);
-  g.lineWidth = 1.6;
   g.stroke();
-  g.restore();
-}
 
-/* ------------- ALGO: machine cuttlefish, faceted core, jointed arms ------------- */
-function drawAlgo(g, hue, ph) {
-  const beat = Math.sin(ph * TAU);
-  g.save();
-  g.translate(64, 64);
-
-  // Mantle cone with fin ribs.
+  // Dorsal fin, small and swept.
   g.beginPath();
-  g.moveTo(8, -12);
-  g.lineTo(-30, -3);
-  g.quadraticCurveTo(-36, 0, -30, 3);
-  g.lineTo(8, 12);
+  g.moveTo(-2, -10);
+  g.quadraticCurveTo(2, -16, 7, -10);
   g.closePath();
-  g.fillStyle = lg(g, 0, -12, 0, 12, [[0, hsl(hue, 55, 42)], [1, hsl(hue, 50, 20)]]);
+  g.fillStyle = hsl(hue, 60, 50, 0.5);
   g.fill();
-  for (let i = 0; i < 3; i++) {
-    const x = 0 - i * 11;
-    const w = 5 + Math.sin(ph * TAU + i * 1.3) * 1.6;
-    g.beginPath();
-    g.moveTo(x + 5, -11 + i * 2.5);
-    g.quadraticCurveTo(x - 2, -13 - w + i * 2.5, x - 8, -10 + i * 2.5);
-    g.quadraticCurveTo(x - 3, -9 + i * 2.5, x + 5, -11 + i * 2.5);
-    g.closePath();
-    g.fillStyle = hsl(hue, 62, 52, 0.85);
-    g.fill();
-    g.beginPath();
-    g.moveTo(x + 5, 11 - i * 2.5);
-    g.quadraticCurveTo(x - 2, 13 + w - i * 2.5, x - 8, 10 - i * 2.5);
-    g.quadraticCurveTo(x - 3, 9 - i * 2.5, x + 5, 11 - i * 2.5);
-    g.closePath();
-    g.fillStyle = hsl(hue, 62, 34, 0.85);
-    g.fill();
-  }
 
-  // Faceted core head.
+  // Sleek body: rounded head, long taper to the peduncle.
   g.beginPath();
-  for (let i = 0; i < 6; i++) {
-    const a = (i / 6) * TAU + Math.PI / 6;
-    const x = 19 + Math.cos(a) * 16;
-    const y = Math.sin(a) * 14;
-    if (i === 0) g.moveTo(x, y);
-    else g.lineTo(x, y);
-  }
+  g.moveTo(34, -3);
+  g.bezierCurveTo(30, -9, 18, -11, 4, -11);
+  g.bezierCurveTo(-12, -11, -26, -6, -33, -1.5);
+  g.lineTo(-33, 1.5);
+  g.bezierCurveTo(-26, 6, -12, 10, 4, 10);
+  g.bezierCurveTo(18, 10, 30, 7, 34, 3);
+  g.quadraticCurveTo(36, 0, 34, -3);
   g.closePath();
-  g.fillStyle = lg(g, 10, -14, 26, 14, [
-    [0, hsl(hue, 70, 62)],
-    [0.5, hsl(hue, 65, 40)],
-    [1, hsl(hue, 60, 24)],
-  ]);
+  g.fillStyle = glass(g, hue, -12, 11);
   g.fill();
-  // Facet seams.
+  // Top rim, bright.
+  g.beginPath();
+  g.moveTo(34, -3);
+  g.bezierCurveTo(30, -9, 18, -11, 4, -11);
+  g.bezierCurveTo(-12, -11, -26, -6, -33, -1.5);
+  rimStroke(g, hue);
+  // Belly rim, softer.
+  g.beginPath();
+  g.moveTo(-33, 1.5);
+  g.bezierCurveTo(-26, 6, -12, 10, 4, 10);
+  g.bezierCurveTo(18, 10, 30, 7, 34, 3);
   g.strokeStyle = hsl(hue, 80, 78, 0.35);
   g.lineWidth = 1;
-  g.beginPath();
-  g.moveTo(8, -8);
-  g.lineTo(20, 0);
-  g.lineTo(8, 9);
-  g.moveTo(20, 0);
-  g.lineTo(31, -4);
   g.stroke();
 
-  // Visor slit, the one bright organ.
+  // Spine line and photophores along the belly.
+  g.strokeStyle = hsl(hue, 70, 80, 0.28);
+  g.lineWidth = 0.8;
   g.beginPath();
-  if (g.roundRect) g.roundRect(15, -4.5, 15, 5, 2.5);
-  else g.rect(15, -4.5, 15, 5);
-  g.fillStyle = hsl(hue, 100, 80, 0.98);
-  g.fill();
-  g.beginPath();
-  g.arc(24, -2, 6, 0, TAU);
-  g.fillStyle = hsl(hue, 100, 70, 0.28);
-  g.fill();
-
-  // Jointed arms, two segments each.
-  for (let i = 0; i < 3; i++) {
-    const y0 = -7 + i * 7;
-    const flex = beat * 0.3 + i * 0.3;
-    const a1 = -0.45 + i * 0.45 + flex * 0.3;
-    const x1 = 31 + Math.cos(a1) * 11;
-    const y1 = y0 + Math.sin(a1) * 11;
-    const a2 = a1 + 0.8 + flex;
-    const x2 = x1 + Math.cos(a2) * 10;
-    const y2 = y1 + Math.sin(a2) * 10;
-    g.strokeStyle = hsl(hue, 58, 52, 0.95);
-    g.lineWidth = 4;
-    g.lineCap = 'round';
-    g.beginPath();
-    g.moveTo(29, y0);
-    g.lineTo(x1, y1);
-    g.lineTo(x2, y2);
-    g.stroke();
-    g.beginPath();
-    g.arc(x1, y1, 2.2, 0, TAU);
-    g.fillStyle = hsl(hue, 90, 78, 0.95);
-    g.fill();
-  }
+  g.moveTo(30, 0);
+  g.quadraticCurveTo(0, 1.5, -30, 0);
+  g.stroke();
+  core(g, hue, 10, -1, 13, 0.26);
+  for (let i = 0; i < 4; i++) dot(g, hue, 20 - i * 12, 6.5 - i * 0.6, 1.1, 0.75);
+  dot(g, hue, 26, -3, 1.7, 1); // eye
   g.restore();
 }
 
-/* ---------------- APE: segmented isopod, plates, legs, antennae ---------------- */
-function drawApe(g, hue, ph) {
-  const step = Math.sin(ph * TAU);
+/* ---------------- ALGO: crystalline dart ---------------- */
+function drawAlgo(g, hue, ph) {
+  const beat = Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
 
-  // Legs under the body, cycling.
-  g.strokeStyle = hsl(hue, 50, 40, 0.95);
-  g.lineWidth = 2.4;
-  g.lineCap = 'round';
-  for (let i = 0; i < 4; i++) {
-    const x = 14 - i * 11;
-    const sw = Math.sin(ph * TAU + i * 1.7) * 3;
-    for (const s of [-1, 1]) {
-      g.beginPath();
-      g.moveTo(x, 8 * s * 0.4 + 6);
-      g.lineTo(x - 3 + sw, 16);
-      g.lineTo(x - 7 + sw, 21);
-      g.stroke();
-    }
-  }
-
-  // Tail plate.
-  g.beginPath();
-  g.ellipse(-28, 0, 8, 9, 0, 0, TAU);
-  g.fillStyle = hsl(hue, 50, 26);
-  g.fill();
-
-  // Carapace plates, back to front so each overlaps the next.
-  for (let i = 0; i < 5; i++) {
-    const x = -22 + i * 9.5;
-    const ry = 15 - i * 1.6;
+  // Swept wing fins.
+  for (const s of [-1, 1]) {
     g.beginPath();
-    g.ellipse(x, 0, 11, ry, 0, 0, TAU);
-    g.fillStyle = lg(g, x, -ry, x, ry, [
-      [0, hsl(hue, 55, 46)],
-      [0.5, hsl(hue, 52, 32)],
-      [1, hsl(hue, 45, 20)],
-    ]);
+    g.moveTo(8, s * 7);
+    g.quadraticCurveTo(-2, s * (16 + beat), -14, s * (19 + beat));
+    g.quadraticCurveTo(-6, s * 10, -10, s * 5);
+    g.closePath();
+    g.fillStyle = hsl(hue, 60, 44, 0.45);
     g.fill();
-    // Seam shadow on the rear edge of each plate.
-    g.beginPath();
-    g.ellipse(x - 3, 0, 10, ry - 1, 0, Math.PI * 0.5, Math.PI * 1.5);
-    g.strokeStyle = hsl(hue, 45, 10, 0.65);
-    g.lineWidth = 1.8;
+    g.strokeStyle = hsl(hue, 90, 82, 0.5);
+    g.lineWidth = 1;
     g.stroke();
   }
 
-  // Dorsal ridge highlight.
+  // Trailing filaments.
+  g.strokeStyle = hsl(hue, 85, 78, 0.45);
+  g.lineWidth = 1;
   g.beginPath();
-  g.moveTo(-26, -8);
-  g.quadraticCurveTo(0, -16, 20, -9);
-  g.strokeStyle = hsl(hue, 90, 80, 0.45);
-  g.lineWidth = 1.6;
+  g.moveTo(-28, -1);
+  g.quadraticCurveTo(-38, -3 - beat, -44, -2 - beat * 2);
+  g.moveTo(-28, 1);
+  g.quadraticCurveTo(-38, 3 + beat, -44, 2 + beat * 2);
   g.stroke();
 
-  // Head plate, antennae, eyes.
+  // Dart body.
   g.beginPath();
-  g.ellipse(22, 0, 9, 10, 0, 0, TAU);
-  g.fillStyle = lg(g, 22, -10, 22, 10, [[0, hsl(hue, 58, 50)], [1, hsl(hue, 48, 26)]]);
+  g.moveTo(34, 0);
+  g.lineTo(14, -8);
+  g.lineTo(-16, -6);
+  g.lineTo(-28, 0);
+  g.lineTo(-16, 6);
+  g.lineTo(14, 8);
+  g.closePath();
+  g.fillStyle = glass(g, hue, -9, 9);
   g.fill();
-  g.strokeStyle = hsl(hue, 50, 40, 0.95);
-  g.lineWidth = 1.6;
-  g.lineCap = 'round';
   g.beginPath();
-  g.moveTo(28, -4);
-  g.quadraticCurveTo(38, -9, 46, -8 + step);
-  g.moveTo(28, 3);
-  g.quadraticCurveTo(38, 6, 46, 8 - step);
+  g.moveTo(34, 0);
+  g.lineTo(14, -8);
+  g.lineTo(-16, -6);
+  g.lineTo(-28, 0);
+  rimStroke(g, hue, 0.85, 1.3);
+  // Facet lines.
+  g.strokeStyle = hsl(hue, 75, 80, 0.3);
+  g.lineWidth = 0.8;
+  g.beginPath();
+  g.moveTo(14, -8);
+  g.lineTo(-4, 0);
+  g.lineTo(14, 8);
+  g.moveTo(-4, 0);
+  g.lineTo(-28, 0);
   g.stroke();
-  for (const y of [-4, 3]) {
-    g.beginPath();
-    g.arc(25, y, 2, 0, TAU);
-    g.fillStyle = hsl(hue, 20, 8);
-    g.fill();
-    g.beginPath();
-    g.arc(25.7, y - 0.7, 0.8, 0, TAU);
-    g.fillStyle = hsl(hue, 90, 88, 0.9);
-    g.fill();
-  }
+  core(g, hue, 8, 0, 12, 0.3);
+  // Visor slit.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = hsl(hue, 100, 82, 0.95);
+  g.beginPath();
+  g.ellipse(22, -1, 5, 1.6, 0, 0, Math.PI * 2);
+  g.fill();
+  g.restore();
+  dot(g, hue, -16, 0, 1.2, 0.7);
   g.restore();
 }
 
-/* -------------- INSIDER: ribbon eel with a head, eye and real girth -------------- */
+/* ---------------- APE: armored glider ---------------- */
+function drawApe(g, hue, ph) {
+  const step = Math.sin(ph * Math.PI * 2);
+  g.save();
+  g.translate(64, 64);
+
+  // Tucked leg blades, thin and swept back.
+  g.strokeStyle = hsl(hue, 70, 62, 0.5);
+  g.lineWidth = 1.2;
+  g.lineCap = 'round';
+  for (let i = 0; i < 3; i++) {
+    const x = 10 - i * 10;
+    const sw = step * 2 + i;
+    g.beginPath();
+    g.moveTo(x, 8);
+    g.quadraticCurveTo(x - 4, 12 + sw * 0.4, x - 8, 14 + sw * 0.6);
+    g.stroke();
+  }
+
+  // Antennae, fine curves.
+  g.strokeStyle = hsl(hue, 85, 80, 0.6);
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(20, -4);
+  g.quadraticCurveTo(30, -8, 38, -9 + step);
+  g.moveTo(20, 2);
+  g.quadraticCurveTo(30, 4, 38, 6 - step);
+  g.stroke();
+
+  // Tail fan.
+  g.beginPath();
+  g.moveTo(-20, 0);
+  g.lineTo(-30, -6);
+  g.lineTo(-28, 0);
+  g.lineTo(-30, 6);
+  g.closePath();
+  g.fillStyle = hsl(hue, 60, 46, 0.5);
+  g.fill();
+
+  // Shell: pointed front, rounded back.
+  g.beginPath();
+  g.moveTo(24, 0);
+  g.bezierCurveTo(20, -9, 8, -12, -4, -12);
+  g.bezierCurveTo(-14, -12, -20, -7, -21, 0);
+  g.bezierCurveTo(-20, 7, -14, 12, -4, 12);
+  g.bezierCurveTo(8, 12, 20, 9, 24, 0);
+  g.closePath();
+  g.fillStyle = glass(g, hue, -12, 12);
+  g.fill();
+  g.beginPath();
+  g.moveTo(24, 0);
+  g.bezierCurveTo(20, -9, 8, -12, -4, -12);
+  g.bezierCurveTo(-14, -12, -20, -7, -21, 0);
+  rimStroke(g, hue, 0.9, 1.4);
+  // Segment arcs.
+  g.strokeStyle = hsl(hue, 70, 80, 0.26);
+  g.lineWidth = 0.9;
+  for (let i = 0; i < 4; i++) {
+    const x = 12 - i * 8;
+    g.beginPath();
+    g.moveTo(x, -10 + i * 0.6);
+    g.quadraticCurveTo(x - 4, 0, x, 10 - i * 0.6);
+    g.stroke();
+  }
+  core(g, hue, 4, 0, 12, 0.26);
+  dot(g, hue, 18, -4, 1.5, 1);
+  dot(g, hue, 18, 3, 1.2, 0.8);
+  g.restore();
+}
+
+/* ---------------- INSIDER: ribbon of light ---------------- */
 function drawInsider(g, hue, ph) {
   g.save();
   g.translate(64, 64);
-  const N = 26;
+  const N = 28;
   const xs = [];
   const ys = [];
   const ws = [];
   for (let i = 0; i <= N; i++) {
     const t = i / N;
-    const x = 32 - t * 74;
-    const amp = 9 * (1 - t * 0.55);
-    const y = Math.sin(t * 4.4 + ph * TAU) * amp * (0.35 + t * 0.9);
-    xs.push(x);
-    ys.push(y);
-    ws.push((14 - t * 11.5) * 0.5);
+    xs.push(32 - t * 70);
+    ys.push(Math.sin(t * 3.6 + ph * Math.PI * 2) * (7 * (0.4 + t * 0.8)));
+    ws.push((5.5 - t * 4.4) * 0.5 + 0.4);
   }
-  // Ribbon body: offset the centreline perpendicular.
-  g.beginPath();
-  for (let i = 0; i <= N; i++) {
+  const perp = (i) => {
     const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
     const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
     const len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len;
-    const ny = dx / len;
-    const px = xs[i] + nx * ws[i];
-    const py = ys[i] + ny * ws[i];
+    return [-dy / len, dx / len];
+  };
+  // Ribbon body.
+  g.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const [nx, ny] = perp(i);
+    const px = xs[i] + nx * ws[i] * 2;
+    const py = ys[i] + ny * ws[i] * 2;
     if (i === 0) g.moveTo(px, py);
     else g.lineTo(px, py);
   }
   for (let i = N; i >= 0; i--) {
-    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
-    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
-    const len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len;
-    const ny = dx / len;
-    g.lineTo(xs[i] - nx * ws[i], ys[i] - ny * ws[i]);
+    const [nx, ny] = perp(i);
+    g.lineTo(xs[i] - nx * ws[i] * 2, ys[i] - ny * ws[i] * 2);
   }
   g.closePath();
-  g.fillStyle = lg(g, 0, -14, 0, 14, [
-    [0, hsl(hue, 65, 58)],
-    [0.5, hsl(hue, 60, 38)],
-    [1, hsl(hue, 50, 22)],
-  ]);
+  g.fillStyle = glass(g, hue, -8, 8);
   g.fill();
-
-  // Dorsal fringe.
-  g.fillStyle = hsl(hue, 70, 66, 0.75);
-  for (let i = 2; i < N - 2; i += 2) {
-    const dx = xs[i + 1] - xs[i - 1];
-    const dy = ys[i + 1] - ys[i - 1];
-    const len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len;
-    const ny = dx / len;
-    g.beginPath();
-    g.moveTo(xs[i] + nx * ws[i], ys[i] + ny * ws[i]);
-    g.lineTo(xs[i] + nx * (ws[i] + 4.6), ys[i] + ny * (ws[i] + 4.6));
-    g.lineTo(xs[i + 1] + nx * ws[i + 1], ys[i + 1] + ny * ws[i + 1]);
-    g.closePath();
-    g.fill();
-  }
-
-  // Head wedge with a jaw and an eye.
-  g.beginPath();
-  g.moveTo(30, ys[0] - 7);
-  g.quadraticCurveTo(42, ys[0] - 4, 43, ys[0] + 0.5);
-  g.quadraticCurveTo(40, ys[0] + 2, 37, ys[0] + 2.5);
-  g.quadraticCurveTo(40, ys[0] + 5, 33, ys[0] + 7);
-  g.quadraticCurveTo(29, ys[0] + 4, 30, ys[0] - 7);
-  g.closePath();
-  g.fillStyle = hsl(hue, 64, 50);
-  g.fill();
-  g.beginPath();
-  g.moveTo(43, ys[0] + 0.5);
-  g.quadraticCurveTo(38, ys[0] + 2, 34, ys[0] + 2);
-  g.strokeStyle = hsl(hue, 40, 12, 0.7);
-  g.lineWidth = 1.3;
-  g.stroke();
-  g.beginPath();
-  g.arc(35, ys[0] - 2.5, 2.3, 0, TAU);
-  g.fillStyle = hsl(hue, 20, 8);
-  g.fill();
-  g.beginPath();
-  g.arc(35.8, ys[0] - 3.3, 0.9, 0, TAU);
-  g.fillStyle = hsl(hue, 90, 88, 0.9);
-  g.fill();
-
-  // Dorsal rim light.
+  // Luminous dorsal edge.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 82, 0.8);
+  g.lineWidth = 1.4;
   g.beginPath();
   for (let i = 0; i <= N; i++) {
-    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
-    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
-    const len = Math.hypot(dx, dy) || 1;
-    const px = xs[i] + (-dy / len) * ws[i];
-    const py = ys[i] + (dx / len) * ws[i];
+    const [nx, ny] = perp(i);
+    const px = xs[i] + nx * ws[i] * 2;
+    const py = ys[i] + ny * ws[i] * 2;
     if (i === 0) g.moveTo(px, py);
     else g.lineTo(px, py);
   }
-  g.strokeStyle = hsl(hue, 95, 82, 0.5);
-  g.lineWidth = 1.4;
   g.stroke();
+  g.restore();
+  // Ventral edge, soft.
+  g.strokeStyle = hsl(hue, 80, 76, 0.3);
+  g.lineWidth = 0.9;
+  g.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const [nx, ny] = perp(i);
+    const px = xs[i] - nx * ws[i] * 2;
+    const py = ys[i] - ny * ws[i] * 2;
+    if (i === 0) g.moveTo(px, py);
+    else g.lineTo(px, py);
+  }
+  g.stroke();
+  // Head teardrop with eye, and photophores along the centreline.
+  g.beginPath();
+  g.moveTo(32, ys[0] - 4);
+  g.quadraticCurveTo(40, ys[0] - 1, 39, ys[0] + 1);
+  g.quadraticCurveTo(37, ys[0] + 3, 32, ys[0] + 4);
+  g.closePath();
+  g.fillStyle = hsl(hue, 60, 52, 0.6);
+  g.fill();
+  core(g, hue, 26, ys[2], 8, 0.22);
+  for (let i = 4; i < N - 2; i += 5) dot(g, hue, xs[i], ys[i], 1.1, 0.8);
+  dot(g, hue, 34, ys[0] - 1.5, 1.5, 1);
   g.restore();
 }
 
 const CREATURE_PAINTERS = { WHALE: drawWhale, ALGO: drawAlgo, APE: drawApe, INSIDER: drawInsider };
 
-/**
- * v7 "field guide": four animals with real anatomy and volume, painted dark
- * back to light belly with one rim light and one bright organ each, so a
- * silhouette still reads at the 18px the tank draws most bodies at. Bodies
- * fill their sprite; the halo is a whisper because the tank adds its own.
- */
 function bakeCreature(archetype, hue, phase) {
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = SPRITE;
   const g = canvas.getContext('2d');
+  // A whisper of ambient light only; the tank adds its own halo at draw time
+  // and a strong baked one washes the glass body out at small sizes.
   const halo = g.createRadialGradient(SPRITE / 2, SPRITE / 2, 6, SPRITE / 2, SPRITE / 2, SPRITE * 0.47);
-  halo.addColorStop(0, hsla(hue, 90, 60, 0.12));
+  halo.addColorStop(0, hsla(hue, 90, 60, 0.1));
   halo.addColorStop(1, hsla(hue, 90, 60, 0));
   g.fillStyle = halo;
   g.fillRect(0, 0, SPRITE, SPRITE);
   CREATURE_PAINTERS[archetype](g, hue, phase);
   return canvas;
 }
-
 
 /** Animation frames for an archetype + hue bucket (4-frame sine sway). */
 // Curated jewel palette instead of a full 360° rainbow: cool bioluminescent
