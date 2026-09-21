@@ -7,6 +7,7 @@ import {
   dominantTax,
   genomeFingerprint,
   isHungry,
+  personaOf,
   tick as tickWorld,
   txLanding,
   WHALE_BOOM_SIZE,
@@ -624,6 +625,10 @@ export function createApp(options: AppOptions = {}) {
         hungry: isHungry(world, c),
         offspring: c.offspring,
         maxMeal: Math.round(c.maxMeal * 10) / 10,
+        persona: personaOf(c.genome),
+        // Only creatures whose record meal fell from a chain transfer carry
+        // the provenance; the rest stay a few bytes cheaper.
+        ...(c.maxMealTx ? { mealTx: c.maxMealTx, mealUsd: c.maxMealUsd } : {}),
       })),
       foods: world.foods.map((f) => ({ x: Math.round(f.x), y: Math.round(f.y) })),
     };

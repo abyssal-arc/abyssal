@@ -15,6 +15,7 @@ import {
   dominantTax,
   isHungry,
   steerArchetype,
+  personaOf,
   randomGenome,
   type Senses,
   type WorldConfig,
@@ -800,6 +801,7 @@ test('obituaries: the prey of a hunt is memorialized, not just counted', () => {
   assert.deepEqual(o.titles, [], 'a short life earns no titles');
   const survivor = world.creatures.find((c) => c.id === whale.id);
   assert.equal(survivor?.kills, 1);
+  assert.equal(survivor?.maxMealTx, null, 'a meal of prey has no meteor behind it');
   // Half of what the prey had left, minus the prey's own metabolism this tick.
   assert.ok(survivor!.maxMeal > 29 && survivor!.maxMeal <= 30, 'a hunted prey counts as a meal');
 });
@@ -864,9 +866,11 @@ test('eaters: a tx pellet is traceable to the creature that ate it', () => {
   c.x = 200; c.y = 700;
   c.energy = 60; // hungry, so it swims for the fall instead of ignoring it
   for (let i = 0; i < 40 && !(world.eaters[hash]?.length > 0); i++) {
-    tick(world, { chain: 0.5, market: 0 }, i === 0 ? [{ hash, size: 1, at: { x: 200, y: 700 } }] : []);
+    tick(world, { chain: 0.5, market: 0 }, i === 0 ? [{ hash, size: 1, usd: 812, at: { x: 200, y: 700 } }] : []);
   }
   assert.ok(world.eaters[hash]?.includes(c.id), 'the meteor trail must name its eater');
+  assert.equal(c.maxMealTx, hash, 'a record meal names the transfer it fell from');
+  assert.equal(c.maxMealUsd, 812);
   assert.equal(world.eaters[hash].length, 1, 'one bite is logged once');
   const survivor = world.creatures.find((x) => x.id === c.id);
   assert.ok(survivor && survivor.maxMeal > 0, 'the biggest meal is remembered');
@@ -896,6 +900,17 @@ test('offspring: a birth credits the parent and the child carries the line', () 
   assert.ok(parent.offspring >= 1, 'the parent keeps its own count');
   assert.equal(child.generation, parent.generation + 1);
   assert.equal(child.offspring, 0);
+});
+
+test('persona packs three quartiled axes into six bits', () => {
+  const a = randomGenome(new Rng(9));
+  const b = randomGenome(new Rng(9));
+  const pa = personaOf(a);
+  assert.equal(pa, personaOf(b), 'the same genome tells the same story');
+  assert.ok(pa >= 0 && pa <= 63, 'six bits, three axes');
+  let spread = 0;
+  for (let i = 0; i < 200; i++) spread |= personaOf(randomGenome(new Rng(i)));
+  assert.ok(spread > 7, 'a population should not share one personality');
 });
 
 test('idsInZone wraps the torus: an edge zone sees both sides', () => {

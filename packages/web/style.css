@@ -459,6 +459,17 @@ button.chip.faction.mine {
 #following .row .val b { cursor: pointer; padding: 0 3px; color: var(--fg-3); font-weight: 400; }
 #following .row .val b:hover { color: var(--danger); }
 
+/* creature card: story lines first, the raw numbers folded away */
+#creature-card .prop span { color: var(--fg-3); }
+#creature-card .prop b { color: var(--fg-1); font-weight: 500; }
+.card-actions { display: flex; gap: 6px; margin: calc(var(--sp) * 1.5) 0 calc(var(--sp)); }
+#card-adv {
+  border-top: 1px solid var(--glass-border);
+  padding-top: calc(var(--sp));
+  margin-top: calc(var(--sp));
+}
+#card-adv .prop b { color: var(--fg-2); font-weight: 400; }
+
 /* ---------- intervention buttons ---------- */
 .hint { font-size: 11px; color: var(--fg-3); line-height: 1.6; margin-bottom: calc(var(--sp) * 2.5); }
 button.iv {

@@ -12,6 +12,7 @@ export {
   mutateGenome,
   forward,
   genomeFingerprint,
+  personaOf,
   steerArchetype,
 } from './genome.js';
 export type { Genome, BrainOutput, Archetype, ArchetypeTraits } from './genome.js';

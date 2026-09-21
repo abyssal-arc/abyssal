@@ -182,15 +182,19 @@
   </aside>
 
   <div id="dock" class="glass rise">
+    <button id="dock-mem" class="dock-btn"><span data-i18n="memorialsTitle">Memorials</span></button>
     <button id="dock-obits" class="dock-btn"><span data-i18n="extinctionLists">Extinction lists</span></button>
     <button id="dock-analytics" class="dock-btn"><span data-i18n="analytics">Analytics</span></button>
     <button id="dock-you" class="dock-btn"><span data-i18n="dockYou">You</span></button>
     <span class="token" id="dock-token" data-i18n="tokenTbd">Token: TBD</span>
   </div>
 
-  <div id="drawer-obits" class="drawer glass" hidden>
+  <div id="drawer-mem" class="drawer glass" hidden>
     <div class="section-title"><span data-i18n="memorialsTitle">Memorials</span></div>
     <div id="memorials"></div>
+  </div>
+
+  <div id="drawer-obits" class="drawer glass" hidden>
     <div class="section-title"><span data-i18n="extinctionLists">Extinction lists</span><span class="legend"><i class="dot harvest"></i><span data-i18n="harvest">harvest</span> <i class="dot judgment"></i><span data-i18n="judgment">judgment</span></span></div>
     <div id="death-stats"></div>
     <div id="judgments" data-i18n="noCulls">No culls yet</div>

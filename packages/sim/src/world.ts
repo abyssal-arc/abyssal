@@ -26,6 +26,8 @@ export interface TxMeteor {
   hash: string;
   /** 0..1, normalized transaction magnitude. */
   size: number;
+  /** Whole USDC of the transfer, when the feed knows it. */
+  usd?: number;
   /**
    * Explicit landing site, overriding the hash-derived one. Used when the
    * transfer belongs to an address the world embodies (a chain whale): its
@@ -56,6 +58,10 @@ export interface Creature {
   offspring: number;
   /** Largest single meal, in energy. */
   maxMeal: number;
+  /** Tx hash of that largest meal, null when it was prey or plankton. */
+  maxMealTx: string | null;
+  /** Whole USDC of the transfer that meal fell from, 0 when unknown. */
+  maxMealUsd: number;
   /** True once the creature stood inside a whale boom. */
   boomTouched: boolean;
   x: number;
@@ -93,6 +99,8 @@ export interface Obituary {
 export interface Food {
   /** Tx hash whose landing spawned this pellet, for the meteor-to-eater trail. */
   src?: string;
+  /** Whole USDC of that transfer, so a meal can be priced in its story. */
+  srcUsd?: number;
   id: number;
   x: number;
   y: number;
@@ -317,6 +325,8 @@ function makeCreature(
     parentId,
     offspring: 0,
     maxMeal: 0,
+    maxMealTx: null,
+    maxMealUsd: 0,
     boomTouched: false,
   };
 }
@@ -473,7 +483,7 @@ export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG):
   return world;
 }
 
-function spawnFood(world: World, x: number, y: number, energy?: number, src?: string): void {
+function spawnFood(world: World, x: number, y: number, energy?: number, src?: string, srcUsd?: number): void {
   if (world.foods.length >= world.config.maxFood) return;
   world.foods.push({
     id: world.nextFoodId++,
@@ -481,6 +491,7 @@ function spawnFood(world: World, x: number, y: number, energy?: number, src?: st
     x: wrap(x, world.config.width),
     y: wrap(y, world.config.height),
     energy: energy ?? world.config.foodEnergy,
+    srcUsd,
   });
   world.totalFoodSpawned++;
 }
@@ -651,7 +662,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
     for (let i = 0; i < count; i++) {
       const a = rng.range(0, Math.PI * 2);
       const d = Math.sqrt(rng.next()) * (10 + size * 30);
-      spawnFood(world, x + Math.cos(a) * d, y + Math.sin(a) * d, energy, tx.hash);
+      spawnFood(world, x + Math.cos(a) * d, y + Math.sin(a) * d, energy, tx.hash, tx.usd);
     }
     // An explicit landing site means the money belongs to an address the world
     // embodies, so a big enough fall is a *local* boom: creatures near enough
@@ -832,7 +843,11 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
       foodDistSq <= cfg.eatRadius * cfg.eatRadius
     ) {
       c.energy = Math.min(cfg.maxEnergy, c.energy + nearestFood.energy);
-      c.maxMeal = Math.max(c.maxMeal, nearestFood.energy);
+      if (nearestFood.energy > c.maxMeal) {
+        c.maxMeal = nearestFood.energy;
+        c.maxMealTx = nearestFood.src ?? null;
+        c.maxMealUsd = nearestFood.srcUsd ?? 0;
+      }
       if (nearestFood.src) {
         const list = (world.eaters[nearestFood.src] ??= []);
         if (list.length < 8 && !list.includes(c.id)) list.push(c.id);
@@ -891,7 +906,11 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
         const gain = Math.max(0, p.energy * 0.5);
         c.energy = Math.min(cfg.maxEnergy, c.energy + gain);
         c.devouredTotal += gain;
-        c.maxMeal = Math.max(c.maxMeal, gain);
+        if (gain > c.maxMeal) {
+          c.maxMeal = gain;
+          c.maxMealTx = null;
+          c.maxMealUsd = 0;
+        }
         c.kills++;
         c.huntReadyAt = world.tick + cfg.huntCooldown;
         // Kill growth: every kill makes the whale visibly bigger (capped).
@@ -1168,6 +1187,8 @@ export function fromJSON(json: string): World {
   for (const c of rest.creatures ?? []) {
     c.offspring ??= 0;
     c.maxMeal ??= 0;
+    c.maxMealTx ??= null;
+    c.maxMealUsd ??= 0;
     c.boomTouched ??= false;
     c.kills ??= 0;
     c.devouredTotal ??= 0;

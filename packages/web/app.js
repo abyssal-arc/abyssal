@@ -3491,28 +3491,103 @@ worldCanvas.addEventListener('mousemove', (ev) => {
 });
 worldCanvas.addEventListener('mouseleave', () => { hideTip(); aimPos = null; });
 
+/* ---------- the creature card: a story first, numbers on request ---------- */
+
+// One sim tick is a quarter second of wall clock (19200 ticks = one game day =
+// 80 minutes), which is what turns an age in ticks into minutes a person feels.
+const TICK_MS = 250;
+const HUNGER_RATIO = 0.55;
+
+function wallAge(ageTicks) {
+  const min = (ageTicks * TICK_MS) / 60000;
+  if (min < 1) return `${Math.round(min * 60)}s`;
+  if (min < 90) return `${min < 10 ? min.toFixed(1) : Math.round(min)}${t('unitMin')}`;
+  const h = min / 60;
+  return `${h < 10 ? h.toFixed(1) : Math.round(h)}${t('unitHour')}`;
+}
+
+function gameAge(ageTicks, ticksPerDay) {
+  const hours = (ageTicks / ticksPerDay) * 24;
+  if (hours < 1) return `${Math.round(hours * 60)}${t('unitGameMin')}`;
+  if (hours < 24) return `${hours.toFixed(1)}${t('unitGameHour')}`;
+  return `${(hours / 24).toFixed(1)}${t('unitGameDay')}`;
+}
+
+const personaAxis = (bits, prefix) => {
+  const lvl = bits === 0 ? 'Low' : bits === 3 ? 'High' : 'Mid';
+  return t(`persona${prefix}${lvl}`);
+};
+
+function personaWords(persona) {
+  return [
+    personaAxis((persona >> 2) & 3, 'App'),
+    personaAxis((persona >> 4) & 3, 'Rest'),
+    personaAxis(persona & 3, 'Fec'),
+  ].join(' · ');
+}
+
+function killTier(kills) {
+  if (kills >= 8) return 'tierApex';
+  if (kills >= 4) return 'tierAdept';
+  if (kills >= 1) return 'tierNovice';
+  return 'tierNone';
+}
+
+let cardAdvanced = false;
+let cardFor = null;
+
 function renderCard(c) {
   const el = document.getElementById('creature-card');
-  if (!c) { el.hidden = true; return; }
-  const ageTicks = (latestSnap?.tick ?? 0) - c.bornTick;
+  if (!c) { el.hidden = true; cardFor = null; return; }
+  if (cardFor !== c.id) { cardFor = c.id; cardAdvanced = false; }
+  const maxEnergy = 200;
+  const ratio = Math.max(0, Math.min(1, c.energy / maxEnergy));
+  const cond = ratio < 0.15 ? 'condDying' : ratio < HUNGER_RATIO ? 'condHungry' : 'condHealthy';
+  const ageTicks = Math.max(0, (latestSnap?.tick ?? 0) - c.bornTick);
+  const ticksPerDay = latestSnap?.ticksPerDay ?? 19200;
   const hue = Math.round(c.hue * 360);
+  const parent = c.parentId != null ? latestSnap?.byId.get(c.parentId) : null;
+  const kills = c.kills ?? 0;
+  const fate = [
+    c.parentId == null ? t('fateReseed') : null,
+    kills >= 8 ? t('fateApex') : null,
+    (c.offspring ?? 0) >= 4 ? t('fateLineage') : null,
+  ].filter(Boolean);
+  const line = (k, v) => `<div class="prop"><span>${t(k)}</span><b>${v}</b></div>`;
+  const meal = c.mealTx
+    ? `<a class="who-link" href="${explorerTxUrl}${c.mealTx}" target="_blank" rel="noopener">` +
+      `${t('mealMeteor', { usd: c.mealUsd ? fmtUsd(c.mealUsd) : '?' })} · ${shortAddr(c.mealTx)}</a>`
+    : c.maxMeal > 0 ? t('mealPlain', { e: c.maxMeal.toFixed(1) }) : t('mealNone');
   el.hidden = false;
   el.innerHTML = `
     <div><span class="dot" style="background:hsl(${hue},${Math.round(c.sat * 100)}%,${Math.round(c.light * 100)}%)"></span>
     <span class="cid">${c.name ?? `${t('creature')} #${c.id}`}</span> · ${c.archetype}</div>
-    <div>${t('energy')}: ${c.energy.toFixed(1)}</div>
-    <div>${t('killsLabel')}: ${c.kills ?? 0}</div>
-    <div>${t('devouredLabel')}: ${(c.devouredTotal ?? 0).toFixed(1)}</div>
-    <div>${t('age')}: ${ageTicks}${t('ticks')}</div>
-    <div>${t('generation')}: G${c.generation}</div>
-    <div>${t('fateLabel')}: D${Math.floor(c.bornTick / (latestSnap?.ticksPerDay ?? 19200))} · ${c.parentId != null ? (latestSnap.byId.get(c.parentId)?.name ?? '—') : t('fateOrphan')}</div>
-    <div>${t('offspring')}: ${c.offspring ?? 0} · ${t('maxMeal')}: ${(c.maxMeal ?? 0).toFixed(1)}</div>
-    <div><button id="watch-btn" class="dock-btn">${watched.has(c.id) ? t('unwatch') : t('watch')}</button></div>
-    <div>${t('genomeFingerprint')}: [${c.genes.join(', ')}] · hue ${c.hue.toFixed(2)}</div>
+    ${line('storyState', `${t(cond)}${t('condPct', { pct: Math.round(ratio * 100) })}`)}
+    ${line('storyPersona', personaWords(c.persona ?? 21))}
+    ${line('storyRecord', kills === 0 ? t('tierNone') : `${t(killTier(kills))}${t('killsLine', { n: kills })}`)}
+    ${line('storyMeal', meal)}
+    ${line('storyAge', t('ageLine', { wall: wallAge(ageTicks), game: gameAge(ageTicks, ticksPerDay) }))}
+    ${line('storyGen', `${t('genLine', { g: c.generation })} · ${parent ? t('lineageParent', { name: parent.name ?? `#${parent.id}` }) : t('lineageReseed')}`)}
+    ${line('storyFate', fate.length ? fate.join(' · ') : t('fateNone'))}
+    <div class="card-actions">
+      <button id="watch-btn" class="dock-btn">${watched.has(c.id) ? t('unwatch') : t('watch')}</button>
+      <button id="adv-btn" class="dock-btn mini">${cardAdvanced ? t('advancedHide') : t('advanced')}</button>
+    </div>
+    <div id="card-adv" ${cardAdvanced ? '' : 'hidden'}>
+      ${line('energy', `${c.energy.toFixed(1)} / ${maxEnergy}`)}
+      ${line('age', `${ageTicks}${t('ticks')}`)}
+      ${line('devouredLabel', (c.devouredTotal ?? 0).toFixed(1))}
+      ${line('offspring', c.offspring ?? 0)}
+      ${line('genomeFingerprint', `[${c.genes.join(', ')}] · hue ${c.hue.toFixed(2)}`)}
+    </div>
   `;
   // Bound after the markup exists: rebuilding the card throws the old node away.
   el.querySelector('#watch-btn').onclick = () => {
     setWatched(c.id, !watched.has(c.id));
+    renderCard(c);
+  };
+  el.querySelector('#adv-btn').onclick = () => {
+    cardAdvanced = !cardAdvanced;
     renderCard(c);
   };
 }
@@ -3869,8 +3944,8 @@ document.querySelectorAll('[data-collapse]').forEach((head) => {
   });
 });
 
-// Bottom dock: deaths / data / standing drawers (mutually exclusive).
-const drawers = { obits: 'drawer-obits', analytics: 'drawer-analytics', you: 'drawer-you' };
+// Bottom dock: memorials / deaths / data / standing drawers (mutually exclusive).
+const drawers = { mem: 'drawer-mem', obits: 'drawer-obits', analytics: 'drawer-analytics', you: 'drawer-you' };
 function toggleDrawer(which) {
   for (const [key, id] of Object.entries(drawers)) {
     const el = document.getElementById(id);
@@ -3883,6 +3958,7 @@ function toggleDrawer(which) {
     resize();
   }
 }
+document.getElementById('dock-mem').addEventListener('click', () => toggleDrawer('mem'));
 document.getElementById('dock-obits').addEventListener('click', () => toggleDrawer('obits'));
 document.getElementById('dock-analytics').addEventListener('click', () => toggleDrawer('analytics'));
 document.getElementById('dock-you').addEventListener('click', () => {

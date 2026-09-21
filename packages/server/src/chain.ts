@@ -20,6 +20,8 @@ export interface ChainTx {
   simulated?: boolean;
   /** Provenance for payment-flow feeds (Arc USDC): who paid whom, how much. */
   meta?: { from: string; to: string; amount: number; x402: boolean };
+  /** Whole USDC of the transfer, carried into the sim so a meal can name it. */
+  usd?: number;
   /** Landing site override, set when the transfer belongs to a chain whale. */
   at?: { x: number; y: number };
   /** The resident whale this transfer fed; drives the client's visuals/ticker. */

@@ -545,6 +545,7 @@ export class ArcUsdcFeed implements ChainFeed {
           this.pendingTxs.push({
             hash: log.transactionHash,
             size: sizeOf(amount),
+            usd: amount,
             meta: { from: fromAddr, to: toAddr, amount, x402: x402 === true },
           });
         }

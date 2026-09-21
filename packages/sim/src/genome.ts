@@ -192,6 +192,16 @@ export function genomeFingerprint(g: Genome): number[] {
   return g.w1.slice(0, 4).map((v) => Math.round(v * 100) / 100);
 }
 
+/**
+ * A three-axis personality in six bits (two per axis): appetite, restlessness
+ * and fecundity, quartiled from the output biases. The card tells a story with
+ * these; the raw weights stay folded under "advanced".
+ */
+export function personaOf(g: Genome): number {
+  const q = (v: number) => Math.min(3, Math.max(0, Math.floor(((v + 1) / 2) * 4)));
+  return (q(g.b2[1]) << 4) | (q(g.b2[2]) << 2) | q(g.b2[3]);
+}
+
 /* ---------- creature naming ---------- */
 
 /**
