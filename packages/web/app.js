@@ -140,25 +140,17 @@ const HUE_BUCKETS = 24;
 const CREATURE_VISUAL_SCALE = 1.3;
 const spriteCache = new Map();
 
-/* ---------- procedural creature sprites (v10 "plasma organisms") ---------- */
+/* ---------- procedural creature sprites (v11 "living light") ---------- */
 /**
- * v10: Premium sci-fi energy organisms with solid gradient-filled bodies,
- * internal glow cores, layered depth, and bold silhouettes that read clearly
- * at 18-40px display size. Mass and presence over thin outlines.
+ * v11: elegant deep-sea luminous organisms, ABZÛ-style. Smooth bezier
+ * silhouettes filled with translucent radial gradients (bright luminous core
+ * → deep dark rim), one or two soft light streaks, a wide ambient glow.
+ * Restraint over detail: at 18-40 px each creature must read as a luminous
+ * orb with a distinct silhouette — living light, not a mechanical device.
  */
 const hsl = hsla;
 
-/** Translucent glass fill — kept for the leviathan painter. */
-function glass(g, hue, y0, y1) {
-  const gr = g.createLinearGradient(0, y0, 0, y1);
-  gr.addColorStop(0, hsl(hue, 58, 66, 0.4));
-  gr.addColorStop(0.28, hsl(hue, 50, 46, 0.5));
-  gr.addColorStop(0.55, hsl(hue, 66, 26, 0.68));
-  gr.addColorStop(1, hsl(hue, 72, 76, 0.24));
-  return gr;
-}
-
-/** Additive inner core glow — useful for neon eyes and thrusters. */
+/** Additive inner core glow — the soft heart of light. */
 function core(g, hue, x, y, r, a = 0.3) {
   g.save();
   g.globalCompositeOperation = 'lighter';
@@ -172,7 +164,7 @@ function core(g, hue, x, y, r, a = 0.3) {
   g.restore();
 }
 
-/** A bright data dot / photophore. */
+/** A bright photophore dot with a tiny halo. */
 function dot(g, hue, x, y, r = 1.4, a = 0.9) {
   g.save();
   g.globalCompositeOperation = 'lighter';
@@ -187,501 +179,270 @@ function dot(g, hue, x, y, r = 1.4, a = 0.9) {
   g.restore();
 }
 
-/** Filled capsule/pill path (used for legs, body segments). */
-function capsulePath(g, x1, y1, x2, y2, r) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const len = Math.sqrt(dx * dx + dy * dy) || 1;
-  const nx = -dy / len * r, ny = dx / len * r;
-  g.beginPath();
-  g.moveTo(x1 + nx, y1 + ny);
-  g.lineTo(x2 + nx, y2 + ny);
-  g.arc(x2, y2, r, Math.atan2(ny, nx), Math.atan2(-ny, -nx), false);
-  g.lineTo(x1 - nx, y1 - ny);
-  g.arc(x1, y1, r, Math.atan2(-ny, -nx), Math.atan2(ny, nx), false);
-  g.closePath();
-}
-
-/** Rich radial body gradient: bright center → saturated mid → dark rim. */
-function bodyRadial(g, hue, cx, cy, r, alpha = 1) {
-  const gr = g.createRadialGradient(cx, cy - r * 0.15, r * 0.05, cx, cy, r);
-  gr.addColorStop(0, hsl(hue, 95, 72, alpha));
-  gr.addColorStop(0.3, hsl(hue, 90, 55, alpha * 0.95));
-  gr.addColorStop(0.7, hsl(hue + 15, 80, 30, alpha * 0.9));
-  gr.addColorStop(1, hsl(hue + 30, 70, 12, alpha * 0.85));
-  return gr;
-}
-
-/** Soft outer aura for visual weight (additive). */
-function aura(g, hue, cx, cy, r, alpha = 0.3) {
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const gr = g.createRadialGradient(cx, cy, r * 0.3, cx, cy, r);
-  gr.addColorStop(0, hsl(hue, 100, 65, alpha));
-  gr.addColorStop(0.5, hsl(hue, 90, 50, alpha * 0.4));
-  gr.addColorStop(1, hsl(hue, 80, 40, 0));
+/** Translucent pearl: bright center → colored mid → transparent rim. */
+function pearl(g, hue, x, y, r, a = 1) {
+  const gr = g.createRadialGradient(x - r * 0.25, y - r * 0.3, r * 0.1, x, y, r);
+  gr.addColorStop(0, hsl(hue, 85, 82, 0.9 * a));
+  gr.addColorStop(0.45, hsl(hue, 80, 55, 0.7 * a));
+  gr.addColorStop(0.8, hsl(hue + 12, 70, 32, 0.35 * a));
+  gr.addColorStop(1, hsl(hue + 12, 70, 25, 0));
   g.fillStyle = gr;
   g.beginPath();
-  g.arc(cx, cy, r, 0, TAU);
+  g.arc(x, y, r, 0, TAU);
   g.fill();
-  g.restore();
 }
 
-/** Thick energy band (for internal structure). */
-function energyBand(g, hue, x1, y1, x2, y2, width, alpha = 0.7) {
+/** Shared elegant whale silhouette (fauna whale + the golden sovereign). */
+function whaleForm(g, H, ph, rich) {
+  const pulse = 0.9 + 0.1 * Math.sin(ph * TAU);
+  const sat = 80 + (rich ? 8 : 0);   // the sovereign's gold reads richer
+  // Flowing tail fluke, gradient fading to transparent at the tips.
   g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 100, 75, alpha);
-  g.lineWidth = width;
-  g.lineCap = 'round';
-  g.beginPath();
-  g.moveTo(x1, y1);
-  g.lineTo(x2, y2);
-  g.stroke();
-  g.strokeStyle = hsl(hue, 90, 55, alpha * 0.4);
-  g.lineWidth = width * 2.2;
-  g.beginPath();
-  g.moveTo(x1, y1);
-  g.lineTo(x2, y2);
-  g.stroke();
-  g.restore();
-}
-
-/* ---------------- WHALE: Abyssal Cruiser (深渊巡洋舰) ---------------- */
-function drawWhale(g, hue, ph) {
-  const pulse = 0.7 + 0.3 * Math.sin(ph * TAU);
-  const sway = Math.sin(ph * TAU) * 1.5;
-  g.save();
-  g.translate(64, 64);
-
-  // Outer aura for presence
-  aura(g, hue, 0, 0, 38, 0.22 * pulse);
-
-  // Shadow silhouette (slightly larger, dark)
-  g.beginPath();
-  g.moveTo(30, 0);
-  g.bezierCurveTo(26, -13, 10, -16, -6, -15);
-  g.bezierCurveTo(-22, -14, -34, -8, -36, 0);
-  g.bezierCurveTo(-34, 8, -22, 14, -6, 15);
-  g.bezierCurveTo(10, 16, 26, 13, 30, 0);
-  g.closePath();
-  g.fillStyle = hsl(hue + 30, 60, 5, 0.7);
-  g.fill();
-
-  // Tail fluke — filled crescent with gradient
-  g.save();
-  g.translate(-34, 0);
-  g.rotate(sway * 0.04);
-  const tailGr = g.createLinearGradient(0, -14, 0, 14);
-  tailGr.addColorStop(0, hsl(hue + 20, 75, 20, 0.9));
-  tailGr.addColorStop(0.4, hsl(hue, 85, 45, 0.95));
-  tailGr.addColorStop(0.6, hsl(hue, 85, 45, 0.95));
-  tailGr.addColorStop(1, hsl(hue + 20, 75, 20, 0.9));
+  g.translate(-27, 0);
+  g.rotate(Math.sin(ph * TAU) * 0.05);
+  const tg = g.createLinearGradient(4, 0, -16, 0);
+  tg.addColorStop(0, hsl(H, 70, 50, 0.5));
+  tg.addColorStop(0.55, hsl(H, 70, 45, 0.3));
+  tg.addColorStop(1, hsl(H, 70, 40, 0));
+  g.fillStyle = tg;
   g.beginPath();
   g.moveTo(4, 0);
-  g.bezierCurveTo(-4, -6, -10, -14, -16, -18);
-  g.bezierCurveTo(-10, -10, -8, -4, -8, 0);
-  g.bezierCurveTo(-8, 4, -10, 10, -16, 18);
-  g.bezierCurveTo(-10, 14, -4, 6, 4, 0);
+  g.bezierCurveTo(-2, -2.5, -8, -7, -15, -19);
+  g.bezierCurveTo(-13, -9, -8, -3, -4, -0.8);
+  g.bezierCurveTo(-4, -0.3, -4, 0.3, -4, 0.8);
+  g.bezierCurveTo(-8, 3, -13, 9, -15, 18);
+  g.bezierCurveTo(-8, 7, -2, 2.5, 4, 0);
   g.closePath();
-  g.fillStyle = tailGr;
   g.fill();
   g.restore();
-
-  // Main body — organic whale shape with rich gradient
+  // Dorsal bump and flowing pectoral fin, same translucent family.
+  const fg = g.createLinearGradient(0, -16, 0, 26);
+  fg.addColorStop(0, hsl(H, 70, 52, 0.4));
+  fg.addColorStop(1, hsl(H, 70, 35, 0));
+  g.fillStyle = fg;
   g.beginPath();
-  g.moveTo(28, 0);
-  g.bezierCurveTo(24, -11, 10, -14, -4, -13);
-  g.bezierCurveTo(-18, -12, -30, -7, -32, 0);
-  g.bezierCurveTo(-30, 7, -18, 12, -4, 13);
-  g.bezierCurveTo(10, 14, 24, 11, 28, 0);
+  g.moveTo(-9, -9.5);
+  g.bezierCurveTo(-8, -14, -4, -15.5, -2, -13.5);
+  g.bezierCurveTo(-3, -11.5, -5, -10, -6, -9);
   g.closePath();
-  const bodyGr = g.createRadialGradient(2, -2, 2, 0, 0, 30);
-  bodyGr.addColorStop(0, hsl(hue - 10, 95, 68, 1));
-  bodyGr.addColorStop(0.25, hsl(hue, 90, 52, 0.98));
-  bodyGr.addColorStop(0.6, hsl(hue + 15, 80, 32, 0.95));
-  bodyGr.addColorStop(1, hsl(hue + 30, 70, 14, 0.92));
-  g.fillStyle = bodyGr;
   g.fill();
-
-  // Dorsal fin — solid filled
   g.beginPath();
-  g.moveTo(-2, -13);
-  g.bezierCurveTo(0, -20, 6, -22, 8, -18);
-  g.bezierCurveTo(9, -15, 6, -13, 4, -12);
+  g.moveTo(9, 4.5);
+  g.bezierCurveTo(6, 11, 1, 18, -6, 23);
+  g.bezierCurveTo(-1, 15, 2, 9, 3, 4);
   g.closePath();
-  const finGr = g.createLinearGradient(0, -22, 4, -12);
-  finGr.addColorStop(0, hsl(hue, 90, 55, 0.9));
-  finGr.addColorStop(1, hsl(hue + 20, 75, 25, 0.85));
-  g.fillStyle = finGr;
   g.fill();
-
-  // Energy ribcage — 5 thick curved bands inside body
+  // Body: arched back, blunt head, flat belly, long taper to the peduncle.
+  g.beginPath();
+  g.moveTo(31, -4);
+  g.bezierCurveTo(28, -10, 16, -13, 2, -12);
+  g.bezierCurveTo(-11, -11, -22, -5.5, -27, -1.5);
+  g.bezierCurveTo(-22, 1.5, -13, 4.5, -2, 5.5);
+  g.bezierCurveTo(12, 6.5, 25, 4, 29, 1);
+  g.quadraticCurveTo(31.5, -1, 31, -4);
+  g.closePath();
+  const bg = g.createRadialGradient(10, -4, 2, 2, -1, 31);
+  bg.addColorStop(0, hsl(H, sat, 66, 0.7));
+  bg.addColorStop(0.5, hsl(H, sat - 10, 40, 0.5));
+  bg.addColorStop(1, hsl(H, sat - 20, 16, 0.3));
+  g.fillStyle = bg;
+  g.fill();
+  // One soft internal light streak, then the heart of light and the eye.
   g.save();
   g.globalCompositeOperation = 'lighter';
-  for (let i = 0; i < 5; i++) {
-    const rx = 16 - i * 9;
-    const ribH = 9 - Math.abs(i - 2) * 1.5;
-    g.strokeStyle = hsl(hue - 5, 100, 70, (0.25 + 0.1 * pulse) * (1 - i * 0.1));
-    g.lineWidth = 2.5;
-    g.lineCap = 'round';
-    g.beginPath();
-    g.moveTo(rx, -ribH);
-    g.quadraticCurveTo(rx - 3, 0, rx, ribH);
-    g.stroke();
-  }
-  g.restore();
-
-  // Reactor core — large bright orb center-body
-  core(g, hue - 10, 0, 0, 14, 0.55 * pulse);
-  core(g, hue, 0, 0, 7, 0.7 * pulse);
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.fillStyle = hsl(hue - 10, 100, 92, 0.85 * pulse);
-  g.beginPath();
-  g.arc(0, 0, 3.5, 0, TAU);
-  g.fill();
-  g.restore();
-
-  // Eye — intense bright point
-  dot(g, hue, 22, -4, 2.2, 0.95);
-  core(g, hue, 22, -4, 5, 0.4 * pulse);
-
-  // Belly highlight — subtle bright strip
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const bellyGr = g.createLinearGradient(-20, 8, 20, 8);
-  bellyGr.addColorStop(0, hsl(hue, 80, 60, 0));
-  bellyGr.addColorStop(0.3, hsl(hue, 90, 70, 0.15 * pulse));
-  bellyGr.addColorStop(0.7, hsl(hue, 90, 70, 0.15 * pulse));
-  bellyGr.addColorStop(1, hsl(hue, 80, 60, 0));
-  g.fillStyle = bellyGr;
-  g.fillRect(-24, 5, 48, 6);
-  g.restore();
-
-  g.restore();
-}
-
-/* ---------------- ALGO: Photon Blade (光子刃) ---------------- */
-function drawAlgo(g, hue, ph) {
-  const pulse = 0.7 + 0.3 * Math.sin(ph * TAU);
-  g.save();
-  g.translate(64, 64);
-
-  // Outer aura
-  aura(g, hue, 0, 0, 36, 0.18 * pulse);
-
-  // Engine exhaust glow (behind body)
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const exGr = g.createRadialGradient(-28, 0, 0, -28, 0, 18);
-  exGr.addColorStop(0, hsl(hue + 160, 100, 85, 0.6 * pulse));
-  exGr.addColorStop(0.3, hsl(hue + 140, 95, 60, 0.3 * pulse));
-  exGr.addColorStop(0.7, hsl(hue, 90, 45, 0.1));
-  exGr.addColorStop(1, hsl(hue, 80, 40, 0));
-  g.fillStyle = exGr;
-  g.beginPath();
-  g.arc(-28, 0, 18, 0, TAU);
-  g.fill();
-  g.restore();
-
-  // Shadow silhouette
-  g.beginPath();
-  g.moveTo(32, 0);
-  g.bezierCurveTo(24, -8, 4, -10, -20, -7);
-  g.lineTo(-30, 0);
-  g.lineTo(-20, 7);
-  g.bezierCurveTo(4, 10, 24, 8, 32, 0);
-  g.closePath();
-  g.fillStyle = hsl(hue + 20, 50, 5, 0.6);
-  g.fill();
-
-  // Swept fins — solid filled with gradient (top & bottom)
-  for (const s of [-1, 1]) {
-    g.beginPath();
-    g.moveTo(6, s * 5);
-    g.bezierCurveTo(0, s * 10, -10, s * 18, -18, s * 20);
-    g.lineTo(-14, s * 14);
-    g.bezierCurveTo(-8, s * 10, -2, s * 6, -8, s * 4);
-    g.closePath();
-    const finGr = g.createLinearGradient(6, s * 5, -18, s * 20);
-    finGr.addColorStop(0, hsl(hue, 85, 50, 0.9));
-    finGr.addColorStop(0.5, hsl(hue + 10, 80, 35, 0.85));
-    finGr.addColorStop(1, hsl(hue + 20, 70, 18, 0.8));
-    g.fillStyle = finGr;
-    g.fill();
-    // Bright leading edge
-    g.save();
-    g.globalCompositeOperation = 'lighter';
-    g.strokeStyle = hsl(hue, 100, 75, 0.5 * pulse);
-    g.lineWidth = 2;
-    g.lineCap = 'round';
-    g.beginPath();
-    g.moveTo(6, s * 5);
-    g.bezierCurveTo(0, s * 10, -10, s * 18, -18, s * 20);
-    g.stroke();
-    g.restore();
-  }
-
-  // Main body — sleek torpedo with directional gradient
-  g.beginPath();
-  g.moveTo(30, 0);
-  g.bezierCurveTo(22, -7, 4, -9, -18, -6);
-  g.lineTo(-28, 0);
-  g.lineTo(-18, 6);
-  g.bezierCurveTo(4, 9, 22, 7, 30, 0);
-  g.closePath();
-  const bodyGr = g.createLinearGradient(30, 0, -28, 0);
-  bodyGr.addColorStop(0, hsl(hue - 10, 95, 70, 1));
-  bodyGr.addColorStop(0.2, hsl(hue, 90, 55, 0.98));
-  bodyGr.addColorStop(0.6, hsl(hue + 10, 80, 32, 0.95));
-  bodyGr.addColorStop(1, hsl(hue + 20, 70, 15, 0.9));
-  g.fillStyle = bodyGr;
-  g.fill();
-
-  // Central energy stripe — thick bright lightsaber core
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const stripeGr = g.createLinearGradient(28, 0, -26, 0);
-  stripeGr.addColorStop(0, hsl(hue - 15, 100, 90, 0.9 * pulse));
-  stripeGr.addColorStop(0.4, hsl(hue, 100, 75, 0.6 * pulse));
-  stripeGr.addColorStop(0.8, hsl(hue + 10, 95, 60, 0.3 * pulse));
-  stripeGr.addColorStop(1, hsl(hue + 20, 90, 50, 0.1));
-  g.strokeStyle = stripeGr;
-  g.lineWidth = 3.5;
+  g.strokeStyle = hsl(H, 90, 80, 0.08 * pulse);
+  g.lineWidth = 4;
   g.lineCap = 'round';
   g.beginPath();
-  g.moveTo(26, 0);
-  g.lineTo(-24, 0);
-  g.stroke();
-  // Wider soft glow pass
-  g.strokeStyle = stripeGr;
-  g.lineWidth = 7;
-  g.globalAlpha = 0.3;
-  g.beginPath();
-  g.moveTo(26, 0);
-  g.lineTo(-24, 0);
+  g.moveTo(12, -4);
+  g.bezierCurveTo(0, -6, -8, -5, -14, -1);
   g.stroke();
   g.restore();
-
-  // Nose highlight — intense bright point
+  core(g, H, 8, -3, 14, 0.22 * pulse);
+  // Eye: a single small bright dot with a whisper of halo.
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.fillStyle = hsl(hue - 15, 100, 95, 0.9);
+  g.fillStyle = hsl(H, 100, 92, 0.9);
   g.beginPath();
-  g.arc(28, 0, 2.5, 0, TAU);
+  g.arc(24, -5, 1.2, 0, TAU);
   g.fill();
-  g.restore();
-  core(g, hue, 28, 0, 8, 0.45 * pulse);
-
-  // Engine core — bright orange-white at rear
-  core(g, hue + 160, -26, 0, 6, 0.5 * pulse);
-
+  g.fillStyle = hsl(H, 100, 75, 0.22);
+  g.beginPath();
+  g.arc(24, -5, 3, 0, TAU);
+  g.fill();
   g.restore();
 }
 
-/* ---------------- APE: Carapace Drone (甲壳无人机) ---------------- */
-function drawApe(g, hue, ph) {
-  const pulse = 0.7 + 0.3 * Math.sin(ph * TAU);
-  const legPhase = ph * TAU;
+/* ---------------- WHALE: Luminous Leviathan (幽光巨鲸) ---------------- */
+function drawWhale(g, hue, ph) {
   g.save();
   g.translate(64, 64);
+  const b = 1 + 0.03 * Math.sin(ph * TAU);
+  g.scale(b, b);
+  whaleForm(g, hue, ph, 0);
+  g.restore();
+}
 
-  // Outer aura
-  aura(g, hue, 0, -2, 34, 0.2 * pulse);
+/* ---------------- ALGO: Light Dart (光镖) ---------------- */
+function drawAlgo(g, hue, ph) {
+  const pulse = 0.9 + 0.1 * Math.sin(ph * TAU);
+  g.save();
+  g.translate(64, 64);
+  const b = 1 + 0.03 * Math.sin(ph * TAU);
+  g.scale(b, b);
 
-  // Legs — 3 per side, sturdy filled capsules with joint dots
-  for (let side = -1; side <= 1; side += 2) {
-    for (let i = 0; i < 3; i++) {
-      const bx = -8 + i * 8;
-      const by = side * 11;
-      const wiggle = Math.sin(legPhase + i * 1.2 + (side > 0 ? 0.5 : 0)) * 2;
-      const mx = bx + (i - 1) * 3 + wiggle * 0.5;
-      const my = side * 19 + wiggle;
-      const tx = mx + (i - 1) * 2;
-      const ty = side * 25 + wiggle * 0.7;
+  // Two delicate translucent fins.
+  for (const s of [-1, 1]) {
+    const fgr = g.createLinearGradient(6, s * 3.5, -16, s * 16);
+    fgr.addColorStop(0, hsl(hue, 85, 68, 0.5));
+    fgr.addColorStop(1, hsl(hue + 20, 75, 40, 0));
+    g.fillStyle = fgr;
+    g.beginPath();
+    g.moveTo(6, s * 3.5);
+    g.bezierCurveTo(0, s * 8, -8, s * 13, -16, s * 16);
+    g.bezierCurveTo(-9, s * 9, -6, s * 5, -7, s * 2.5);
+    g.closePath();
+    g.fill();
+  }
 
-      // Upper leg segment
-      capsulePath(g, bx, by, mx, my, 2.5);
-      const legGr = g.createLinearGradient(bx, by, mx, my);
-      legGr.addColorStop(0, hsl(hue, 70, 38, 0.95));
-      legGr.addColorStop(1, hsl(hue + 10, 60, 22, 0.9));
-      g.fillStyle = legGr;
-      g.fill();
+  // Sleek torpedo body: bright nose → rich mid → dark tail.
+  g.beginPath();
+  g.moveTo(32, 0);
+  g.bezierCurveTo(24, -5.5, 6, -7.5, -12, -4.5);
+  g.bezierCurveTo(-21, -2.8, -27, -1, -30, 0);
+  g.bezierCurveTo(-27, 1, -21, 2.8, -12, 4.5);
+  g.bezierCurveTo(6, 7.5, 24, 5.5, 32, 0);
+  g.closePath();
+  const bg = g.createLinearGradient(32, 0, -30, 0);
+  bg.addColorStop(0, hsl(hue, 90, 80, 0.8));
+  bg.addColorStop(0.35, hsl(hue, 88, 62, 0.7));
+  bg.addColorStop(0.7, hsl(hue, 85, 45, 0.5));
+  bg.addColorStop(1, hsl(hue + 30, 70, 20, 0.3));
+  g.fillStyle = bg;
+  g.fill();
 
-      // Lower leg segment
-      capsulePath(g, mx, my, tx, ty, 2);
-      const legGr2 = g.createLinearGradient(mx, my, tx, ty);
-      legGr2.addColorStop(0, hsl(hue + 10, 65, 32, 0.9));
-      legGr2.addColorStop(1, hsl(hue + 15, 55, 18, 0.85));
-      g.fillStyle = legGr2;
-      g.fill();
+  // Single spine highlight along the back.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 85, 0.5 * pulse);
+  g.lineWidth = 1;
+  g.lineCap = 'round';
+  g.beginPath();
+  g.moveTo(26, -1.5);
+  g.bezierCurveTo(12, -5, -6, -5, -21, -1);
+  g.stroke();
+  g.restore();
 
-      // Joint highlights
-      dot(g, hue, mx, my, 1.5, 0.6 * pulse);
-      dot(g, hue, tx, ty, 1.2, 0.45 * pulse);
+  // Speed trail: a few fading motes behind the tail, then the eye.
+  for (let i = 0; i < 3; i++) {
+    dot(g, hue, -34 - i * 5, Math.sin(ph * TAU + i * 1.4) * (1 + i * 0.8), 1.2 - i * 0.3, 0.35 - i * 0.11);
+  }
+  dot(g, hue, 26, -1, 1.2, 0.8);
+  g.restore();
+}
+
+/* ---------------- APE: Living Gem (活宝石) ---------------- */
+function drawApe(g, hue, ph) {
+  const pulse = 0.9 + 0.1 * Math.sin(ph * TAU);
+  const wig = Math.sin(ph * TAU);
+  g.save();
+  g.translate(64, 64);
+  const b = 1 + 0.03 * wig;
+  g.scale(b, b);
+
+  // Tiny curved legs with faint glowing tips, tucked at the shell rim.
+  for (const s of [-1, 1]) {
+    for (let i = 0; i < 2; i++) {
+      const bx = -8 + i * 14;
+      const tx = bx + (i ? 5 : -5);
+      const ty = s * (12 + Math.sin(ph * TAU + i * 1.3 + s) * 1);
+      g.strokeStyle = hsl(hue + 20, 55, 60, 0.22);
+      g.lineWidth = 2.2;
+      g.lineCap = 'round';
+      g.beginPath();
+      g.moveTo(bx, s * 6);
+      g.quadraticCurveTo(bx + (i ? 3 : -3), s * 10, tx, ty);
+      g.stroke();
+      dot(g, hue, tx, ty, 0.8, 0.25 * pulse);
     }
   }
 
-  // Shell shadow (larger dark dome behind)
-  g.beginPath();
-  g.ellipse(0, 0, 18, 16, 0, 0, TAU);
-  g.fillStyle = hsl(hue + 20, 50, 6, 0.7);
-  g.fill();
-
-  // Main shell — dome with rich radial gradient
-  g.beginPath();
-  g.ellipse(0, -1, 16, 14, 0, 0, TAU);
-  const shellGr = g.createRadialGradient(-2, -5, 1, 0, -1, 16);
-  shellGr.addColorStop(0, hsl(hue - 10, 90, 65, 1));
-  shellGr.addColorStop(0.3, hsl(hue, 85, 48, 0.98));
-  shellGr.addColorStop(0.65, hsl(hue + 15, 75, 28, 0.95));
-  shellGr.addColorStop(1, hsl(hue + 25, 65, 12, 0.9));
-  g.fillStyle = shellGr;
-  g.fill();
-
-  // Shell segment bands — 3 thick colored arcs with gaps
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  for (let i = 0; i < 3; i++) {
-    const bandR = 7 + i * 4;
-    const startA = -0.6 + i * 0.15;
-    const endA = Math.PI + 0.6 - i * 0.15;
-    g.strokeStyle = hsl(hue + i * 15, 90, 55 + i * 5, (0.3 - i * 0.05) * pulse);
-    g.lineWidth = 3 - i * 0.5;
-    g.lineCap = 'round';
-    g.beginPath();
-    g.ellipse(0, -1, bandR, bandR * 0.85, 0, startA, endA);
-    g.stroke();
-  }
-  g.restore();
-
-  // Glowing brain — visible through shell top
-  core(g, hue - 20, 0, -4, 10, 0.45 * pulse);
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.fillStyle = hsl(hue - 20, 100, 88, 0.7 * pulse);
-  g.beginPath();
-  g.ellipse(0, -4, 4, 3.5, 0, 0, TAU);
-  g.fill();
-  g.restore();
-
-  // Antennae with bright bulb tips
+  // Two thin antennae with glowing tips.
   for (const s of [-1, 1]) {
-    g.strokeStyle = hsl(hue, 70, 45, 0.85);
-    g.lineWidth = 1.8;
+    const ay = s * 4 + wig * s * 1;
+    g.strokeStyle = hsl(hue, 70, 60, 0.3);
+    g.lineWidth = 1;
     g.lineCap = 'round';
     g.beginPath();
-    g.moveTo(14, s * 3);
-    g.quadraticCurveTo(20, s * 7, 26, s * 5 + Math.sin(legPhase + s) * 1.5);
+    g.moveTo(14, s * 2);
+    g.quadraticCurveTo(17, s * 3, 19.5, ay);
     g.stroke();
-    // Bright bulb tip
-    dot(g, hue - 10, 26, s * 5 + Math.sin(legPhase + s) * 1.5, 2.5, 0.9 * pulse);
+    dot(g, hue, 19.5, ay, 1.1, 0.55 * pulse);
   }
 
-  // Visor/eye — front bright slit
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const visorGr = g.createLinearGradient(14, -3, 14, 3);
-  visorGr.addColorStop(0, hsl(hue, 100, 80, 0.3));
-  visorGr.addColorStop(0.5, hsl(hue - 10, 100, 92, 0.9));
-  visorGr.addColorStop(1, hsl(hue, 100, 80, 0.3));
-  g.fillStyle = visorGr;
+  // Iridescent dome shell: bright top → shifting mid → dark rim.
   g.beginPath();
-  g.ellipse(15, 0, 3, 2.5, 0, 0, TAU);
+  g.ellipse(0, -2, 17, 14, 0, 0, TAU);
+  const sg = g.createRadialGradient(-4, -8, 1, 0, -2, 20);
+  sg.addColorStop(0, hsl(hue, 75, 72, 0.75));
+  sg.addColorStop(0.5, hsl(hue + 20, 70, 48, 0.6));
+  sg.addColorStop(1, hsl(hue + 40, 60, 16, 0.35));
+  g.fillStyle = sg;
   g.fill();
-  g.restore();
-  core(g, hue, 15, 0, 6, 0.35 * pulse);
 
+  // Warm under-glow leaking beneath the shell.
+  core(g, hue + 160, 0, 7, 16, 0.35 * pulse);
   g.restore();
 }
 
-/* ---------------- INSIDER: Plasma Eel (等离子鳗) ---------------- */
+/* ---------------- INSIDER: Pearl Chain (珍珠链) ---------------- */
 function drawInsider(g, hue, ph) {
-  const pulse = 0.7 + 0.3 * Math.sin(ph * TAU);
+  const pulse = 0.9 + 0.1 * Math.sin(ph * TAU);
   g.save();
   g.translate(64, 64);
 
-  // Generate segment positions along a sine-wave path
-  const SEGS = 9;
-  const segs = [];
-  for (let i = 0; i < SEGS; i++) {
-    const t = i / (SEGS - 1);
-    const x = 28 - t * 58;
-    const y = Math.sin(t * 3.5 + ph * TAU) * (4 + t * 5);
-    const r = 7 - t * 4;
-    const segHue = hue + i * 12;
-    const alpha = 1 - t * 0.45;
-    segs.push({ x, y, r, segHue, alpha });
+  // Pearls along a gentle sine curve, head to tail.
+  const N = 8;
+  const R = [6.5, 5.2, 4.4, 3.7, 3.1, 2.5, 2, 1.5];
+  const orbs = [];
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    orbs.push({
+      x: 30 - t * 60,
+      y: Math.sin(t * 3.4 + ph * TAU) * (2.5 + t * 4.5),
+      r: R[i],
+      h: hue + i * 4,
+    });
   }
 
-  // Outer aura along body path
-  aura(g, hue, 0, 0, 36, 0.15 * pulse);
-
-  // Energy connections between segments (thick glowing links)
+  // Thin luminous thread linking the pearls.
   g.save();
   g.globalCompositeOperation = 'lighter';
-  for (let i = 0; i < SEGS - 1; i++) {
-    const a = segs[i], b = segs[i + 1];
-    const connGr = g.createLinearGradient(a.x, a.y, b.x, b.y);
-    connGr.addColorStop(0, hsl(a.segHue, 100, 65, 0.4 * pulse * a.alpha));
-    connGr.addColorStop(1, hsl(b.segHue, 100, 60, 0.3 * pulse * b.alpha));
-    g.strokeStyle = connGr;
-    g.lineWidth = Math.min(a.r, b.r) * 1.2;
-    g.lineCap = 'round';
-    g.beginPath();
-    g.moveTo(a.x, a.y);
-    g.lineTo(b.x, b.y);
-    g.stroke();
-  }
-  g.restore();
-
-  // Draw segments tail-first so head overlaps
-  for (let i = SEGS - 1; i >= 0; i--) {
-    const s = segs[i];
-    // Shadow under each segment
-    g.beginPath();
-    g.ellipse(s.x, s.y + 1, s.r + 1.5, s.r * 0.8 + 1, 0, 0, TAU);
-    g.fillStyle = hsl(s.segHue + 20, 50, 5, 0.4 * s.alpha);
-    g.fill();
-
-    // Main segment body — filled ellipse with radial gradient
-    g.beginPath();
-    g.ellipse(s.x, s.y, s.r, s.r * 0.78, 0, 0, TAU);
-    const segGr = g.createRadialGradient(s.x - s.r * 0.2, s.y - s.r * 0.2, 0, s.x, s.y, s.r);
-    segGr.addColorStop(0, hsl(s.segHue - 10, 100, 75, s.alpha));
-    segGr.addColorStop(0.35, hsl(s.segHue, 92, 55, s.alpha * 0.95));
-    segGr.addColorStop(0.7, hsl(s.segHue + 15, 80, 32, s.alpha * 0.9));
-    segGr.addColorStop(1, hsl(s.segHue + 25, 70, 15, s.alpha * 0.8));
-    g.fillStyle = segGr;
-    g.fill();
-
-    // Inner bright spot on each segment
-    g.save();
-    g.globalCompositeOperation = 'lighter';
-    g.fillStyle = hsl(s.segHue - 10, 100, 85, 0.35 * pulse * s.alpha);
-    g.beginPath();
-    g.ellipse(s.x, s.y, s.r * 0.4, s.r * 0.3, 0, 0, TAU);
-    g.fill();
-    g.restore();
-  }
-
-  // Head — larger with bright visor
-  const head = segs[0];
-  core(g, hue - 10, head.x, head.y, 12, 0.4 * pulse);
-  // Visor/eye band
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  const visorGr = g.createLinearGradient(head.x + 2, head.y - 4, head.x + 2, head.y + 4);
-  visorGr.addColorStop(0, hsl(hue, 100, 70, 0.2));
-  visorGr.addColorStop(0.5, hsl(hue - 15, 100, 92, 0.9 * pulse));
-  visorGr.addColorStop(1, hsl(hue, 100, 70, 0.2));
-  g.fillStyle = visorGr;
+  g.strokeStyle = hsl(hue + 14, 90, 78, 0.55 * pulse);
+  g.lineWidth = 1;
   g.beginPath();
-  g.ellipse(head.x + 3, head.y, 3.5, 2.8, 0, 0, TAU);
-  g.fill();
+  g.moveTo(orbs[0].x, orbs[0].y);
+  for (let i = 1; i < N; i++) g.lineTo(orbs[i].x, orbs[i].y);
+  g.stroke();
   g.restore();
-  // Bright eye point
-  dot(g, hue - 15, head.x + 4, head.y, 2, 0.95);
+
+  // Pearls, tail first so the head overlaps.
+  for (let i = N - 1; i >= 0; i--) {
+    const o = orbs[i];
+    pearl(g, o.h, o.x, o.y, o.r * 1.3, 0.75 + 0.25 * (1 - i / N));
+  }
+
+  // Head crescent visor.
+  const hd = orbs[0];
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 70, 95, 0.9 * pulse);
+  g.lineWidth = 2.5;
+  g.lineCap = 'round';
+  g.beginPath();
+  g.arc(hd.x, hd.y, hd.r * 0.55, Math.PI * 0.15, Math.PI * 0.85);
+  g.stroke();
+  g.restore();
 
   g.restore();
 }
@@ -706,148 +467,37 @@ function bakeCreature(archetype, hue, phase) {
 
 /**
  * Resident chain whales are not fauna: they get their own painter, a grand
- * gold-rimmed leviathan, so a live address never reads as just another fish.
+ * golden sovereign, so a live address never reads as just another fish.
  */
 const leviathanCache = new Map();
+const GOLD = 42;
 function leviathanFrames(hueBucket) {
   let frames = leviathanCache.get(hueBucket);
   if (frames) return frames;
-  const hue = PALETTE_HUES[hueBucket % PALETTE_HUES.length];
   frames = [0, 0.25, 0.5, 0.75].map((p) => {
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = SPRITE;
-    drawLeviathan(canvas.getContext('2d'), hue, p);
+    drawLeviathan(canvas.getContext('2d'), GOLD, p);
     return canvas;
   });
   leviathanCache.set(hueBucket, frames);
+  // The sovereign's ambient bloom is golden and stronger, never the fauna hue.
+  glowCache.set(hueBucket, makeGlow(GOLD, 1.3));
   return frames;
 }
 
 /**
- * The chain leviathan: a resident whale embodying a live address. Deliberately
- * not one of the four species: bigger, gold-marked (it is made of money), with a
- * grand crescent fluke and a falcate dorsal, so nobody mistakes it for fauna.
+ * The chain leviathan: the same elegant living-light language as the whale,
+ * but gold (it is made of money), larger and more regal — the king of the tank.
  */
-const GOLD = 42;
-
 function drawLeviathan(g, hue, ph) {
-  const beat = Math.sin(ph * Math.PI * 2);
   g.save();
   g.translate(64, 64);
-  g.scale(1.12, 1.12);
-
-  // Broad crescent flukes, beating slowly.
-  g.save();
-  g.translate(-40, 0);
-  g.rotate(beat * 0.12);
-  g.beginPath();
-  g.moveTo(3, -2);
-  g.bezierCurveTo(-6, -6, -12, -12, -16, -20);
-  g.bezierCurveTo(-10, -10, -9, -4, -10, 0);
-  g.bezierCurveTo(-9, 4, -10, 10, -16, 18);
-  g.bezierCurveTo(-12, 11, -6, 6, 3, 2);
-  g.closePath();
-  g.fillStyle = hsl(hue, 58, 40, 0.55);
-  g.fill();
-  g.strokeStyle = hsl(GOLD, 90, 70, 0.5);
-  g.lineWidth = 1;
-  g.stroke();
-  g.restore();
-
-  // Long slender pectoral fin.
-  g.beginPath();
-  g.moveTo(8, 6);
-  g.bezierCurveTo(0, 14, -10, 20, -20, 23);
-  g.bezierCurveTo(-10, 15, -4, 9, 0, 4);
-  g.closePath();
-  g.fillStyle = hsl(hue, 58, 34, 0.6);
-  g.fill();
-  g.strokeStyle = hsl(hue, 85, 78, 0.4);
-  g.lineWidth = 1;
-  g.stroke();
-
-  // Falcate dorsal fin, set far back.
-  g.beginPath();
-  g.moveTo(-14, -13);
-  g.bezierCurveTo(-11, -20, -7, -21, -4, -14);
-  g.closePath();
-  g.fillStyle = hsl(hue, 58, 44, 0.55);
-  g.fill();
-
-  // Grand body: arched back, blunt head, long taper.
-  const arch = beat * 1.2;
-  g.beginPath();
-  g.moveTo(42, -2);
-  g.bezierCurveTo(38, -10, 26, -14, 8, -14 - arch * 0.3);
-  g.bezierCurveTo(-12, -14, -30, -8, -41, -2);
-  g.lineTo(-41, 2);
-  g.bezierCurveTo(-30, 7, -12, 12, 8, 12);
-  g.bezierCurveTo(26, 12, 38, 8, 42, 4);
-  g.quadraticCurveTo(44, 1, 42, -2);
-  g.closePath();
-  g.fillStyle = glass(g, hue, -15, 13);
-  g.fill();
-
-  // Sheen on the back.
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.translate(6, -8);
-  g.rotate(-0.12);
-  const sh = g.createRadialGradient(0, 0, 0, 0, 0, 24);
-  sh.addColorStop(0, hsl(hue, 60, 92, 0.15));
-  sh.addColorStop(1, hsl(hue, 60, 92, 0));
-  g.fillStyle = sh;
-  g.beginPath();
-  g.ellipse(0, 0, 24, 6, 0, 0, Math.PI * 2);
-  g.fill();
-  g.restore();
-
-  // Gold rim along the back: this animal is made of money.
-  g.beginPath();
-  g.moveTo(42, -2);
-  g.bezierCurveTo(38, -10, 26, -14, 8, -14 - arch * 0.3);
-  g.bezierCurveTo(-12, -14, -30, -8, -41, -2);
-  g.strokeStyle = hsl(GOLD, 95, 74, 0.85);
-  g.lineWidth = 1.5;
-  g.stroke();
-  // Inner dark line for glass thickness.
-  g.beginPath();
-  g.moveTo(39, -1.5);
-  g.bezierCurveTo(35, -8.5, 25, -12.2, 8, -12.2);
-  g.bezierCurveTo(-11, -12.2, -28, -6.8, -38, -1.5);
-  g.strokeStyle = hsl(hue, 70, 10, 0.4);
-  g.lineWidth = 1.6;
-  g.stroke();
-  // Belly rim, cool and soft.
-  g.beginPath();
-  g.moveTo(-41, 2);
-  g.bezierCurveTo(-30, 7, -12, 12, 8, 12);
-  g.bezierCurveTo(26, 12, 38, 8, 42, 4);
-  g.strokeStyle = hsl(hue, 80, 78, 0.35);
-  g.lineWidth = 1;
-  g.stroke();
-
-  // Throat grooves and a curved mouth line.
-  g.strokeStyle = hsl(hue, 60, 80, 0.22);
-  g.lineWidth = 0.8;
-  for (let i = 0; i < 3; i++) {
-    g.beginPath();
-    g.moveTo(38 - i * 3, 3 + i * 2);
-    g.quadraticCurveTo(28 - i * 3, 6 + i * 2, 18 - i * 3, 6 + i * 2);
-    g.stroke();
-  }
-  g.beginPath();
-  g.moveTo(41, 2);
-  g.quadraticCurveTo(34, 5, 27, 4.5);
-  g.strokeStyle = hsl(hue, 50, 12, 0.6);
-  g.lineWidth = 1.1;
-  g.stroke();
-
-  // Gold photophore line along the flank, and the eye.
-  for (let i = 0; i < 7; i++) {
-    dot(g, GOLD, 26 - i * 10, 6 - i * 0.5, 1.1, 0.8);
-  }
-  dot(g, GOLD, 33, -4, 2, 1);
+  const b = 1.12 * (1 + 0.03 * Math.sin(ph * TAU));
+  g.scale(b, b);
+  whaleForm(g, GOLD, ph, 1);
+  // Regal golden aura breathing over the body.
+  core(g, GOLD, 4, -2, 26, 0.26);
   g.restore();
 }
 /** Animation frames for an archetype + hue bucket (4-frame sine sway). */
@@ -868,26 +518,27 @@ function creatureFrames(archetype, hueBucket) {
   return frames;
 }
 
-/** Additive bloom per hue bucket — strong soft glow filling the 96×96 canvas. */
+/** Additive bloom per hue bucket — soft ambient light filling the 96×96 canvas. */
 const glowCache = new Map();
-function creatureGlow(hueBucket) {
-  let s = glowCache.get(hueBucket);
-  if (s) return s;
-  const hue = PALETTE_HUES[hueBucket % PALETTE_HUES.length];
+function makeGlow(hue, boost = 1) {
   const c = document.createElement('canvas');
   c.width = c.height = 96;
   const g = c.getContext('2d');
   const grad = g.createRadialGradient(48, 48, 0, 48, 48, 48);
-  grad.addColorStop(0, hsla(hue, 100, 75, 0.6));
-  grad.addColorStop(0.15, hsla(hue, 100, 68, 0.4));
-  grad.addColorStop(0.35, hsla(hue, 95, 60, 0.25));
-  grad.addColorStop(0.6, hsla(hue + 15, 90, 50, 0.1));
-  grad.addColorStop(0.85, hsla(hue + 20, 85, 45, 0.03));
-  grad.addColorStop(1, hsla(hue, 80, 40, 0));
+  grad.addColorStop(0, hsla(hue, 90, 70, 0.45 * boost));
+  grad.addColorStop(0.3, hsla(hue, 85, 55, 0.15 * boost));
+  grad.addColorStop(0.7, hsla(hue, 80, 45, 0.04 * boost));
+  grad.addColorStop(1, hsla(hue, 80, 45, 0));
   g.fillStyle = grad;
   g.fillRect(0, 0, 96, 96);
-  glowCache.set(hueBucket, c);
   return c;
+}
+function creatureGlow(hueBucket) {
+  let s = glowCache.get(hueBucket);
+  if (s) return s;
+  s = makeGlow(PALETTE_HUES[hueBucket % PALETTE_HUES.length]);
+  glowCache.set(hueBucket, s);
+  return s;
 }
 
 /* ---------- food sprites (3 refined plankton/spore variants) ---------- */
