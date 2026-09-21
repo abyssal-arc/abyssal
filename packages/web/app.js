@@ -19,7 +19,7 @@
  * is capped at 2; per-snapshot preprocessing runs once per poll.
  */
 import { t, initI18n } from './i18n.js';
-import { mulberry32, hashSeed, mixSeed, unitNoise, buildFrameGeometry } from './src/geom.js';
+import { mulberry32, hashSeed, mixSeed, unitNoise } from './src/geom.js';
 import { hsla, shortAddr, fmtUsd } from './src/format.js';
 
 initI18n();
@@ -128,365 +128,440 @@ const HUE_BUCKETS = 24;
 const CREATURE_VISUAL_SCALE = 1.3;
 const spriteCache = new Map();
 
-/* ---------- procedural creature sprites (v6 "biodiversity") ---------- */
+/* ---------- procedural creature sprites (v7 "field guide") ---------- */
 /**
- * v6 "biodiversity": four body plans that share nothing with a generic fish.
- *   WHALE   → giant nautilus (log-spiral shell, ancient heavy money)
- *   ALGO    → faceted crystal drone (angular, machine, no organic curves)
- *   APE     → armored ball (chunky plated isopod, brute mass)
- *   INSIDER → ribbon eel (long sinuous phantom, stealth)
- * Every stroke ≥2.4px in sprite space so it survives the ~3x downscale.
+ * v7 "field guide" creature painters. Bodies fill their footprint, real anatomy,
+ * dark back / light belly, one rim light and one accent organ, so a silhouette
+ * still reads at 18px. Facing +x, centred on (64,64) in a 128px sprite.
  */
-const ARCHETYPE_SCALE = { WHALE: 1.06, ALGO: 0.94, APE: 0.98, INSIDER: 1.0 };
-const TAU = Math.PI * 2;
+const hsl = hsla;
 
-/** Vertical body gradient: dark dorsal → bright ventral (volume, not outline). */
-function bodyFill(g, hue, y0, y1) {
-  const gr = g.createLinearGradient(0, y0, 0, y1);
-  gr.addColorStop(0, hsla(hue, 68, 16, 0.97));
-  gr.addColorStop(0.42, hsla(hue, 76, 34, 0.97));
-  gr.addColorStop(0.78, hsla(hue, 86, 52, 0.96));
-  gr.addColorStop(1, hsla(hue, 94, 70, 0.94));
+function lg(g, x0, y0, x1, y1, stops) {
+  const gr = g.createLinearGradient(x0, y0, x1, y1);
+  for (const [o, c] of stops) gr.addColorStop(o, c);
   return gr;
 }
 
-/** Rim light: bright on the top contour, fading out before the belly. */
-function rim(g, hue, y0, y1, w = 2.2) {
-  const gr = g.createLinearGradient(0, y0, 0, y1);
-  gr.addColorStop(0, hsla(hue, 100, 92, 0.95));
-  gr.addColorStop(0.4, hsla(hue, 100, 82, 0.4));
-  gr.addColorStop(0.72, hsla(hue, 100, 78, 0));
-  g.strokeStyle = gr;
-  g.lineWidth = w;
-  g.lineJoin = 'round';
+/** Stroke a path again as a top-edge rim light. */
+function rim(g, hue, width = 1.6, alpha = 0.55) {
+  g.save();
+  g.clip();
+  g.strokeStyle = hsl(hue, 95, 84, alpha);
+  g.lineWidth = width * 2;
+  g.translate(0, -width);
   g.stroke();
+  g.restore();
 }
 
-/** Tapered ribbon: sampled polyline stroked with round caps, width w0→w1. */
-function tapered(g, pts, w0, w1, color) {
-  g.strokeStyle = color;
-  g.lineCap = 'round';
-  g.lineJoin = 'round';
-  for (let i = 1; i < pts.length; i++) {
-    const t = i / (pts.length - 1);
-    g.lineWidth = w0 + (w1 - w0) * t;
+/* ---------------- WHALE: sperm-whale body, flukes, one fin ---------------- */
+function drawWhale(g, hue, ph) {
+  const beat = Math.sin(ph * TAU);
+  g.save();
+  g.translate(64, 64);
+
+  // Caudal peduncle and flukes, beating around the tail root.
+  g.save();
+  g.translate(-30, 0);
+  g.rotate(beat * 0.22);
+  g.beginPath();
+  g.moveTo(2, -5);
+  g.quadraticCurveTo(-9, -7, -16, -18);
+  g.quadraticCurveTo(-10, -6, -13, 0);
+  g.quadraticCurveTo(-10, 6, -16, 16);
+  g.quadraticCurveTo(-9, 7, 2, 5);
+  g.closePath();
+  g.fillStyle = lg(g, 0, -16, 0, 16, [[0, hsl(hue, 55, 34)], [1, hsl(hue, 45, 22)]]);
+  g.fill();
+  g.restore();
+
+  // Body mass: blunt head, deep middle, narrow peduncle.
+  g.beginPath();
+  g.moveTo(39, -12);
+  g.bezierCurveTo(30, -18, 10, -20, -6, -17);
+  g.bezierCurveTo(-18, -14, -26, -8, -31, -4);
+  g.lineTo(-31, 4);
+  g.bezierCurveTo(-24, 10, -12, 16, 2, 17);
+  g.bezierCurveTo(16, 18, 32, 15, 38, 9);
+  g.quadraticCurveTo(41, 0, 39, -12);
+  g.closePath();
+  const body = lg(g, 0, -20, 0, 18, [
+    [0, hsl(hue, 62, 40)],
+    [0.45, hsl(hue, 58, 30)],
+    [0.75, hsl(hue, 40, 46)],
+    [1, hsl(hue, 32, 62)],
+  ]);
+  g.fillStyle = body;
+  g.fill();
+
+  // Dorsal ridge.
+  g.beginPath();
+  g.moveTo(-4, -16);
+  g.quadraticCurveTo(2, -22, 8, -15);
+  g.quadraticCurveTo(2, -17, -4, -16);
+  g.closePath();
+  g.fillStyle = hsl(hue, 60, 36);
+  g.fill();
+
+  // Pectoral fin, swept back, flexing with the beat.
+  g.save();
+  g.translate(12, 9);
+  g.rotate(0.55 + beat * 0.14);
+  g.beginPath();
+  g.moveTo(2, -2);
+  g.quadraticCurveTo(-2, 12, -18, 19);
+  g.quadraticCurveTo(-8, 9, -6, -1);
+  g.closePath();
+  g.fillStyle = hsl(hue, 52, 22, 0.98);
+  g.fill();
+  g.strokeStyle = hsl(hue, 70, 60, 0.5);
+  g.lineWidth = 1;
+  g.stroke();
+  g.restore();
+  // Mouth line.
+  g.beginPath();
+  g.moveTo(38, 4);
+  g.quadraticCurveTo(32, 7, 26, 6);
+  g.strokeStyle = hsl(hue, 40, 12, 0.7);
+  g.lineWidth = 1.4;
+  g.stroke();
+
+  // Ventral grooves.
+  g.strokeStyle = hsl(hue, 30, 70, 0.25);
+  g.lineWidth = 1;
+  for (let i = 0; i < 3; i++) {
     g.beginPath();
-    g.moveTo(pts[i - 1][0], pts[i - 1][1]);
-    g.lineTo(pts[i][0], pts[i][1]);
+    g.moveTo(30 - i * 4, 12 - i * 2.5);
+    g.quadraticCurveTo(10, 15 - i * 2.5, -14, 8 - i * 2);
     g.stroke();
   }
-}
 
-/** Sample a quadratic bezier into points. */
-function qpts(x0, y0, cx, cy, x1, y1, n = 10) {
-  const out = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    out.push([u * u * x0 + 2 * u * t * cx + t * t * x1, u * u * y0 + 2 * u * t * cy + t * t * y1]);
-  }
-  return out;
-}
-
-/** Soft bioluminescent organ, readable at small sizes. */
-function lantern(g, hue, x, y, r) {
-  const ng = g.createRadialGradient(x, y, 0, x, y, r * 3.4);
-  ng.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
-  ng.addColorStop(0.3, hsla(hue, 100, 84, 0.55));
-  ng.addColorStop(1, hsla(hue, 100, 78, 0));
-  g.fillStyle = ng;
+  // Eye.
   g.beginPath();
-  g.arc(x, y, r * 3.4, 0, TAU);
+  g.arc(29, -3, 2.7, 0, TAU);
+  g.fillStyle = hsl(hue, 20, 8);
   g.fill();
+  g.beginPath();
+  g.arc(29.9, -3.9, 1, 0, TAU);
+  g.fillStyle = hsl(hue, 90, 88, 0.9);
+  g.fill();
+
+  // Rim light along the back.
+  g.beginPath();
+  g.moveTo(38, -10);
+  g.bezierCurveTo(30, -17, 10, -19, -6, -16);
+  g.bezierCurveTo(-18, -13, -26, -8, -31, -4);
+  g.strokeStyle = hsl(hue, 95, 82, 0.5);
+  g.lineWidth = 1.6;
+  g.stroke();
+  g.restore();
 }
 
+/* ------------- ALGO: machine cuttlefish, faceted core, jointed arms ------------- */
+function drawAlgo(g, hue, ph) {
+  const beat = Math.sin(ph * TAU);
+  g.save();
+  g.translate(64, 64);
+
+  // Mantle cone with fin ribs.
+  g.beginPath();
+  g.moveTo(8, -12);
+  g.lineTo(-30, -3);
+  g.quadraticCurveTo(-36, 0, -30, 3);
+  g.lineTo(8, 12);
+  g.closePath();
+  g.fillStyle = lg(g, 0, -12, 0, 12, [[0, hsl(hue, 55, 42)], [1, hsl(hue, 50, 20)]]);
+  g.fill();
+  for (let i = 0; i < 3; i++) {
+    const x = 0 - i * 11;
+    const w = 5 + Math.sin(ph * TAU + i * 1.3) * 1.6;
+    g.beginPath();
+    g.moveTo(x + 5, -11 + i * 2.5);
+    g.quadraticCurveTo(x - 2, -13 - w + i * 2.5, x - 8, -10 + i * 2.5);
+    g.quadraticCurveTo(x - 3, -9 + i * 2.5, x + 5, -11 + i * 2.5);
+    g.closePath();
+    g.fillStyle = hsl(hue, 62, 52, 0.85);
+    g.fill();
+    g.beginPath();
+    g.moveTo(x + 5, 11 - i * 2.5);
+    g.quadraticCurveTo(x - 2, 13 + w - i * 2.5, x - 8, 10 - i * 2.5);
+    g.quadraticCurveTo(x - 3, 9 - i * 2.5, x + 5, 11 - i * 2.5);
+    g.closePath();
+    g.fillStyle = hsl(hue, 62, 34, 0.85);
+    g.fill();
+  }
+
+  // Faceted core head.
+  g.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * TAU + Math.PI / 6;
+    const x = 19 + Math.cos(a) * 16;
+    const y = Math.sin(a) * 14;
+    if (i === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  }
+  g.closePath();
+  g.fillStyle = lg(g, 10, -14, 26, 14, [
+    [0, hsl(hue, 70, 62)],
+    [0.5, hsl(hue, 65, 40)],
+    [1, hsl(hue, 60, 24)],
+  ]);
+  g.fill();
+  // Facet seams.
+  g.strokeStyle = hsl(hue, 80, 78, 0.35);
+  g.lineWidth = 1;
+  g.beginPath();
+  g.moveTo(8, -8);
+  g.lineTo(20, 0);
+  g.lineTo(8, 9);
+  g.moveTo(20, 0);
+  g.lineTo(31, -4);
+  g.stroke();
+
+  // Visor slit, the one bright organ.
+  g.beginPath();
+  if (g.roundRect) g.roundRect(15, -4.5, 15, 5, 2.5);
+  else g.rect(15, -4.5, 15, 5);
+  g.fillStyle = hsl(hue, 100, 80, 0.98);
+  g.fill();
+  g.beginPath();
+  g.arc(24, -2, 6, 0, TAU);
+  g.fillStyle = hsl(hue, 100, 70, 0.28);
+  g.fill();
+
+  // Jointed arms, two segments each.
+  for (let i = 0; i < 3; i++) {
+    const y0 = -7 + i * 7;
+    const flex = beat * 0.3 + i * 0.3;
+    const a1 = -0.45 + i * 0.45 + flex * 0.3;
+    const x1 = 31 + Math.cos(a1) * 11;
+    const y1 = y0 + Math.sin(a1) * 11;
+    const a2 = a1 + 0.8 + flex;
+    const x2 = x1 + Math.cos(a2) * 10;
+    const y2 = y1 + Math.sin(a2) * 10;
+    g.strokeStyle = hsl(hue, 58, 52, 0.95);
+    g.lineWidth = 4;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(29, y0);
+    g.lineTo(x1, y1);
+    g.lineTo(x2, y2);
+    g.stroke();
+    g.beginPath();
+    g.arc(x1, y1, 2.2, 0, TAU);
+    g.fillStyle = hsl(hue, 90, 78, 0.95);
+    g.fill();
+  }
+  g.restore();
+}
+
+/* ---------------- APE: segmented isopod, plates, legs, antennae ---------------- */
+function drawApe(g, hue, ph) {
+  const step = Math.sin(ph * TAU);
+  g.save();
+  g.translate(64, 64);
+
+  // Legs under the body, cycling.
+  g.strokeStyle = hsl(hue, 50, 40, 0.95);
+  g.lineWidth = 2.4;
+  g.lineCap = 'round';
+  for (let i = 0; i < 4; i++) {
+    const x = 14 - i * 11;
+    const sw = Math.sin(ph * TAU + i * 1.7) * 3;
+    for (const s of [-1, 1]) {
+      g.beginPath();
+      g.moveTo(x, 8 * s * 0.4 + 6);
+      g.lineTo(x - 3 + sw, 16);
+      g.lineTo(x - 7 + sw, 21);
+      g.stroke();
+    }
+  }
+
+  // Tail plate.
+  g.beginPath();
+  g.ellipse(-28, 0, 8, 9, 0, 0, TAU);
+  g.fillStyle = hsl(hue, 50, 26);
+  g.fill();
+
+  // Carapace plates, back to front so each overlaps the next.
+  for (let i = 0; i < 5; i++) {
+    const x = -22 + i * 9.5;
+    const ry = 15 - i * 1.6;
+    g.beginPath();
+    g.ellipse(x, 0, 11, ry, 0, 0, TAU);
+    g.fillStyle = lg(g, x, -ry, x, ry, [
+      [0, hsl(hue, 55, 46)],
+      [0.5, hsl(hue, 52, 32)],
+      [1, hsl(hue, 45, 20)],
+    ]);
+    g.fill();
+    // Seam shadow on the rear edge of each plate.
+    g.beginPath();
+    g.ellipse(x - 3, 0, 10, ry - 1, 0, Math.PI * 0.5, Math.PI * 1.5);
+    g.strokeStyle = hsl(hue, 45, 10, 0.65);
+    g.lineWidth = 1.8;
+    g.stroke();
+  }
+
+  // Dorsal ridge highlight.
+  g.beginPath();
+  g.moveTo(-26, -8);
+  g.quadraticCurveTo(0, -16, 20, -9);
+  g.strokeStyle = hsl(hue, 90, 80, 0.45);
+  g.lineWidth = 1.6;
+  g.stroke();
+
+  // Head plate, antennae, eyes.
+  g.beginPath();
+  g.ellipse(22, 0, 9, 10, 0, 0, TAU);
+  g.fillStyle = lg(g, 22, -10, 22, 10, [[0, hsl(hue, 58, 50)], [1, hsl(hue, 48, 26)]]);
+  g.fill();
+  g.strokeStyle = hsl(hue, 50, 40, 0.95);
+  g.lineWidth = 1.6;
+  g.lineCap = 'round';
+  g.beginPath();
+  g.moveTo(28, -4);
+  g.quadraticCurveTo(38, -9, 46, -8 + step);
+  g.moveTo(28, 3);
+  g.quadraticCurveTo(38, 6, 46, 8 - step);
+  g.stroke();
+  for (const y of [-4, 3]) {
+    g.beginPath();
+    g.arc(25, y, 2, 0, TAU);
+    g.fillStyle = hsl(hue, 20, 8);
+    g.fill();
+    g.beginPath();
+    g.arc(25.7, y - 0.7, 0.8, 0, TAU);
+    g.fillStyle = hsl(hue, 90, 88, 0.9);
+    g.fill();
+  }
+  g.restore();
+}
+
+/* -------------- INSIDER: ribbon eel with a head, eye and real girth -------------- */
+function drawInsider(g, hue, ph) {
+  g.save();
+  g.translate(64, 64);
+  const N = 26;
+  const xs = [];
+  const ys = [];
+  const ws = [];
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const x = 32 - t * 74;
+    const amp = 9 * (1 - t * 0.55);
+    const y = Math.sin(t * 4.4 + ph * TAU) * amp * (0.35 + t * 0.9);
+    xs.push(x);
+    ys.push(y);
+    ws.push((14 - t * 11.5) * 0.5);
+  }
+  // Ribbon body: offset the centreline perpendicular.
+  g.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
+    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const px = xs[i] + nx * ws[i];
+    const py = ys[i] + ny * ws[i];
+    if (i === 0) g.moveTo(px, py);
+    else g.lineTo(px, py);
+  }
+  for (let i = N; i >= 0; i--) {
+    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
+    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    g.lineTo(xs[i] - nx * ws[i], ys[i] - ny * ws[i]);
+  }
+  g.closePath();
+  g.fillStyle = lg(g, 0, -14, 0, 14, [
+    [0, hsl(hue, 65, 58)],
+    [0.5, hsl(hue, 60, 38)],
+    [1, hsl(hue, 50, 22)],
+  ]);
+  g.fill();
+
+  // Dorsal fringe.
+  g.fillStyle = hsl(hue, 70, 66, 0.75);
+  for (let i = 2; i < N - 2; i += 2) {
+    const dx = xs[i + 1] - xs[i - 1];
+    const dy = ys[i + 1] - ys[i - 1];
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    g.beginPath();
+    g.moveTo(xs[i] + nx * ws[i], ys[i] + ny * ws[i]);
+    g.lineTo(xs[i] + nx * (ws[i] + 4.6), ys[i] + ny * (ws[i] + 4.6));
+    g.lineTo(xs[i + 1] + nx * ws[i + 1], ys[i + 1] + ny * ws[i + 1]);
+    g.closePath();
+    g.fill();
+  }
+
+  // Head wedge with a jaw and an eye.
+  g.beginPath();
+  g.moveTo(30, ys[0] - 7);
+  g.quadraticCurveTo(42, ys[0] - 4, 43, ys[0] + 0.5);
+  g.quadraticCurveTo(40, ys[0] + 2, 37, ys[0] + 2.5);
+  g.quadraticCurveTo(40, ys[0] + 5, 33, ys[0] + 7);
+  g.quadraticCurveTo(29, ys[0] + 4, 30, ys[0] - 7);
+  g.closePath();
+  g.fillStyle = hsl(hue, 64, 50);
+  g.fill();
+  g.beginPath();
+  g.moveTo(43, ys[0] + 0.5);
+  g.quadraticCurveTo(38, ys[0] + 2, 34, ys[0] + 2);
+  g.strokeStyle = hsl(hue, 40, 12, 0.7);
+  g.lineWidth = 1.3;
+  g.stroke();
+  g.beginPath();
+  g.arc(35, ys[0] - 2.5, 2.3, 0, TAU);
+  g.fillStyle = hsl(hue, 20, 8);
+  g.fill();
+  g.beginPath();
+  g.arc(35.8, ys[0] - 3.3, 0.9, 0, TAU);
+  g.fillStyle = hsl(hue, 90, 88, 0.9);
+  g.fill();
+
+  // Dorsal rim light.
+  g.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
+    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
+    const len = Math.hypot(dx, dy) || 1;
+    const px = xs[i] + (-dy / len) * ws[i];
+    const py = ys[i] + (dx / len) * ws[i];
+    if (i === 0) g.moveTo(px, py);
+    else g.lineTo(px, py);
+  }
+  g.strokeStyle = hsl(hue, 95, 82, 0.5);
+  g.lineWidth = 1.4;
+  g.stroke();
+  g.restore();
+}
+
+const CREATURE_PAINTERS = { WHALE: drawWhale, ALGO: drawAlgo, APE: drawApe, INSIDER: drawInsider };
+
+/**
+ * v7 "field guide": four animals with real anatomy and volume, painted dark
+ * back to light belly with one rim light and one bright organ each, so a
+ * silhouette still reads at the 18px the tank draws most bodies at. Bodies
+ * fill their sprite; the halo is a whisper because the tank adds its own.
+ */
 function bakeCreature(archetype, hue, phase) {
   const canvas = document.createElement('canvas');
   canvas.width = canvas.height = SPRITE;
   const g = canvas.getContext('2d');
-  const cx = SPRITE / 2;
-  const cy = SPRITE / 2;
-  const sw = Math.sin(phase * TAU);
-
-  // Ambient halo so the body sits in its own light.
-  const glow = g.createRadialGradient(cx, cy, 4, cx, cy, SPRITE * 0.46);
-  glow.addColorStop(0, hsla(hue, 95, 62, 0.2));
-  glow.addColorStop(0.55, hsla(hue, 95, 55, 0.06));
-  glow.addColorStop(1, hsla(hue, 95, 55, 0));
-  g.fillStyle = glow;
+  const halo = g.createRadialGradient(SPRITE / 2, SPRITE / 2, 6, SPRITE / 2, SPRITE / 2, SPRITE * 0.47);
+  halo.addColorStop(0, hsla(hue, 90, 60, 0.12));
+  halo.addColorStop(1, hsla(hue, 90, 60, 0));
+  g.fillStyle = halo;
   g.fillRect(0, 0, SPRITE, SPRITE);
-
-  g.save();
-  g.translate(cx, cy);
-  const S = ARCHETYPE_SCALE[archetype] ?? 1;
-  g.scale(S, S);
-  g.translate(-cx, -cy);
-  g.lineCap = 'round';
-  g.lineJoin = 'round';
-
-  if (archetype === 'WHALE') {
-    // ---- Giant nautilus: logarithmic spiral shell, aperture to +x. ----
-    const scx = cx - 6;
-    const scy = cy;
-    const k = 0.17;                 // growth per radian
-    const R = 27;                   // aperture radius
-    const turns = -3.1 * Math.PI;   // wind inward
-    const pts = [];
-    const N = 90;
-    for (let i = 0; i <= N; i++) {
-      const th = (i / N) * turns;   // 0 → turns (inward)
-      const r = R * Math.exp(k * th);
-      // aperture faces down-right (+x, +y) so the head/tentacles sit at +x
-      const a = th + Math.PI * 0.15;
-      pts.push([scx + r * Math.cos(a), scy + r * Math.sin(a), r]);
-    }
-    // Shell body: tapered thick spiral (width ∝ radius).
-    g.lineCap = 'round';
-    for (let i = 1; i < pts.length; i++) {
-      const [x0, y0, r0] = pts[i - 1];
-      const [x1, y1, r1] = pts[i];
-      g.strokeStyle = hsla(hue, 74, 26 + 30 * (r1 / R), 0.97);
-      g.lineWidth = Math.max(1.4, r1 * 0.62);
-      g.beginPath();
-      g.moveTo(x0, y0);
-      g.lineTo(x1, y1);
-      g.stroke();
-    }
-    // Rim highlight on the outer whorl.
-    g.strokeStyle = hsla(hue, 100, 90, 0.5);
-    g.lineWidth = 1.8;
-    g.beginPath();
-    for (let i = 0; i <= Math.floor(N * 0.62); i++) {
-      const th = (i / N) * turns;
-      const r = R * Math.exp(k * th) * 1.16;
-      const a = th + Math.PI * 0.15;
-      const x = scx + r * Math.cos(a);
-      const y = scy + r * Math.sin(a);
-      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
-    }
-    g.stroke();
-    // Chamber septa: short lines across the outer whorl.
-    g.strokeStyle = hsla(hue, 100, 86, 0.26);
-    g.lineWidth = 1.3;
-    for (let i = 6; i < 40; i += 4) {
-      const th = (i / N) * turns;
-      const r = R * Math.exp(k * th);
-      const a = th + Math.PI * 0.15;
-      g.beginPath();
-      g.moveTo(scx + r * 0.5 * Math.cos(a), scy + r * 0.5 * Math.sin(a));
-      g.lineTo(scx + r * 1.05 * Math.cos(a), scy + r * 1.05 * Math.sin(a));
-      g.stroke();
-    }
-    // Aperture lip glow.
-    lantern(g, hue, pts[0][0], pts[0][1], 2.6);
-    // Tentacles reaching +x from the aperture.
-    const ax = pts[0][0];
-    const ay = pts[0][1];
-    for (let i = 0; i < 5; i++) {
-      const s = (i - 2) / 2;
-      const w1 = Math.sin(phase * TAU + i * 0.9) * 4;
-      const tp = qpts(ax, ay + s * 3, ax + 14 + w1 * 0.4, ay + s * 9 + w1, ax + 26 + w1 * 0.3, ay + s * 15 - w1, 10);
-      tapered(g, tp, 2.8, 0.6, hsla(hue, 100, 84, 0.6));
-    }
-  } else if (archetype === 'ALGO') {
-    // ---- Faceted crystal drone: angular, machine, no organic curves. ----
-    const pulse = 0.5 + 0.5 * sw;
-    // Swept angular wings (two, mirrored) behind the core, large & sharp.
-    for (const sgn of [-1, 1]) {
-      g.beginPath();
-      g.moveTo(cx + 8, cy + sgn * 5);
-      g.lineTo(cx - 10, cy + sgn * 36);
-      g.lineTo(cx - 30, cy + sgn * 26);
-      g.lineTo(cx - 14, cy + sgn * 3);
-      g.closePath();
-      const wg = g.createLinearGradient(cx, cy, cx - 20, cy + sgn * 34);
-      wg.addColorStop(0, hsla(hue, 82, 60, 0.68));
-      wg.addColorStop(1, hsla(hue, 85, 28, 0.16));
-      g.fillStyle = wg;
-      g.fill();
-      g.strokeStyle = hsla(hue, 100, 90, 0.7);
-      g.lineWidth = 1.7;
-      g.stroke();
-    }
-    // Forward prow spike (motion read).
-    g.beginPath();
-    g.moveTo(cx + 34, cy);
-    g.lineTo(cx + 16, cy - 6);
-    g.lineTo(cx + 16, cy + 6);
-    g.closePath();
-    g.fillStyle = hsla(hue, 88, 66, 0.85);
-    g.fill();
-    g.strokeStyle = hsla(hue, 100, 92, 0.7);
-    g.lineWidth = 1.5;
-    g.stroke();
-    // Central faceted hex core (two tones for a cut-crystal read).
-    const hex = [];
-    for (let i = 0; i < 6; i++) {
-      const a = (i / 6) * TAU + Math.PI / 6;
-      hex.push([cx + Math.cos(a) * 22, cy + Math.sin(a) * 18]);
-    }
-    // upper facet
-    g.beginPath();
-    g.moveTo(hex[0][0], hex[0][1]);
-    for (let i = 1; i < 3; i++) g.lineTo(hex[i][0], hex[i][1]);
-    g.lineTo(cx, cy);
-    g.closePath();
-    g.fillStyle = hsla(hue, 85, 62, 0.92);
-    g.fill();
-    // lower facet
-    g.beginPath();
-    g.moveTo(hex[3][0], hex[3][1]);
-    for (let i = 4; i < 6; i++) g.lineTo(hex[i][0], hex[i][1]);
-    g.lineTo(cx, cy);
-    g.closePath();
-    g.fillStyle = hsla(hue, 78, 28, 0.95);
-    g.fill();
-    // remaining side facets
-    g.beginPath();
-    g.moveTo(hex[2][0], hex[2][1]);
-    g.lineTo(hex[3][0], hex[3][1]);
-    g.lineTo(cx, cy);
-    g.closePath();
-    g.fillStyle = hsla(hue, 82, 46, 0.94);
-    g.fill();
-    g.beginPath();
-    g.moveTo(hex[5][0], hex[5][1]);
-    g.lineTo(hex[0][0], hex[0][1]);
-    g.lineTo(cx, cy);
-    g.closePath();
-    g.fillStyle = hsla(hue, 82, 44, 0.94);
-    g.fill();
-    // Crystal outline + facet seams.
-    g.strokeStyle = hsla(hue, 100, 92, 0.85);
-    g.lineWidth = 1.8;
-    g.beginPath();
-    g.moveTo(hex[0][0], hex[0][1]);
-    for (let i = 1; i < 6; i++) g.lineTo(hex[i][0], hex[i][1]);
-    g.closePath();
-    g.stroke();
-    g.strokeStyle = hsla(hue, 100, 88, 0.35);
-    g.lineWidth = 1.2;
-    for (let i = 0; i < 6; i++) {
-      g.beginPath();
-      g.moveTo(cx, cy);
-      g.lineTo(hex[i][0], hex[i][1]);
-      g.stroke();
-    }
-    // Glowing core + vertex nodes (machine read).
-    lantern(g, hue, cx, cy, 2.6 + pulse * 0.8);
-    g.fillStyle = hsla(hue, 100, 92, 0.9);
-    for (let i = 0; i < 6; i++) {
-      g.beginPath();
-      g.arc(hex[i][0], hex[i][1], 1.5, 0, TAU);
-      g.fill();
-    }
-  } else if (archetype === 'APE') {
-    // ---- Armored ball: chunky plated isopod, brute mass. ----
-    const R = 25;
-    // Stubby legs on the lower rim only (behind the shell), thick & short.
-    for (let i = 0; i < 4; i++) {
-      const a = Math.PI * (0.28 + 0.15 * i);
-      const w1 = Math.sin(phase * TAU + i * 0.8) * 2;
-      const lx = cx + Math.cos(a) * (R - 3);
-      const ly = cy + Math.sin(a) * (R - 3);
-      const lp = qpts(lx, ly, lx + Math.cos(a) * 7, ly + Math.sin(a) * 7 + w1, lx + Math.cos(a) * 12, ly + Math.sin(a) * 12 + w1, 8);
-      tapered(g, lp, 5.2, 2.2, hsla(hue, 88, 58, 0.7));
-    }
-    // Round plated body.
-    g.beginPath();
-    g.arc(cx, cy, R, 0, TAU);
-    g.fillStyle = bodyFill(g, hue, cy - R, cy + R);
-    g.fill();
-    rim(g, hue, cy - R, cy + R * 0.7, 2.4);
-    // Overlapping segment plates: bold arcs across the ball.
-    g.strokeStyle = hsla(hue, 100, 84, 0.55);
-    g.lineWidth = 2.2;
-    for (let i = 1; i <= 3; i++) {
-      const off = (i / 4) * R * 2 - R;
-      g.beginPath();
-      g.ellipse(cx + off * 0.3, cy, Math.max(4, R - Math.abs(off) * 0.55), R * 0.96, 0, -Math.PI * 0.5, Math.PI * 0.5);
-      g.stroke();
-    }
-    // Dorsal ridge highlight.
-    g.strokeStyle = hsla(hue, 100, 94, 0.6);
-    g.lineWidth = 2.4;
-    g.beginPath();
-    g.arc(cx, cy, R - 2, Math.PI * 1.08, Math.PI * 1.7);
-    g.stroke();
-    // Heavy face plate + two blunt eyes at +x.
-    g.fillStyle = hsla(hue, 72, 12, 0.62);
-    g.beginPath();
-    g.ellipse(cx + R * 0.58, cy, R * 0.46, R * 0.7, 0, 0, TAU);
-    g.fill();
-    g.strokeStyle = hsla(hue, 100, 88, 0.4);
-    g.lineWidth = 1.5;
-    g.stroke();
-    lantern(g, hue, cx + R * 0.66, cy - 7, 2.2);
-    lantern(g, hue, cx + R * 0.66, cy + 7, 2.2);
-  } else {
-    // ---- INSIDER ribbon eel: long sinuous phantom, stealth. ----
-    // Sinuous centerline from -x (tail) to +x (head).
-    const amp = 9;
-    const len = 92;
-    const M = 40;
-    const spine = [];
-    for (let i = 0; i <= M; i++) {
-      const t = i / M;
-      const x = cx - len / 2 + t * len;
-      const y = cy + Math.sin(t * Math.PI * 2.1 + phase * TAU) * amp * Math.sin(t * Math.PI);
-      spine.push([x, y]);
-    }
-    // Ribbon body: tapered along its length (thin tail → mid → thin head).
-    g.lineCap = 'round';
-    g.lineJoin = 'round';
-    for (let i = 1; i < spine.length; i++) {
-      const t = i / (spine.length - 1);
-      const w = 3 + Math.sin(t * Math.PI) * 10;   // thickest mid-body
-      const seg = g.createLinearGradient(0, spine[i][1] - w, 0, spine[i][1] + w);
-      seg.addColorStop(0, hsla(hue, 80, 66, 0.85));
-      seg.addColorStop(1, hsla(hue, 74, 24, 0.5));
-      g.strokeStyle = seg;
-      g.lineWidth = w;
-      g.beginPath();
-      g.moveTo(spine[i - 1][0], spine[i - 1][1]);
-      g.lineTo(spine[i][0], spine[i][1]);
-      g.stroke();
-    }
-    // Dorsal fin frill: small triangles along the top of the ribbon.
-    g.fillStyle = hsla(hue, 92, 72, 0.32);
-    for (let i = 3; i < spine.length - 3; i += 2) {
-      const [x, y] = spine[i];
-      const t = i / (spine.length - 1);
-      const half = 1.5 + Math.sin(t * Math.PI) * 5;
-      const h = 3 + Math.sin(t * Math.PI) * 6;
-      g.beginPath();
-      g.moveTo(x - 3, y - half);
-      g.lineTo(x, y - half - h);
-      g.lineTo(x + 3, y - half);
-      g.closePath();
-      g.fill();
-    }
-    // Bright dorsal edge line for a wet sheen.
-    g.strokeStyle = hsla(hue, 100, 90, 0.5);
-    g.lineWidth = 1.5;
-    g.beginPath();
-    for (let i = 0; i < spine.length; i++) {
-      const t = i / (spine.length - 1);
-      const off = 0.5 + Math.sin(t * Math.PI) * 4.6;
-      const x = spine[i][0];
-      const y = spine[i][1] - off;
-      if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
-    }
-    g.stroke();
-    // Head + two faint lantern eyes at +x.
-    const head = spine[spine.length - 1];
-    lantern(g, hue, head[0] - 1, head[1] - 2.5, 1.7);
-    lantern(g, hue, head[0] - 1, head[1] + 2.5, 1.7);
-  }
-
-  g.restore();
+  CREATURE_PAINTERS[archetype](g, hue, phase);
   return canvas;
 }
+
 
 /** Animation frames for an archetype + hue bucket (4-frame sine sway). */
 // Curated jewel palette instead of a full 360° rainbow: cool bioluminescent
@@ -1955,68 +2030,154 @@ function lerpAngle(a, b, k) {
   return a + d * k;
 }
 
-/* ---------- the sky: chain temperature rendered as weather ---------- */
+/**
+ * v7 tank: stratified deep-sea cross-section. Lit surface, drifting particulate,
+ * depth fog, rock strata walls, sediment floor. Money still falls as gold.
+ */
 
-// Continuous sky palette: deep night -> dawn -> bright teal day.
-const SKY_STOPS = [
-  { at: 0, top: [3, 6, 14], bottom: [5, 9, 20] },
-  { at: 0.5, top: [10, 22, 38], bottom: [13, 32, 51] },
-  { at: 1, top: [13, 58, 69], bottom: [18, 85, 94] },
-];
+/* ---------- the water: a stratified deep-sea cross-section ---------- */
 
-function skyColor(temp) {
-  let a = SKY_STOPS[0];
-  let b = SKY_STOPS[SKY_STOPS.length - 1];
-  for (let i = 0; i < SKY_STOPS.length - 1; i++) {
-    if (temp >= SKY_STOPS[i].at && temp <= SKY_STOPS[i + 1].at) {
-      a = SKY_STOPS[i];
-      b = SKY_STOPS[i + 1];
-      break;
-    }
-  }
-  const k = (temp - a.at) / Math.max(1e-6, b.at - a.at);
-  const mix = (u, v) => Math.round(u + (v - u) * k);
-  const top = `rgb(${mix(a.top[0], b.top[0])}, ${mix(a.top[1], b.top[1])}, ${mix(a.top[2], b.top[2])})`;
-  const bottom = `rgb(${mix(a.bottom[0], b.bottom[0])}, ${mix(a.bottom[1], b.bottom[1])}, ${mix(a.bottom[2], b.bottom[2])})`;
-  return { top, bottom };
+/** Deterministic 0..1 from an integer, so every viewer draws the same water. */
+function strataNoise(i) {
+  let x = (i ^ 0x9e3779b9) >>> 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
 }
 
-/** Soft vertical light column for the bright-day regime. */
-const BEAM_SPRITE = (() => {
-  const c = document.createElement('canvas');
-  c.width = 96;
-  c.height = 256;
-  const g = c.getContext('2d');
-  const vert = g.createLinearGradient(0, 0, 0, 256);
-  vert.addColorStop(0, 'rgba(140, 230, 220, 0.4)');
-  vert.addColorStop(1, 'rgba(140, 230, 220, 0)');
-  g.fillStyle = vert;
-  g.fillRect(0, 0, 96, 256);
-  g.globalCompositeOperation = 'destination-in';
-  const horiz = g.createLinearGradient(0, 0, 96, 0);
-  horiz.addColorStop(0, 'rgba(0,0,0,0)');
-  horiz.addColorStop(0.5, 'rgba(0,0,0,1)');
-  horiz.addColorStop(1, 'rgba(0,0,0,0)');
-  g.fillStyle = horiz;
-  g.fillRect(0, 0, 96, 256);
-  return c;
-})();
+function drawDepthFrame(now, chainTemp) {
+  const g = wctx;
+  const W = cssW;
+  const H = cssH;
+  const t = now / 1000;
 
-// Ambient layers are seeded, not random, so every viewer and every refresh
-// gets the same starfield and mote layout instead of a fresh roll.
-const ambientRnd = mulberry32(0x5eed1337);
+  // Water column: lit teal at the surface down to near-black at the floor.
+  const water = g.createLinearGradient(0, 0, 0, H);
+  water.addColorStop(0, '#0a2a33');
+  water.addColorStop(0.14, '#07202a');
+  water.addColorStop(0.5, '#04141c');
+  water.addColorStop(1, '#01060a');
+  g.fillStyle = water;
+  g.fillRect(0, 0, W, H);
 
-// Ambient motes: density follows chain temperature (sparse at night, thick
-// like a feeding bloom at day).
-const MOTES = [];
-for (let i = 0; i < 90; i++) {
-  MOTES.push({
-    fx: ambientRnd(),
-    fy: ambientRnd(),
-    size: 0.4 + ambientRnd() * 0.8,
-    speed: 0.1 + ambientRnd() * 0.4,
-    phase: ambientRnd() * Math.PI * 2,
-  });
+  // Surface: a bright band with two slow caustic waves.
+  const surf = g.createLinearGradient(0, 0, 0, H * 0.1);
+  const surfA = 0.22 + 0.4 * dayLight();
+  surf.addColorStop(0, hsl(186, 60, 46, surfA));
+  surf.addColorStop(1, hsl(186, 60, 46, 0));
+  g.fillStyle = surf;
+  g.fillRect(0, 0, W, H * 0.1);
+  g.strokeStyle = hsl(186, 80, 78, 0.14 + 0.26 * dayLight());
+  g.lineWidth = 1.2;
+  for (let k = 0; k < 2; k++) {
+    g.beginPath();
+    for (let x = 0; x <= W; x += 8) {
+      const y = 6 + k * 7 + Math.sin(x / 90 + t * (0.5 + k * 0.2)) * 2.4;
+      if (x === 0) g.moveTo(x, y);
+      else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+
+  // Depth strata: three fog bands that breathe very slowly.
+  for (let i = 0; i < 3; i++) {
+    const y = H * (0.32 + i * 0.22) + Math.sin(t * 0.07 + i * 2) * 6;
+    const band = g.createLinearGradient(0, y - 26, 0, y + 26);
+    band.addColorStop(0, hsl(200, 40, 60, 0));
+    band.addColorStop(0.5, hsl(200, 40, 62, 0.06));
+    band.addColorStop(1, hsl(200, 40, 60, 0));
+    g.fillStyle = band;
+    g.fillRect(0, y - 26, W, 52);
+  }
+
+  // Rock strata walls: layered cut-away bands on both edges.
+  for (const side of [0, 1]) {
+    const w = W * 0.075;
+    for (let i = 0; i < 9; i++) {
+      const y0 = (H / 9) * i + strataNoise(i * 7 + side * 31) * 14;
+      const h = H / 9 + 6;
+      const l = 8 + strataNoise(i * 13 + side * 17) * 7;
+      g.fillStyle = hsl(205, 22, l, 0.9);
+      g.beginPath();
+      if (side === 0) {
+        g.moveTo(0, y0);
+        g.quadraticCurveTo(w * (0.42 + strataNoise(i + side) * 0.3), y0 + h * 0.5, 0, y0 + h);
+      } else {
+        g.moveTo(W, y0);
+        g.quadraticCurveTo(W - w * (0.42 + strataNoise(i + side) * 0.3), y0 + h * 0.5, W, y0 + h);
+      }
+      g.closePath();
+      g.fill();
+      // A faint lighter seam between strata.
+      g.strokeStyle = hsl(190, 35, 46, 0.2);
+      g.lineWidth = 1;
+      g.beginPath();
+      if (side === 0) g.moveTo(0, y0 + 1);
+      else g.moveTo(W, y0 + 1);
+      if (side === 0) g.lineTo(w * 0.5, y0 + h * 0.5);
+      else g.lineTo(W - w * 0.5, y0 + h * 0.5);
+      g.stroke();
+    }
+  }
+
+  // Sediment floor with two rock silhouettes.
+  const floor = g.createLinearGradient(0, H * 0.9, 0, H);
+  floor.addColorStop(0, hsl(210, 25, 10, 0));
+  floor.addColorStop(1, hsl(210, 25, 8, 0.95));
+  g.fillStyle = floor;
+  g.fillRect(0, H * 0.9, W, H * 0.1);
+  g.fillStyle = hsl(210, 20, 7, 0.9);
+  for (const [fx, fr] of [[0.22, 46], [0.78, 62]]) {
+    g.beginPath();
+    g.ellipse(W * fx, H + fr * 0.35, fr, fr * 0.55, 0, Math.PI, TAU);
+    g.fill();
+  }
+
+  // Marine snow: density follows chain activity, fall is slow and seeded.
+  const motes = Math.round(40 + chainTemp * 90);
+  g.fillStyle = hsl(190, 40, 80, 0.16);
+  for (let i = 0; i < motes; i++) {
+    const seed = strataNoise(i);
+    const x = (seed * W + Math.sin(t * 0.3 + i) * 12) % W;
+    const y = (strataNoise(i + 500) * H + t * (6 + seed * 10)) % H;
+    const r = 0.6 + strataNoise(i + 900) * 1.1;
+    g.globalAlpha = 0.08 + strataNoise(i + 40) * 0.14;
+    g.beginPath();
+    g.arc(x, y, r, 0, TAU);
+    g.fill();
+  }
+  g.globalAlpha = 1;
+
+  // Money falls as gold light shafts from the surface. Three nested trapezoids
+  // fake a soft edge; a real blur or an erase pass would cost the whole frame.
+  const shafts = 5;
+  for (let i = 0; i < shafts; i++) {
+    const x = W * (0.15 + 0.7 * strataNoise(i + 77)) + Math.sin(t * 0.2 + i) * 20;
+    const w = 12 + strataNoise(i + 3) * 24;
+    const a = (0.028 + 0.02 * Math.sin(t * 0.6 + i * 2)) * (0.6 + chainTemp * 0.6);
+    for (let k = 0; k < 3; k++) {
+      const ww = w * (1 - k * 0.3);
+      const shaft = g.createLinearGradient(0, 0, 0, H * 0.85);
+      shaft.addColorStop(0, hsl(42, 90, 64, Math.max(0, a * (0.5 + k * 0.35))));
+      shaft.addColorStop(0.7, hsl(42, 90, 64, Math.max(0, a * 0.25 * (0.5 + k * 0.35))));
+      shaft.addColorStop(1, hsl(42, 90, 64, 0));
+      g.fillStyle = shaft;
+      g.beginPath();
+      g.moveTo(x - ww * 0.22, 0);
+      g.lineTo(x + ww * 0.22, 0);
+      g.lineTo(x + ww, H * 0.85);
+      g.lineTo(x - ww, H * 0.85);
+      g.closePath();
+      g.fill();
+    }
+  }
+
+  // Depth vignette so the middle of the tank stays the brightest read.
+  const vig = g.createRadialGradient(W / 2, H * 0.42, H * 0.2, W / 2, H * 0.5, H * 0.95);
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, 'rgba(0,0,0,0.55)');
+  g.fillStyle = vig;
+  g.fillRect(0, 0, W, H);
 }
 
 /* ---------- day/night cycle: slow solar drift bent by chain heat ---------- */
@@ -2025,18 +2186,6 @@ const DAY_MS = 5 * 60 * 1000;
 function dayLight() {
   const phase = ((Date.now() % DAY_MS) / DAY_MS + (latestSnap?.chainTemp ?? 0.5) * 0.1) % 1;
   return 0.5 - 0.5 * Math.cos(phase * Math.PI * 2);
-}
-
-const starRnd = mulberry32(0x57a25);
-const STARS = [];
-for (let i = 0; i < 70; i++) {
-  STARS.push({
-    fx: starRnd(),
-    fy: starRnd() * 0.85,
-    size: 0.5 + starRnd() * 1.1,
-    speed: 0.5 + starRnd(),
-    phase: starRnd() * Math.PI * 2,
-  });
 }
 
 function render() {
@@ -2080,171 +2229,15 @@ function render() {
 
   const ct = latestSnap.chainTemp ?? 0.5;
 
-  // 1) Sky: chain temperature as weather, dimmed toward true night by the
-  //    solar cycle. The translucent fill doubles as the trail fade, so
-  //    creature trails melt into the current sky.
-  const dl = dayLight();
+  // 1) Water: one stratified deep-sea cross-section, painted opaque every
+  //    frame. The depth frame owns the whole background (surface light, strata
+  //    fog, rock walls, sediment, marine snow, money shafts), so creature
+  //    motion leaves no trails and every viewer sees the same water.
   wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   wctx.globalAlpha = 1;
-  const sky = skyColor(Math.min(1, ct * (0.4 + 0.6 * dl)));
-  const skyGrad = wctx.createLinearGradient(0, 0, 0, cssH);
-  skyGrad.addColorStop(0, sky.top);
-  skyGrad.addColorStop(1, sky.bottom);
-  wctx.globalAlpha = 0.3;
-  wctx.fillStyle = skyGrad;
-  wctx.fillRect(0, 0, cssW, cssH);
-  wctx.globalAlpha = 1;
 
-  // Starfield emerges as the sun sets, under a deep indigo night wash.
-  if (dl < 0.6) {
-    const night = (0.6 - dl) / 0.6;
-    wctx.fillStyle = `rgba(4, 6, 18, ${0.4 * night})`;
-    wctx.fillRect(0, 0, cssW, cssH);
-    for (const st of STARS) {
-      wctx.globalAlpha = night * (0.3 + 0.6 * (0.5 + 0.5 * Math.sin((now / 900) * st.speed + st.phase)));
-      wctx.drawImage(DOTS.white, st.fx * cssW - 2.5, st.fy * cssH - 2.5, 5 * st.size, 5 * st.size);
-    }
-    wctx.globalAlpha = 1;
-  } else if (dl > 0.55) {
-    const warm = (dl - 0.55) / 0.45;
-    const noonGlow = wctx.createLinearGradient(0, 0, 0, cssH);
-    noonGlow.addColorStop(0, `rgba(150, 235, 220, ${0.08 * warm})`);
-    noonGlow.addColorStop(1, 'rgba(150, 235, 220, 0)');
-    wctx.fillStyle = noonGlow;
-    wctx.fillRect(0, 0, cssW, cssH);
-  }
 
-  // 2) Nebula texture (procedural, baked) + light beams + ambient motes.
-  wctx.globalAlpha = 0.22 + 0.08 * Math.sin(now / 4000);
-  wctx.drawImage(nebula, 0, 0, cssW, cssH);
-  wctx.globalAlpha = 1;
-
-  if (ct > 0.55 && dl > 0.3) {
-    const beamAlpha = (ct - 0.55) * 0.9 * ((dl - 0.3) / 0.7);
-    for (let i = 0; i < 4; i++) {
-      const bx = (0.18 + i * 0.22 + 0.02 * Math.sin(now / 2600 + i)) * cssW;
-      wctx.globalAlpha = beamAlpha * (0.6 + 0.4 * Math.sin(now / 1800 + i * 1.7));
-      wctx.drawImage(BEAM_SPRITE, bx - 48, -20, 96, cssH * 0.9);
-    }
-    wctx.globalAlpha = 1;
-  }
-
-  const moteCount = Math.floor(ct * MOTES.length);
-  for (let i = 0; i < moteCount; i++) {
-    const mo = MOTES[i];
-    const my = ((mo.fy - (now * mo.speed * 0.00002)) % 1 + 1) % 1;
-    const mx = mo.fx + 0.01 * Math.sin(now / 2000 + mo.phase);
-    wctx.globalAlpha = 0.35 + 0.3 * Math.sin(now / 1300 + mo.phase);
-    wctx.drawImage(DOTS.white, mx * cssW - 4, my * cssH - 4, 8 * mo.size, 8 * mo.size);
-  }
-  wctx.globalAlpha = 1;
-
-/* ---------- abyss frame: trench walls, portal ring, gold data rain ---------- */
-
-const FRAME = buildFrameGeometry(0xab155a1);
-const CANYON_L = FRAME.canyonL;
-const CANYON_R = FRAME.canyonR;
-const RAIN_COLS = FRAME.rainCols;
-const NODES = FRAME.nodes;
-const JELLIES = FRAME.jellies;
-
-/**
- * The trench the tank sits in, in the token avatar's language: dark canyon
- * walls frame the water, a portal ring at the surface pours the payment flow
- * down as gold data rain, and the observatory's graph drifts on the right wall
- * among jellyfish bells. Seeded once, so every viewer sees the same trench.
- */
-function drawAbyssFrame(now, ct) {
-  wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  for (const [side, profile] of [['L', CANYON_L], ['R', CANYON_R]]) {
-    wctx.beginPath();
-    if (side === 'L') wctx.moveTo(0, 0); else wctx.moveTo(cssW, 0);
-    for (let i = 0; i < profile.length; i++) {
-      const y = (i / (profile.length - 1)) * cssH;
-      const x = side === 'L' ? profile[i] * cssW : cssW - profile[i] * cssW;
-      wctx.lineTo(x, y);
-    }
-    if (side === 'L') wctx.lineTo(0, cssH); else wctx.lineTo(cssW, cssH);
-    wctx.closePath();
-    wctx.fillStyle = 'rgba(2, 6, 9, 0.92)';
-    wctx.fill();
-    wctx.strokeStyle = 'rgba(111, 214, 255, 0.10)';
-    wctx.lineWidth = 1;
-    wctx.stroke();
-  }
-  const px0 = 0.57 * cssW;
-  const py0 = -0.06 * cssH;
-  for (let k = 0; k < 3; k++) {
-    wctx.beginPath();
-    wctx.ellipse(px0, py0, (0.16 + k * 0.05) * cssW, (0.035 + k * 0.012) * cssH, 0, 0, TAU);
-    wctx.strokeStyle = `rgba(233, 161, 63, ${0.16 - k * 0.04})`;
-    wctx.lineWidth = 1;
-    wctx.stroke();
-  }
-  const rainA = 0.10 + 0.35 * ct;
-  for (const col of RAIN_COLS) {
-    const x = col.fx * cssW;
-    const span = cssH * 0.85;
-    const off = (now * col.speed + col.phase) % 1;
-    for (let d = 0; d < 26; d++) {
-      const t = (off + d / 26) % 1;
-      const y = t * span;
-      const fade = Math.sin(t * Math.PI);
-      const sz = col.w * (0.6 + fade);
-      wctx.globalAlpha = rainA * fade * (0.5 + 0.5 * Math.sin(now / 700 + d + col.phase));
-      wctx.fillStyle = d % 5 === 0 ? '#ffcc6f' : '#e9a13f';
-      wctx.fillRect(x - sz / 2, y, sz, sz * 1.6);
-    }
-  }
-  wctx.globalAlpha = 1;
-  wctx.strokeStyle = 'rgba(111, 214, 255, 0.10)';
-  wctx.lineWidth = 0.6;
-  for (let i = 0; i < NODES.length; i++) {
-    for (let j = i + 1; j < NODES.length; j++) {
-      const a = NODES[i];
-      const b = NODES[j];
-      const dx = (a.fx - b.fx) * cssW;
-      const dy = (a.fy - b.fy) * cssH;
-      if (dx * dx + dy * dy < (0.12 * cssW) ** 2) {
-        wctx.beginPath();
-        wctx.moveTo(a.fx * cssW, a.fy * cssH);
-        wctx.lineTo(b.fx * cssW, b.fy * cssH);
-        wctx.stroke();
-      }
-    }
-  }
-  for (const n of NODES) {
-    const tw = 0.5 + 0.5 * Math.sin(now / 1200 + n.phase);
-    wctx.globalAlpha = 0.25 + 0.35 * tw;
-    wctx.fillStyle = '#7fd8ff';
-    wctx.beginPath();
-    wctx.arc(n.fx * cssW, n.fy * cssH, n.r * (0.8 + 0.4 * tw), 0, TAU);
-    wctx.fill();
-  }
-  for (const j of JELLIES) {
-    const y = (((j.fy - now * j.speed) % 1) + 1) % 1 * cssH;
-    const x = j.fx * cssW + 6 * Math.sin(now / 2600 + j.phase);
-    const pulse = 0.85 + 0.15 * Math.sin(now / 900 + j.phase);
-    wctx.globalAlpha = 0.3;
-    wctx.strokeStyle = '#9fe8ff';
-    wctx.lineWidth = 1;
-    wctx.beginPath();
-    wctx.arc(x, y, j.s * pulse, Math.PI, 0);
-    wctx.stroke();
-    for (let t = -2; t <= 2; t++) {
-      wctx.beginPath();
-      wctx.moveTo(x + t * j.s * 0.35, y);
-      wctx.quadraticCurveTo(
-        x + t * j.s * 0.5, y + j.s * 1.2,
-        x + t * j.s * 0.3 + 2 * Math.sin(now / 700 + t), y + j.s * 2.2,
-      );
-      wctx.stroke();
-    }
-  }
-  wctx.globalAlpha = 1;
-}
-
-  drawAbyssFrame(now, ct);
+  drawDepthFrame(now, ct);
 
   // 3) Market volatility shimmer (kept faint on purpose).
   const m = latestSnap.marketTemp ?? 0;
@@ -2394,7 +2387,7 @@ function drawAbyssFrame(now, ct) {
       // creature and made the whole tank stutter, so hunger stays cheap.
       if (!c.hungry) {
         wctx.globalCompositeOperation = 'lighter';
-        wctx.globalAlpha = 0.3 * vib;
+        wctx.globalAlpha = 0.16 * vib;
         wctx.drawImage(creatureGlow(c.spriteKey), -48, -48, 96, 96);
         wctx.globalCompositeOperation = 'source-over';
       }

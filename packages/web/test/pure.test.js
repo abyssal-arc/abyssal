@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-  mulberry32, hashSeed, mixSeed, unitNoise, buildFrameGeometry,
+  mulberry32, hashSeed, mixSeed, unitNoise,
 } from '../src/geom.js';
 import { fmtUsd, shortAddr, hsla } from '../src/format.js';
 
@@ -24,22 +24,6 @@ test('hash seeds are stable and discriminating', () => {
   const n = unitNoise(42);
   assert.ok(n >= 0 && n <= 1);
   assert.equal(n, unitNoise(42));
-});
-
-test('trench geometry is seeded, bounded and non-degenerate', () => {
-  const g = buildFrameGeometry(0xab155a1);
-  assert.deepEqual(g, buildFrameGeometry(0xab155a1), 'same seed, same trench');
-  assert.notDeepEqual(g, buildFrameGeometry(1), 'different seed, different trench');
-  for (const w of [...g.canyonL, ...g.canyonR]) assert.ok(w > 0 && w < 0.2);
-  for (const c of g.rainCols) {
-    assert.ok(c.fx > 0.4 && c.fx < 0.75);
-    assert.ok(c.speed > 0 && c.w >= 1 && c.w <= 3);
-  }
-  for (const n of g.nodes) {
-    assert.ok(n.fx >= 0.72 && n.fx <= 0.98);
-    assert.ok(n.fy >= 0.25 && n.fy <= 0.91);
-  }
-  for (const j of g.jellies) assert.ok(j.s >= 6 && j.s <= 16);
 });
 
 test('format helpers', () => {

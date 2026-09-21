@@ -38,38 +38,3 @@ export function unitNoise(key) {
   return ((t ^ (t >>> 15)) >>> 0) / 4294967296;
 }
 
-/**
- * The trench the tank sits in: canyon wall profiles (normalized widths per
- * row), gold rain columns, constellation nodes and jellyfish bells. Built once
- * per seed; the renderer only animates these, never re-rolls them.
- */
-export function buildFrameGeometry(seed) {
-  const rnd = mulberry32(seed);
-  const canyonL = [];
-  const canyonR = [];
-  for (let i = 0; i <= 14; i++) {
-    canyonL.push(0.035 + 0.05 * Math.sin(i * 1.7) ** 2 + rnd() * 0.03);
-    canyonR.push(0.035 + 0.05 * Math.cos(i * 1.3) ** 2 + rnd() * 0.03);
-  }
-  const rainCols = [];
-  for (let i = 0; i < 9; i++) {
-    rainCols.push({
-      fx: 0.42 + rnd() * 0.3,
-      speed: 0.00006 + rnd() * 0.00008,
-      phase: rnd() * 10,
-      w: 1 + rnd() * 2,
-    });
-  }
-  const nodes = [];
-  for (let i = 0; i < 16; i++) {
-    nodes.push({ fx: 0.72 + rnd() * 0.26, fy: 0.25 + rnd() * 0.65, r: 1.5 + rnd() * 3, phase: rnd() * 10 });
-  }
-  const jellies = [];
-  for (let i = 0; i < 7; i++) {
-    jellies.push({
-      fx: 0.15 + rnd() * 0.7, fy: 0.3 + rnd() * 0.6,
-      s: 6 + rnd() * 10, phase: rnd() * 10, speed: 0.00002 + rnd() * 0.00003,
-    });
-  }
-  return { canyonL, canyonR, rainCols, nodes, jellies };
-}
