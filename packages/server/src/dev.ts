@@ -48,14 +48,14 @@ function loadSnapshot(): string | undefined {
 // ledger into the same interface instead.
 const burnsFile = process.env.USED_BURNS_FILE ?? join(repoRoot, '.data', 'used-burns.txt');
 setBurnLedger({
-  load: () => {
+  load: async () => {
     try {
       return readFileSync(burnsFile, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean);
     } catch {
       return [];
     }
   },
-  append: (hash) => {
+  add: (hash: string) => {
     try {
       mkdirSync(dirname(burnsFile), { recursive: true });
       appendFileSync(burnsFile, `${hash}\n`);
@@ -66,7 +66,25 @@ setBurnLedger({
 });
 
 const snapshot = process.env.FRESH_WORLD ? undefined : loadSnapshot();
+const ledgerFile = join(repoRoot, '.data', 'ledger.json');
 const app = createApp({
+  store: {
+    load: async () => {
+      try {
+        return JSON.parse(readFileSync(ledgerFile, 'utf8'));
+      } catch {
+        return {};
+      }
+    },
+    save: (state) => {
+      try {
+        mkdirSync(dirname(ledgerFile), { recursive: true });
+        writeFileSync(ledgerFile, JSON.stringify(state));
+      } catch (err) {
+        console.warn('[abyssal] ledger write failed:', err);
+      }
+    },
+  },
   static: (pathname, headers) => serveStatic(webRoot, pathname, headers),
   seed: Number(process.env.SEED ?? 1337),
   snapshot,

@@ -18,6 +18,8 @@ import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
   ABYS_PRICES,
   burnOffer,
+  hydrateReceipts,
+  recordBurnReceipt,
   CHAIN_ID,
   explorerTxUrl,
   NETWORK,
@@ -25,6 +27,11 @@ import {
   verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
+
+export interface WorldStore {
+  load(): Promise<{ passes?: [string, number][]; burners?: [string, { total: number; last: number }][] }>;
+  save(s: { passes: [string, number][]; burners: [string, { total: number; last: number }][] }): void;
+}
 
 export interface AppOptions {
   seed?: number;
@@ -42,6 +49,12 @@ export interface AppOptions {
    * falls back to .env and then to the public RPC.
    */
   rpc?: string;
+  /**
+   * Durable home for day passes and burner totals. Memory alone loses them on
+   * an isolate restart; the node adapter uses a json file, the Worker uses the
+   * Durable Object's storage.
+   */
+  store?: WorldStore;
   /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
@@ -425,7 +438,7 @@ export function createApp(options: AppOptions = {}) {
 
   function buildIntervention(body: Record<string, unknown>): Intervention | null {
     const type = body.type as InterventionType;
-    if (type === 'bloom' || type === 'drought' || type === 'pass') {
+    if (type === 'bloom' || type === 'drought') {
       return { type };
     }
     if (type === 'feed' || type === 'poison') {
@@ -597,8 +610,10 @@ export function createApp(options: AppOptions = {}) {
       // Validate the request fully before touching the payment: a typo in
       // x/y/radius must cost nothing, so the burn receipt is only consumed
       // once we know the intervention can actually be applied.
-      const intervention = buildIntervention(body);
-      if (!intervention) {
+      // A pass carries no coordinates and never reaches the simulation.
+      const isPass = type === 'pass';
+      const intervention = isPass ? null : buildIntervention(body);
+      if (!isPass && !intervention) {
         return json({ error: 'invalid intervention params (need x, y, radius 10..300 inside the world)' }, 400);
       }
       const offer = await burnOffer(rpcUrl, type, options.token);
@@ -616,14 +631,32 @@ export function createApp(options: AppOptions = {}) {
       if (!verdict.ok) {
         return json({ error: 'payment required', accepts: [offer], reason: verdict.reason }, 402);
       }
-      noteBurn(verdict.payer, Number(ABYS_PRICES[type]));
-      if (type === 'pass' && verdict.payer) {
-        passes.set(verdict.payer, (Math.floor(world.tick / world.config.ticksPerDay) + 1) * world.config.ticksPerDay);
+      // A pass changes no ecology: grant it and stop, so the burn can never
+      // be spent on a simulation action by accident.
+      if (type === 'pass') {
+        recordBurnReceipt(txHash);
+        noteBurn(verdict.payer, Number(ABYS_PRICES.pass));
+        if (verdict.payer) {
+          passes.set(verdict.payer, (Math.floor(world.tick / world.config.ticksPerDay) + 1) * world.config.ticksPerDay);
+        }
+        saveStore();
+        return json({
+          ok: true,
+          receipt: 'pass: day pass active until the day rolls',
+          until: verdict.payer ? passes.get(verdict.payer) : null,
+        });
       }
-      const result = applyIntervention(world, intervention, {
+      // Non-null here: the pass branch returned above, and every other type
+      // passed buildIntervention's validation.
+      const result = applyIntervention(world, intervention as NonNullable<typeof intervention>, {
         payer: verdict.payer,
         paid: `${ABYS_PRICES[type]} ABYS`,
       });
+      // Record only after the paid action succeeded: a burned receipt that
+      // bought nothing must stay spendable.
+      recordBurnReceipt(txHash);
+      noteBurn(verdict.payer, Number(ABYS_PRICES[type]));
+      saveStore();
       return json({
         ok: true,
         receipt: result.message,
@@ -642,8 +675,30 @@ export function createApp(options: AppOptions = {}) {
     return json({ error: 'not found' }, 404);
   }
 
+  let hydrated: Promise<void> | null = null;
+  function hydrate(): Promise<void> {
+    hydrated ??= (async () => {
+      await hydrateReceipts();
+      if (!options.store) return;
+      const s = await options.store.load();
+      for (const [addr, until] of s.passes ?? []) passes.set(addr, until);
+      for (const [addr, b] of s.burners ?? []) burners.set(addr, b);
+    })();
+    return hydrated;
+  }
+  function saveStore(): void {
+    options.store?.save({
+      passes: [...passes.entries()],
+      burners: [...burners.entries()],
+    });
+  }
+
   return {
-    fetch,
+    hydrate,
+    fetch: async (req: Request) => {
+      await hydrate();
+      return fetch(req);
+    },
     world,
     /**
      * Advance the world to wall-clock now for runtimes that cannot hold a

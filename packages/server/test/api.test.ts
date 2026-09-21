@@ -30,21 +30,25 @@ process.env.ALLOW_DEBUG_TICK ??= '1';
 // the feed price, so the route logic (not the verifier) is what is under test.
 const DEC18 = '0x' + (18).toString(16).padStart(64, '0');
 
-/** RPC stub that answers decimals() and whatever the receipt handler returns. */
-function rpcStub(answer: (data: string | undefined) => unknown) {
+/** RPC stub: decimals(), a confirmed head, and whatever the receipt handler returns. */
+function rpcStub(answer: (method: string, data: string | undefined) => unknown) {
   return createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
-    const data = (JSON.parse(body || '{}') as { params?: [{ data?: string }] })?.params?.[0]?.data;
+    const parsed = JSON.parse(body || '{}') as { method?: string; params?: [{ data?: string }] };
+    const data = parsed.params?.[0]?.data;
+    const result =
+      parsed.method === 'eth_blockNumber' ? '0x100' : answer(parsed.method ?? '', data);
     res.setHeader('content-type', 'application/json');
-    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: answer(data) }));
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
   });
 }
 
-const receiptStub = rpcStub((data) => (data === '0x313ce567'
+const receiptStub = rpcStub((method, data) => (data === '0x313ce567'
   ? DEC18
   : {
       status: '0x1',
+      blockNumber: '0x80',
       logs: [{
         address: process.env.ABYS_TOKEN_ADDRESS,
         topics: [
@@ -121,11 +125,11 @@ test('/intervene answers 503 until the token is deployed', async () => {
 });
 
 test('a burn receipt pays: Transfer to zero for at least the asked amount', async () => {
-  const { verifyBurnReceipt, burnOffer, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
+  const { verifyBurnReceipt, burnOffer, recordBurnReceipt, hydrateReceipts, TRANSFER_TOPIC, BURN_SINK } = await import('../src/payments.js');
   const token = process.env.ABYS_TOKEN_ADDRESS as string;
   const payer = '0x' + 'ab'.repeat(20);
   const PRICE = 100_000n * 10n ** 18n; // 100,000 ABYS at 18 decimals
-  const stub = (receipt: unknown) => rpcStub((data) => (data === '0x313ce567' ? DEC18 : receipt));
+  const stub = (receipt: unknown) => rpcStub((method, data) => (data === '0x313ce567' ? DEC18 : receipt));
   const burnLog = (to: string, value: bigint, addr = token) => ({
     address: addr,
     topics: [TRANSFER_TOPIC, `0x${payer.slice(2).padStart(64, '0')}`, to],
@@ -142,8 +146,8 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   };
 
   const offer = (await burnOffer(`http://127.0.0.1:1`, 'feed'))!; // decimals cached from the stubs below
-  const v = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a1'.repeat(32));
-  assert.equal(v.ok, true);
+  const v = await run({ status: '0x1', blockNumber: '0x80', logs: [burnLog(BURN_SINK, PRICE)] }, '0x' + 'a1'.repeat(32));
+  assert.equal(v.ok, true, `zero-sink burn rejected: ${v.reason}`);
   assert.equal(v.payer, payer);
 
   const v2 = await run({ status: '0x1', logs: [burnLog(payer, PRICE)] }, '0x' + 'a2'.repeat(32));
@@ -156,13 +160,28 @@ test('a burn receipt pays: Transfer to zero for at least the asked amount', asyn
   assert.equal(v4.ok, false);
   assert.equal(v4.reason, 'transaction reverted');
   // The blackhole convention counts as burning too.
-  const v5 = await run({ status: '0x1', logs: [burnLog(DEAD_SINK, PRICE)] }, '0x' + 'a6'.repeat(32));
-  assert.equal(v5.ok, true, 'transfer to the blackhole address is a burn');
+  const v5 = await run({ status: '0x1', blockNumber: '0x80', logs: [burnLog(DEAD_SINK, PRICE)] }, '0x' + 'a6'.repeat(32));
+  assert.equal(v5.ok, true, `blackhole burn rejected: ${v5.reason}`);
+  // An unconfirmed receipt is spendable by nobody.
+  const pendingStub = rpcStub((method, data) => (data === '0x313ce567'
+    ? DEC18
+    : { status: '0x1', blockNumber: '0x100', logs: [burnLog(BURN_SINK, PRICE)] }));
+  await new Promise<void>((r) => pendingStub.listen(0, '127.0.0.1', () => r()));
+  const pending = await verifyBurnReceipt(
+    `http://127.0.0.1:${(pendingStub.address() as AddressInfo).port}`,
+    offer,
+    '0x' + 'a7'.repeat(32),
+  );
+  assert.equal(pending.ok, false);
+  assert.equal(pending.reason, 'receipt pending');
+  pendingStub.close();
 
   const hash = '0x' + 'a5'.repeat(32);
-  const first = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
-  const second = await run({ status: '0x1', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
-  assert.equal(first.ok, true);
+  const first = await run({ status: '0x1', blockNumber: '0x80', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
+  assert.equal(first.ok, true, `replay pair rejected: ${first.reason}`);
+  // verify no longer records; the handler records after the action succeeds.
+  recordBurnReceipt(hash);
+  const second = await run({ status: '0x1', blockNumber: '0x80', logs: [burnLog(BURN_SINK, PRICE)] }, hash);
   assert.equal(second.ok, false, 'one burn buys one intervention');
   assert.equal(second.reason, 'receipt already used');
 });
@@ -609,17 +628,18 @@ test('invalid params are rejected before the burn receipt is consumed', async ()
 });
 
 test('used burn receipts persist through the ledger, so restarts cannot replay', async () => {
-  const { setBurnLedger, verifyBurnReceipt, burnOffer } = await import('../src/payments.js');
+  const { setBurnLedger, verifyBurnReceipt, burnOffer, recordBurnReceipt, hydrateReceipts } = await import('../src/payments.js');
   const file = join(tmpdir(), `abyssal-burns-${process.pid}-${Date.now()}.txt`);
   const mk = () => ({
-    load: () => {
+    load: async () => {
       try { return readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { return []; }
     },
-    append: (h: string) => appendFileSync(file, `${h}\n`),
+    add: (h: string) => appendFileSync(file, `${h}\n`),
   });
   setBurnLedger(mk());
   const srv = rpcStub(() => ({
     status: '0x1',
+    blockNumber: '0x80',
     logs: [{
       address: process.env.ABYS_TOKEN_ADDRESS,
       topics: [TRANSFER_TOPIC, `0x${'cd'.repeat(20).padStart(64, '0')}`, BURN_SINK],
@@ -634,9 +654,12 @@ test('used burn receipts persist through the ledger, so restarts cannot replay',
     const hash = '0x' + 'b8'.repeat(32);
     const first = await verifyBurnReceipt(url, offer, hash);
     assert.equal(first.ok, true);
+    // Recording happens after the paid action succeeds, not inside verify.
+    recordBurnReceipt(hash);
     assert.ok(readFileSync(file, 'utf8').includes(hash), 'the used hash must hit the ledger file');
     // A fresh boot reloads the ledger: the same burn is dead on arrival.
     setBurnLedger(mk());
+    await hydrateReceipts();
     const replayed = await verifyBurnReceipt(url, offer, hash);
     assert.equal(replayed.ok, false);
     assert.equal(replayed.reason, 'receipt already used');
@@ -644,4 +667,30 @@ test('used burn receipts persist through the ledger, so restarts cannot replay',
     srv.close();
     rmSync(file, { force: true });
   }
+});
+
+test('passes and burners survive a restart through the store', async () => {
+  const mem = { passes: [] as [string, number][], burners: [] as [string, { total: number; last: number }][] };
+  const store = {
+    load: async () => mem,
+    save: (s: typeof mem) => { mem.passes = s.passes; mem.burners = s.burners; },
+  };
+  // The shared receipt stub burns from this address, so the pass lands on it.
+  const payer = '0x' + 'ab'.repeat(20);
+  const first = createApp({ seed: 1, store });
+  const hash = '0x' + 'd1'.repeat(32);
+  const grant = await first.fetch(
+    new Request('http://localhost/intervene', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-payment-tx': hash },
+      body: JSON.stringify({ type: 'pass' }),
+    }),
+  );
+  assert.equal(grant.status, 200, 'a verified burn must grant the pass');
+  // A fresh isolate hydrates from the same store: the pass and the recorded
+  // receipt both survive.
+  const second = createApp({ seed: 1, store });
+  await second.hydrate();
+  const exportRes = await second.fetch(new Request(`http://localhost/export?pass=${payer}`));
+  assert.equal(exportRes.status, 200, 'the pass must survive a restart');
 });

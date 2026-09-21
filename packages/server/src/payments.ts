@@ -31,6 +31,33 @@ export const DEAD_SINK = '0x0000000000000000000000000000000000000000000000000000
 /** Both conventions count as burning: contract burn() and blackhole transfer. */
 const SINKS = new Set([BURN_SINK, DEAD_SINK]);
 
+/**
+ * Where used receipts live. Memory alone loses them on an isolate restart, so
+ * the node adapter and the Durable Object each plug a durable backend in;
+ * recording happens only after the paid action succeeded (see handler).
+ */
+export interface BurnLedger {
+  load(): Promise<string[]>;
+  add(hash: string): void;
+}
+let ledger: BurnLedger | null = null;
+const usedReceipts = new Set<string>();
+
+export function setBurnLedger(next: BurnLedger): void {
+  ledger = next;
+}
+export async function hydrateReceipts(): Promise<void> {
+  if (!ledger) return;
+  for (const h of await ledger.load()) usedReceipts.add(h);
+}
+export function isBurnRecorded(hash: string): boolean {
+  return usedReceipts.has(hash);
+}
+export function recordBurnReceipt(hash: string): void {
+  usedReceipts.add(hash);
+  ledger?.add(hash);
+}
+
 /** ABYS prices per intervention, in whole tokens; base units come from the token's decimals(). */
 export const ABYS_PRICES: Record<InterventionType, string> = {
   feed: '100000',
@@ -63,7 +90,6 @@ export interface BurnOffer {
 }
 
 let metaCache: { address: string; decimals: number; at: number } | null = null;
-
 /**
  * Address plus decimals of the payment token, read from the chain and cached
  * for five minutes. Assuming a fixed decimals would let someone burn a dust
@@ -131,32 +157,6 @@ async function rpcCall(rpcUrl: string, method: string, params: unknown[]): Promi
 }
 
 /**
- * Hashes of burn receipts already accepted. Memory alone would let a restart
- * replay an old burn, so production wires a ledger (see setBurnLedger, which
- * dev.ts points at .data/used-burns.txt); without one the set stays in memory
- * and the amount check below is the only replay guard.
- */
-const usedReceipts = new Set<string>();
-
-export interface BurnLedger {
-  load(): string[];
-  append(hash: string): void;
-}
-
-let ledger: BurnLedger | null = null;
-
-/** Attach persistent storage for used receipts; call once at boot. */
-export function setBurnLedger(next: BurnLedger): void {
-  ledger = next;
-  for (const h of next.load()) usedReceipts.add(h);
-}
-
-function remember(hash: string): void {
-  usedReceipts.add(hash);
-  ledger?.append(hash);
-}
-
-/**
  * Accept a payment iff `txHash` is a successful transaction whose logs contain
  * an ABYS burn (Transfer to the zero address) of at least `offer.amount`.
  * Returns who burned, so the response can name the payer.
@@ -177,6 +177,14 @@ export async function verifyBurnReceipt(
   }
   if (!receipt) return { ok: false, reason: 'receipt not found' };
   if (receipt.status !== '0x1') return { ok: false, reason: 'transaction reverted' };
+  // A receipt that is not final yet must not be spendable: wait for at least
+  // one confirmation so a reorged payment can never buy an intervention.
+  const head = await rpcCall(rpcUrl, 'eth_blockNumber', []);
+  const latest = typeof head === 'string' ? parseInt(head, 16) : NaN;
+  const at = typeof receipt.blockNumber === 'string' ? parseInt(receipt.blockNumber, 16) : NaN;
+  if (!Number.isFinite(latest) || !Number.isFinite(at) || latest - at < 1) {
+    return { ok: false, reason: 'receipt pending' };
+  }
   const token = offer.asset.toLowerCase();
   for (const log of receipt.logs ?? []) {
     if (String(log.address).toLowerCase() !== token) continue;
@@ -185,7 +193,7 @@ export async function verifyBurnReceipt(
     if (!SINKS.has(String(topics[2]).toLowerCase())) continue;
     const value = BigInt(log.data ?? '0x0');
     if (value < BigInt(offer.amount)) continue;
-    remember(key);
+    // Recording happens in the handler, after the paid action succeeded.
     return { ok: true, payer: `0x${String(topics[1]).slice(-40)}`.toLowerCase() };
   }
   return { ok: false, reason: 'no burn of the asked amount in this transaction' };

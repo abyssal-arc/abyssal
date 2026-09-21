@@ -218,7 +218,7 @@ tank it is looking at.
 | GET | `/observe` | Arc USDC flow observatory: window stats, endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
 | POST | `/intervene` | intervention gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
-| POST | `/tick` | debug: advance one tick manually |
+| POST | `/tick` | debug only: disabled unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
 | GET | `/ui` | Redirects to `/` |
 
 ## Interventions: burn-to-pay

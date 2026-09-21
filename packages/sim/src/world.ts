@@ -80,8 +80,7 @@ export type Intervention =
   | { type: 'feed'; x: number; y: number; radius: number; amount?: number }
   | { type: 'poison'; x: number; y: number; radius: number; durationTicks?: number }
   | { type: 'bloom'; durationTicks?: number }
-  | { type: 'drought'; durationTicks?: number }
-  | { type: 'pass' };
+  | { type: 'drought'; durationTicks?: number };
 
 export interface TimedEffect {
   /** `boom` = a whale's own transfer landed plankton here and pulls locally. */
@@ -1016,11 +1015,6 @@ export function applyIntervention(
         message: `bloom: food spawn x2 for ${duration} ticks`,
         affected: world.creatures.length,
       };
-    }
-    case 'pass': {
-      // A day pass changes nothing in the ecology: it is a receipt that gates
-      // data export, not a lever on the tank.
-      return { message: 'pass: day pass active until the day rolls', affected: 0 };
     }
     case 'drought': {
       const duration = intervention.durationTicks ?? 2400;

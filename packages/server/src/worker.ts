@@ -4,7 +4,8 @@
  * keeps time flowing while nobody is watching. Static files are served by
  * Workers Static Assets; every other path is API and routes to the object.
  */
-import { createApp } from './handler.js';
+import { createApp, type WorldStore } from './handler.js';
+import { setBurnLedger } from './payments.js';
 import { toJSON } from '@abyssal/sim';
 
 interface DoStorage {
@@ -32,8 +33,43 @@ export class AbyssalWorld {
   private app: ReturnType<typeof createApp> | null = null;
   private lastSave = 0;
 
+  private receipts: string[] | null = null;
+  private ledgerState: { passes: [string, number][]; burners: [string, { total: number; last: number }][] } | null = null;
+
   // Durable Objects receive their bindings through the constructor, not fetch.
-  constructor(private ctx: { storage: DoStorage }, private env: Env) {}
+  constructor(private ctx: { storage: DoStorage }, private env: Env) {
+    // Receipts and passes live in this object's storage, so an isolate restart
+    // cannot replay a burn or drop a day pass.
+    setBurnLedger({
+      load: async () => (await this.state0()).receipts,
+      add: (hash: string) => {
+        void this.state0().then((s) => {
+          s.receipts.push(hash);
+          return this.ctx.storage.put('receipts', s.receipts);
+        });
+      },
+    });
+  }
+
+  private async state0() {
+    if (this.receipts === null) {
+      this.receipts = (await this.ctx.storage.get<string[]>('receipts')) ?? [];
+      this.ledgerState =
+        (await this.ctx.storage.get<{ passes: [string, number][]; burners: [string, { total: number; last: number }][] }>('ledger')) ??
+        { passes: [], burners: [] };
+    }
+    return { receipts: this.receipts, ledger: this.ledgerState! };
+  }
+
+  private store(): WorldStore {
+    return {
+      load: async () => (await this.state0()).ledger,
+      save: (s) => {
+        this.ledgerState = s;
+        void this.ctx.storage.put('ledger', s);
+      },
+    };
+  }
 
   private async boot(): Promise<ReturnType<typeof createApp>> {
     if (!this.app) {
@@ -48,6 +84,7 @@ export class AbyssalWorld {
         instance,
         token: this.env.ABYS_TOKEN_ADDRESS,
         rpc: this.env.ARC_RPC_URL,
+        store: this.store(),
       });
     }
     return this.app;
