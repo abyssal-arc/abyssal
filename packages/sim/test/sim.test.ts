@@ -5,6 +5,7 @@ import {
   tick,
   applyIntervention,
   effectiveSpawnRate,
+  idsInZone,
   txLanding,
   creatureName,
   toJSON,
@@ -18,6 +19,7 @@ import {
   type Senses,
   type WorldConfig,
   type Archetype,
+  type Creature,
 } from '../src/index.js';
 import { Rng } from '../src/prng.js';
 
@@ -750,4 +752,160 @@ test('interventions carry their payer through to effects and events', () => {
   assert.equal(ev.payer, meta.payer);
   assert.equal(ev.paid, meta.paid);
   assert.ok(typeof ev.affected === 'number');
+});
+
+test('obituaries: a starvation death is written up with the life it lived', () => {
+  const world = createWorld(160, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 1);
+  const c = world.creatures[0];
+  c.kills = 9;
+  c.offspring = 5;
+  c.maxMeal = 42;
+  c.boomTouched = true;
+  c.energy = 0.05;
+  for (let i = 0; i < 5 && world.creatures.length > 0; i++) tick(world, { chain: 0, market: 0 });
+  assert.equal(world.creatures.length, 0);
+  const o = world.obituaries[0];
+  assert.equal(o.id, c.id);
+  assert.equal(o.name, c.name);
+  assert.equal(o.archetype, c.archetype);
+  assert.equal(o.cause, 'starvation');
+  assert.equal(o.diedTick, world.tick);
+  assert.equal(o.kills, 9);
+  assert.equal(o.offspring, 5);
+  assert.equal(o.maxMeal, 42);
+  assert.deepEqual(o.titles.sort(), ['apex', 'lineageBearer', 'whalefallSurvivor']);
+  const ev = world.eventLog.find((e) => e.type === 'memorial');
+  assert.equal(ev?.name, c.name);
+  assert.equal(ev?.species, c.archetype);
+});
+
+test('obituaries: the prey of a hunt is memorialized, not just counted', () => {
+  const world = createWorld(161, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 2);
+  const whale = world.creatures[0];
+  const prey = world.creatures[1];
+  whale.archetype = 'WHALE';
+  whale.radius = 8.8;
+  whale.energy = 100;
+  prey.archetype = 'INSIDER';
+  prey.radius = 4;
+  prey.energy = 60;
+  whale.x = 500; whale.y = 500;
+  prey.x = 505; prey.y = 500;
+  tick(world, { chain: 0, market: 0 });
+  const o = world.obituaries[0];
+  assert.equal(o.id, prey.id);
+  assert.equal(o.cause, 'predation');
+  assert.deepEqual(o.titles, [], 'a short life earns no titles');
+  const survivor = world.creatures.find((c) => c.id === whale.id);
+  assert.equal(survivor?.kills, 1);
+  // Half of what the prey had left, minus the prey's own metabolism this tick.
+  assert.ok(survivor!.maxMeal > 29 && survivor!.maxMeal <= 30, 'a hunted prey counts as a meal');
+});
+
+test('obituaries: a poison death is filed as poison and titled poisonGhost', () => {
+  const world = createWorld(162, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 1);
+  const c = world.creatures[0];
+  c.x = 500; c.y = 500;
+  c.energy = 8;
+  applyIntervention(world, { type: 'poison', x: 500, y: 500, radius: 100, durationTicks: 100 });
+  for (let i = 0; i < 8 && world.creatures.length > 0; i++) {
+    tick(world, { chain: 0, market: 0 });
+  }
+  const o = world.obituaries[0];
+  assert.equal(o.cause, 'poison', 'a death inside the zone is not plain starvation');
+  assert.ok(o.titles.includes('poisonGhost'));
+});
+
+test('the memorial ring keeps the 24 newest deaths and survives a save', () => {
+  const world = createWorld(163, { ...NO_FOOD_NO_BIRTH, initialPopulation: 30 });
+  for (const c of world.creatures) c.energy = 0.02;
+  for (let i = 0; i < 10 && world.creatures.length > 0; i++) tick(world, { chain: 0, market: 0 });
+  assert.equal(world.creatures.length, 0);
+  assert.equal(world.obituaries.length, 24, 'the ring is bounded');
+  assert.ok(world.obituaries.every((o) => o.cause === 'starvation'));
+  assert.ok(world.totalDied >= 30, 'every death is counted even once the ring is full');
+  const revived = fromJSON(toJSON(world));
+  assert.equal(revived.obituaries.length, 24);
+  assert.deepEqual(revived.obituaries[0], world.obituaries[0]);
+});
+
+test('a save written before the story layer loads with empty ledgers', () => {
+  const world = createWorld(164, NO_FOOD_NO_BIRTH);
+  const legacy = JSON.parse(toJSON(world)) as Record<string, unknown> & {
+    creatures: Record<string, unknown>[];
+  };
+  delete legacy.eaters;
+  delete legacy.obituaries;
+  for (const c of legacy.creatures) {
+    delete c.offspring;
+    delete c.maxMeal;
+    delete c.boomTouched;
+    delete c.parentId;
+  }
+  const revived = fromJSON(JSON.stringify(legacy));
+  assert.deepEqual(revived.eaters, {});
+  assert.deepEqual(revived.obituaries, []);
+  assert.ok(
+    revived.creatures.every(
+      (c) => c.offspring === 0 && c.maxMeal === 0 && c.boomTouched === false && c.parentId === null,
+    ),
+  );
+  runTicks(revived, 30);
+});
+
+test('eaters: a tx pellet is traceable to the creature that ate it', () => {
+  const hash = '0x' + 'e1'.repeat(32);
+  const world = createWorld(165, { ...DEFAULT_CONFIG, ...NO_FOOD, populationFloor: 0 });
+  world.creatures = world.creatures.slice(0, 1);
+  const c = world.creatures[0];
+  c.x = 200; c.y = 700;
+  c.energy = 60; // hungry, so it swims for the fall instead of ignoring it
+  for (let i = 0; i < 40 && !(world.eaters[hash]?.length > 0); i++) {
+    tick(world, { chain: 0.5, market: 0 }, i === 0 ? [{ hash, size: 1, at: { x: 200, y: 700 } }] : []);
+  }
+  assert.ok(world.eaters[hash]?.includes(c.id), 'the meteor trail must name its eater');
+  assert.equal(world.eaters[hash].length, 1, 'one bite is logged once');
+  const survivor = world.creatures.find((x) => x.id === c.id);
+  assert.ok(survivor && survivor.maxMeal > 0, 'the biggest meal is remembered');
+});
+
+test('offspring: a birth credits the parent and the child carries the line', () => {
+  const world = createWorld(166, {
+    ...DEFAULT_CONFIG,
+    ...NO_FOOD,
+    populationFloor: 0,
+    reproduceUrgeThreshold: 0,
+    reproduceThreshold: 10,
+  });
+  world.creatures = world.creatures.slice(0, 1);
+  // A non-WHALE parent, so the child it makes cannot become its next meal.
+  world.creatures[0].archetype = 'ALGO';
+  const parentId = world.creatures[0].id;
+  world.creatures[0].energy = 400; // each birth costs 45
+  let child: Creature | null = null;
+  for (let i = 0; i < 5 && !child; i++) {
+    tick(world, { chain: 0.5, market: 0.5 });
+    child = world.creatures.find((c) => c.parentId === parentId) ?? null;
+  }
+  assert.ok(child, 'a creature above the threshold should reproduce');
+  const parent = world.creatures.find((c) => c.id === parentId);
+  assert.ok(parent, 'the parent is still alive to be credited');
+  assert.ok(parent.offspring >= 1, 'the parent keeps its own count');
+  assert.equal(child.generation, parent.generation + 1);
+  assert.equal(child.offspring, 0);
+});
+
+test('idsInZone wraps the torus: an edge zone sees both sides', () => {
+  const world = createWorld(167, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 3);
+  const [west, east, mid] = world.creatures;
+  west.x = 995; west.y = 500;
+  east.x = 5; east.y = 500;
+  mid.x = 500; mid.y = 500;
+  const ids = idsInZone(world, 0, 500, 20).sort((a, b) => a - b);
+  assert.deepEqual(ids, [west.id, east.id].sort((a, b) => a - b));
+  assert.deepEqual(idsInZone(world, 0, 500, 0), []);
 });

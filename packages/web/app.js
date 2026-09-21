@@ -861,6 +861,21 @@ function processSnapshot(snap, recv) {
     chainWhales = snap.whales;
   }
   if (snap.eaters) worldEaters = snap.eaters;
+  // Followed creatures: a disappearance is a death, a new child is a birth.
+  const alive = new Map(snap.creatures.map((c) => [c.id, c]));
+  for (const id of watched) {
+    const was = prevAlive.get(id);
+    if (was && !alive.has(id)) toast(t('watchedDied', { name: was.name }), true);
+  }
+  for (const [id, c] of alive) {
+    const was = prevAlive.get(id);
+    if (watched.has(id) && was && (c.offspring ?? 0) > was.offspring) {
+      toast(t('watchedBorn', { name: c.name ?? `#${id}` }));
+    }
+  }
+  prevAlive = new Map(
+    [...alive].map(([id, c]) => [id, { name: c.name ?? `#${id}`, offspring: c.offspring ?? 0 }]),
+  );
   const dtMs = prev ? at - prev.at : POLL_MS;
   const cell = 60;
   const grid = new Map();
@@ -937,6 +952,10 @@ function processSnapshot(snap, recv) {
 let chainWhales = [];
 /** tx hash to creature ids that ate its plankton, from the snapshot. */
 let worldEaters = {};
+/** Creatures the visitor follows; death and birth raise a toast. */
+let watched = new Set(JSON.parse(localStorage.getItem('abyssal-watch') ?? '[]'));
+/** id -> { name, offspring } from the previous snapshot, to see what changed. */
+let prevAlive = new Map();
 /** address -> { t, amount } of its last transfer: the feed pulse + label. */
 const whaleFeed = new Map();
 /** Screen-space hit targets refreshed every frame by drawWhales. */
@@ -1203,6 +1222,8 @@ async function poll() {
     updateBoard();
     renderProps(snap.world.propositions);
     renderBurners(snap.world.burners);
+    renderDaily(snap.world.daily);
+    renderMemorials(snap.world.obituaries);
     if (snap.events.length > 0) {
       for (const e of snap.events) lastEventSeq = Math.max(lastEventSeq, e.seq);
       if (bootstrap) {
@@ -1239,15 +1260,17 @@ setInterval(() => { if (!document.hidden) poll(); }, POLL_MS);
 
 async function pollAux() {
   try {
-    const [h, j] = await Promise.all([
+    const [h, j, rep] = await Promise.all([
       // The charts decimate to CHART_SLOTS points anyway, so asking the server
       // for the undecimated window meant transferring ~10x more JSON than any
       // pixel could show, 456 KB every 10s, larger than the snapshot stream.
       getJSON(`/history?window=${HISTORY_WINDOW}&slots=${CHART_SLOTS}`),
+      getJSON('/reports'),
       getJSON('/judgments'),
     ]);
     lastStats = h.stats;
     lastCulls = j.judgments;
+    renderReports(rep?.reports);
     drawCharts();
     renderObituaries(lastCulls);
   } catch { /* keep stale aux data */ }
@@ -3426,8 +3449,17 @@ function renderCard(c) {
     <div>${t('age')}: ${ageTicks}${t('ticks')}</div>
     <div>${t('generation')}: G${c.generation}</div>
     <div>${t('fateLabel')}: D${Math.floor(c.bornTick / (latestSnap?.ticksPerDay ?? 19200))} · ${c.parentId != null ? (latestSnap.byId.get(c.parentId)?.name ?? '—') : t('fateOrphan')}</div>
+    <div>${t('offspring')}: ${c.offspring ?? 0} · ${t('maxMeal')}: ${(c.maxMeal ?? 0).toFixed(1)}</div>
+    <div><button id="watch-btn" class="dock-btn">${watched.has(c.id) ? t('unwatch') : t('watch')}</button></div>
     <div>${t('genomeFingerprint')}: [${c.genes.join(', ')}] · hue ${c.hue.toFixed(2)}</div>
   `;
+  // Bound after the markup exists: rebuilding the card throws the old node away.
+  el.querySelector('#watch-btn').onclick = () => {
+    if (watched.has(c.id)) watched.delete(c.id);
+    else watched.add(c.id);
+    localStorage.setItem('abyssal-watch', JSON.stringify([...watched]));
+    renderCard(c);
+  };
 }
 
 /* ---------- daily propositions, burners, replay, export ---------- */
@@ -3511,6 +3543,63 @@ document.querySelectorAll('[data-export]').forEach((btn) => btn.addEventListener
     }
   }
 }));
+
+const CAUSE_KEYS = {
+  starvation: 'causeStarvation',
+  poison: 'causePoison',
+  predation: 'causePredation',
+  harvest: 'causeHarvest',
+  judgment: 'causeJudgment',
+};
+const TITLE_KEYS = {
+  apex: 'titleApex',
+  poisonGhost: 'titlePoisonGhost',
+  whalefallSurvivor: 'titleWhalefallSurvivor',
+  lineageBearer: 'titleLineageBearer',
+};
+
+function renderDaily(d) {
+  const el = document.getElementById('daily-report');
+  if (!el) return;
+  if (!d) { el.innerHTML = ''; return; }
+  const line = (k, v) => `<div class="prop"><span>${t(k)}</span><b>${v}</b></div>`;
+  el.innerHTML =
+    (d.maxFall ? line('maxFall', `${fmtUsd(d.maxFall.size * 100000)} · ${d.maxFall.hash.slice(0, 10)}…`) : '') +
+    (d.winner ? line('winnerSpecies', `${d.winner.species} · ${d.winner.kills}`) : '') +
+    (d.biggestIntervention
+      ? line('biggestIntervention', `${d.biggestIntervention.type} · ${d.biggestIntervention.affected}`)
+      : '') +
+    line('deathToll', Object.entries(d.deaths).map(([c, n]) => `${t(CAUSE_KEYS[c] ?? c)} ${n}`).join(' · ') || '0') +
+    (d.mvp.strongest ? line('mvpStrongest', `${d.mvp.strongest.name} · ${d.mvp.strongest.kills}`) : '') +
+    (d.mvp.burner ? line('mvpBurner', `${shortAddr(d.mvp.burner.address)} · ${d.mvp.burner.total}`) : '') +
+    (d.mvp.saddest ? line('mvpSaddest', `${d.mvp.saddest.species} · ${d.mvp.saddest.deaths}`) : '');
+}
+
+function renderReports(list) {
+  const el = document.getElementById('reports');
+  if (!el) return;
+  if (!list?.length) { el.innerHTML = `<div class="addr-empty">${t('reportsEmpty')}</div>`; return; }
+  el.innerHTML = list
+    .map((r) => `<div class="prop"><span>${r.type} · ${r.payer ? shortAddr(r.payer) : '?'} · ${r.paid ?? ''}</span>` +
+      `<b>${r.score === undefined ? '…' : `${r.score} ${r.score > 0 ? t('scoreWorth') : t('scoreWaste')}`}</b></div>`)
+    .join('');
+}
+
+function renderMemorials(list) {
+  const el = document.getElementById('memorials');
+  if (!el) return;
+  if (!list?.length) { el.innerHTML = `<div class="addr-empty">${t('memorialsEmpty')}</div>`; return; }
+  el.innerHTML = list
+    .map((o) => {
+      // Titles are earned, so an ordinary death gets the plain record only.
+      const titles = (o.titles ?? []).map((k) => t(TITLE_KEYS[k] ?? k)).join(' · ');
+      return `<div class="memorial"><b>${o.name}</b> · ${o.archetype} · ${t(CAUSE_KEYS[o.cause] ?? o.cause)}` +
+        (titles ? `<div class="epitaph">${titles}</div>` : '') +
+        `<div class="epitaph">G${o.generation} · ${o.diedTick - o.bornTick}${t('ticks')} · ` +
+        `${t('offspring')} ${o.offspring} · ${t('killsLabel')} ${o.kills} · ${t('maxMeal')} ${o.maxMeal}</div></div>`;
+    })
+    .join('');
+}
 
 /* ---------- panel collapse, dock drawers, welcome layer ---------- */
 

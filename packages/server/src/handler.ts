@@ -1,5 +1,6 @@
 import {
   applyIntervention,
+  idsInZone,
   createWorld,
   DEFAULT_CONFIG,
   fromJSON,
@@ -213,6 +214,13 @@ export function createApp(options: AppOptions = {}) {
       });
     }
     if (txRain.length > 12) txRain = txRain.slice(-12);
+    // The day's biggest fall, for the daily report; a new day starts over.
+    const day = Math.floor(world.tick / world.config.ticksPerDay);
+    if (dayMaxFall.day !== day) dayMaxFall = { day, size: 0, hash: '' };
+    for (const t of txs) {
+      if (t.size > dayMaxFall.size) dayMaxFall = { day, size: t.size, hash: t.hash };
+    }
+    scoreReports();
     lastAdvanceAt = Date.now();
   }
 
@@ -388,6 +396,61 @@ export function createApp(options: AppOptions = {}) {
 
   // Who has burned for the tank, and day-pass holders (export gate).
   const burners = new Map<string, { total: number; last: number }>();
+  // Intervention battle reports, scored 400 ticks after the burn.
+  const reports: {
+    tx: string; type: string; payer?: string; paid?: string; atTick: number;
+    affectedIds: number[]; popAt: number;
+    score?: number; survivors?: number;
+  }[] = [];
+  let dayMaxFall = { day: -1, size: 0, hash: '' };
+
+  function scoreReports() {
+    for (const r of reports) {
+      if (r.score !== undefined || world.tick < r.atTick + 400) continue;
+      const alive = new Set(world.creatures.map((c) => c.id));
+      const survivors = r.affectedIds.filter((id) => alive.has(id)).length;
+      r.survivors = survivors;
+      r.score =
+        r.type === 'poison'
+          ? r.affectedIds.length - survivors
+          : r.type === 'feed'
+            ? survivors
+            : world.creatures.length - r.popAt;
+    }
+  }
+
+  function dailyReport() {
+    const cfg = world.config;
+    const day = Math.floor(world.tick / cfg.ticksPerDay);
+    const killsBy: Record<string, number> = {};
+    for (const c of world.creatures) killsBy[c.archetype] = (killsBy[c.archetype] ?? 0) + c.kills;
+    const winner = Object.entries(killsBy).sort((a, b) => b[1] - a[1])[0];
+    const deathsToday = world.obituaries.filter((o) => Math.floor(o.diedTick / cfg.ticksPerDay) === day);
+    const byCause: Record<string, number> = {};
+    for (const o of deathsToday) byCause[o.cause] = (byCause[o.cause] ?? 0) + 1;
+    const bySpecies: Record<string, number> = {};
+    for (const o of deathsToday) bySpecies[o.archetype] = (bySpecies[o.archetype] ?? 0) + 1;
+    const saddest = Object.entries(bySpecies).sort((a, b) => b[1] - a[1])[0];
+    const strongest = [...world.creatures].sort((a, b) => b.kills - a.kills)[0];
+    const topBurner = [...burners.entries()].sort((a, b) => b[1].total - a[1].total)[0];
+    const biggest = reports
+      .filter((r) => Math.floor(r.atTick / cfg.ticksPerDay) === day)
+      .sort((a, b) => b.affectedIds.length - a.affectedIds.length)[0];
+    return {
+      day,
+      maxFall: dayMaxFall.day === day ? dayMaxFall : null,
+      winner: winner ? { species: winner[0], kills: winner[1] } : null,
+      biggestIntervention: biggest
+        ? { tx: biggest.tx, type: biggest.type, affected: biggest.affectedIds.length }
+        : null,
+      deaths: byCause,
+      mvp: {
+        strongest: strongest ? { id: strongest.id, name: strongest.name, kills: strongest.kills } : null,
+        burner: topBurner ? { address: topBurner[0], total: topBurner[1].total } : null,
+        saddest: saddest ? { species: saddest[0], deaths: saddest[1] } : null,
+      },
+    };
+  }
   const passes = new Map<string, number>();
   function noteBurn(payer: string | undefined, whole: number) {
     if (!payer) return;
@@ -412,9 +475,11 @@ export function createApp(options: AppOptions = {}) {
       eaters: Object.fromEntries(
         txRain.map((t) => [t.hash, (world.eaters[t.hash] ?? []).slice(0, 8)]),
       ),
+      obituaries: world.obituaries.slice(0, 12),
       // The two hidden rules, surfaced so the tank is never a black box.
       tax: dominantTax(world),
       propositions: propositions(),
+      daily: dailyReport(),
       burners: [...burners.entries()]
         .sort((x, y) => y[1].total - x[1].total)
         .slice(0, 8)
@@ -438,6 +503,8 @@ export function createApp(options: AppOptions = {}) {
         bornTick: c.bornTick,
         genes: genomeFingerprint(c.genome),
         hungry: isHungry(world, c),
+        offspring: c.offspring,
+        maxMeal: Math.round(c.maxMeal * 10) / 10,
       })),
       foods: world.foods.map((f) => ({ x: Math.round(f.x), y: Math.round(f.y) })),
     };
@@ -478,6 +545,8 @@ export function createApp(options: AppOptions = {}) {
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
+        'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
+        'GET /export': 'day-pass download of the observation window: ?pass=<address>&kind=csv|replay|digest',
         'GET /observe': 'Arc USDC flow observatory: stats, endpoint ranking, pulse, recent flows (available:false off-Arc)',
         'POST /intervene': 'intervention (feed/poison/bloom/drought) paid by burning ABYS on Arc; the burn receipt is the payment proof; 503 until ABYS_TOKEN_ADDRESS is set',
         'POST /tick': 'debug: advance one tick manually',
@@ -562,6 +631,11 @@ export function createApp(options: AppOptions = {}) {
         events,
         txRain: rainAfter(url.searchParams.get('tx')),
       });
+    }
+
+    if (req.method === 'GET' && path === '/reports') {
+      scoreReports();
+      return json({ reports: reports.slice(-12).reverse() });
     }
 
     if (req.method === 'GET' && path === '/export') {
@@ -691,6 +765,18 @@ export function createApp(options: AppOptions = {}) {
       recordBurnReceipt(txHash);
       noteBurn(verdict.payer, Number(ABYS_PRICES[type]));
       saveStore();
+      if (intervention && 'x' in intervention) {
+        reports.push({
+          tx: txHash,
+          type,
+          payer: verdict.payer,
+          paid: `${ABYS_PRICES[type]} ABYS`,
+          atTick: world.tick,
+          affectedIds: idsInZone(world, intervention.x, intervention.y, intervention.radius),
+          popAt: world.creatures.length,
+        });
+        if (reports.length > 40) reports.splice(0, reports.length - 40);
+      }
       return json({
         ok: true,
         receipt: result.message,

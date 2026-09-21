@@ -52,6 +52,12 @@ export interface Creature {
   name: string;
   /** Who spawned this creature, for the fate line; null for colonists. */
   parentId: number | null;
+  /** How many children this creature produced. */
+  offspring: number;
+  /** Largest single meal, in energy. */
+  maxMeal: number;
+  /** True once the creature stood inside a whale boom. */
+  boomTouched: boolean;
   x: number;
   y: number;
   energy: number;
@@ -67,6 +73,21 @@ export interface Creature {
   huntReadyAt: number;
   generation: number;
   bornTick: number;
+}
+
+export interface Obituary {
+  id: number;
+  name: string;
+  archetype: Archetype;
+  generation: number;
+  bornTick: number;
+  diedTick: number;
+  /** starvation | poison | predation | harvest | judgment */
+  cause: string;
+  kills: number;
+  offspring: number;
+  maxMeal: number;
+  titles: string[];
 }
 
 export interface Food {
@@ -148,7 +169,7 @@ export interface TickStats {
 export interface SimEvent {
   seq: number;
   tick: number;
-  type: 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor' | 'poison_kill' | 'reseed';
+  type: 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor' | 'poison_kill' | 'reseed' | 'memorial';
   /** World coordinates, when the event is localized. */
   x?: number;
   y?: number;
@@ -189,9 +210,11 @@ export interface World {
   effects: TimedEffect[];
   /** Recent paid feeds, so the same spot cannot be fed into a permanent feast. */
   feedFatigue: { x: number; y: number; until: number }[];
-  /** Cull history: hourly harvests and daily judgment days. */
   /** Tx hash to the creatures that ate its plankton, for the meteor trail. */
   eaters: Record<string, number[]>;
+  /** Memorial ring: legendary deaths, newest first. */
+  obituaries: Obituary[];
+  /** Cull history: hourly harvests and daily judgment days. */
   culls: CullRecord[];
   /** Ring buffer of recent positioned events for visualization. */
   eventLog: SimEvent[];
@@ -239,6 +262,17 @@ function pushEvent(world: World, e: Omit<SimEvent, 'seq' | 'tick'>): void {
   }
 }
 
+/** Ids of creatures inside a radius, for intervention reports. */
+export function idsInZone(world: World, x: number, y: number, radius: number): number[] {
+  const out: number[] = [];
+  for (const c of world.creatures) {
+    const dx = torusDelta(x, c.x, world.config.width);
+    const dy = torusDelta(y, c.y, world.config.height);
+    if (dx * dx + dy * dy <= radius * radius) out.push(c.id);
+  }
+  return out;
+}
+
 /** Shortest signed distance from a to b on a ring of the given size. */
 function torusDelta(a: number, b: number, size: number): number {
   let d = b - a;
@@ -281,6 +315,9 @@ function makeCreature(
     generation,
     bornTick: world.tick,
     parentId,
+    offspring: 0,
+    maxMeal: 0,
+    boomTouched: false,
   };
 }
 
@@ -415,6 +452,7 @@ export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG):
     totalFoodSpawned: 0,
     totalPredations: 0,
     eaters: {},
+    obituaries: [],
   };
   for (let i = 0; i < config.initialPopulation; i++) {
     world.creatures.push(
@@ -483,6 +521,43 @@ function measureDiversity(world: World): number {
   return sum / sample.length;
 }
 
+/**
+ * Titles earned by a life, computed at its end: the tank names its dead by
+ * what they actually did, not by a rarity table.
+ */
+function titlesFor(c: Creature, cause: string): string[] {
+  const t: string[] = [];
+  if (c.kills >= 8) t.push('apex');
+  if (cause === 'poison') t.push('poisonGhost');
+  if (c.boomTouched && cause === 'starvation') t.push('whalefallSurvivor');
+  if (c.offspring >= 4) t.push('lineageBearer');
+  return t;
+}
+
+function memorialize(world: World, c: Creature, cause: string): void {
+  world.obituaries.unshift({
+    id: c.id,
+    name: c.name,
+    archetype: c.archetype,
+    generation: c.generation,
+    bornTick: c.bornTick,
+    diedTick: world.tick,
+    cause,
+    kills: c.kills,
+    offspring: c.offspring,
+    maxMeal: c.maxMeal,
+    titles: titlesFor(c, cause),
+  });
+  if (world.obituaries.length > 24) world.obituaries.length = 24;
+  pushEvent(world, {
+    type: 'memorial',
+    x: Math.round(c.x),
+    y: Math.round(c.y),
+    name: c.name,
+    species: c.archetype,
+  });
+}
+
 /** Shared cull logic for hourly harvests and daily judgment days. */
 function cullWeakest(
   world: World,
@@ -498,6 +573,7 @@ function cullWeakest(
   const sorted = [...world.creatures].sort((a, b) => a.energy - b.energy);
   const doomed = sorted.slice(0, cullCount);
   const doomedIds = new Set(doomed.map((c) => c.id));
+  for (const c of doomed) memorialize(world, c, type);
   world.creatures = world.creatures.filter((c) => !doomedIds.has(c.id));
   world.totalDied += cullCount;
   const record: CullRecord = {
@@ -710,6 +786,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
       const dx = torusDelta(c.x, e.x, cfg.width);
       const dy = torusDelta(c.y, e.y, cfg.height);
       if (e.kind === 'boom' && dx * dx + dy * dy > e.radius * e.radius) continue;
+      if (e.kind === 'boom') c.boomTouched = true;
       angle = Math.atan2(dy, dx);
       speed = Math.max(speed, 2.2);
     }
@@ -753,6 +830,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
       foodDistSq <= cfg.eatRadius * cfg.eatRadius
     ) {
       c.energy = Math.min(cfg.maxEnergy, c.energy + nearestFood.energy);
+      c.maxMeal = Math.max(c.maxMeal, nearestFood.energy);
       if (nearestFood.src) {
         const list = (world.eaters[nearestFood.src] ??= []);
         if (list.length < 8 && !list.includes(c.id)) list.push(c.id);
@@ -769,6 +847,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
       world.creatures.length + births.length < cfg.maxPopulation * (0.6 + 0.4 * chainTemp)
     ) {
       c.energy -= cfg.reproduceCost;
+      c.offspring++;
       const childGenome = mutateGenome(c.genome, rng, cfg.mutationRate, cfg.mutationScale);
       radiateIfSaturated(world, childGenome, c.archetype);
       births.push(
@@ -810,6 +889,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
         const gain = Math.max(0, p.energy * 0.5);
         c.energy = Math.min(cfg.maxEnergy, c.energy + gain);
         c.devouredTotal += gain;
+        c.maxMeal = Math.max(c.maxMeal, gain);
         c.kills++;
         c.huntReadyAt = world.tick + cfg.huntCooldown;
         // Kill growth: every kill makes the whale visibly bigger (capped).
@@ -832,6 +912,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
     }
   }
   if (eaten.size > 0) {
+    for (const c of world.creatures) if (eaten.has(c.id)) memorialize(world, c, 'predation');
     world.creatures = world.creatures.filter((c) => !eaten.has(c.id));
     world.totalDied += eaten.size;
     world.totalPredations += eaten.size;
@@ -871,6 +952,15 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
         break;
       }
     }
+  }
+  for (const c of world.creatures) {
+    if (c.energy > 0) continue;
+    const inPoison = poisonZones.some((z) => {
+      const dx = torusDelta(z.x, c.x, cfg.width);
+      const dy = torusDelta(z.y, c.y, cfg.height);
+      return dx * dx + dy * dy <= z.radius * z.radius;
+    });
+    memorialize(world, c, inPoison ? 'poison' : 'starvation');
   }
   world.creatures = world.creatures.filter((c) => c.energy > 0);
   const starved = aliveBefore - world.creatures.length;
@@ -1072,7 +1162,11 @@ export function fromJSON(json: string): World {
   rest.eventLog ??= [];
   rest.nextEventSeq ??= 1;
   rest.eaters ??= {};
+  rest.obituaries ??= [];
   for (const c of rest.creatures ?? []) {
+    c.offspring ??= 0;
+    c.maxMeal ??= 0;
+    c.boomTouched ??= false;
     c.kills ??= 0;
     c.devouredTotal ??= 0;
     // Snapshots written before digestion existed carry no cooldown; resuming

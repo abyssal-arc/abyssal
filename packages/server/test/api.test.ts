@@ -694,3 +694,60 @@ test('passes and burners survive a restart through the store', async () => {
   const exportRes = await second.fetch(new Request(`http://localhost/export?pass=${payer}`));
   assert.equal(exportRes.status, 200, 'the pass must survive a restart');
 });
+
+test('/reports opens on the burn and scores it 400 ticks later', async () => {
+  const app = createApp({ seed: 1 });
+  const hash = '0x' + 'c7'.repeat(32);
+  const paid = await app.fetch(
+    post('/intervene', { type: 'feed', x: 500, y: 500, radius: 300 }, { 'x-payment-tx': hash }),
+  );
+  assert.equal(paid.status, 200, 'the shared stub settles a feed-price burn');
+
+  type Report = {
+    tx: string; type: string; atTick: number; affectedIds: number[];
+    score?: number; survivors?: number;
+  };
+  const get = async () => ((await (await app.fetch(new Request('http://localhost/reports'))).json()) as {
+    reports: Report[];
+  }).reports;
+
+  const open = (await get()).find((r) => r.tx === hash);
+  assert.ok(open, 'a paid intervention opens a battle report');
+  assert.equal(open.type, 'feed');
+  assert.equal(open.score, undefined, 'nothing is scored before the window closes');
+  assert.ok(open.affectedIds.length > 0, 'the report names everyone caught in it');
+
+  for (let i = 0; i < 401; i++) await app.fetch(post('/tick', {}));
+  const scored = (await get()).find((r) => r.tx === hash)!;
+  assert.equal(typeof scored.score, 'number', 'the window has closed, so the report is scored');
+  assert.ok(scored.survivors! <= scored.affectedIds.length);
+  assert.equal(scored.score, scored.survivors, 'a feed is judged by who lived through it');
+});
+
+test('the render payload carries the daily report, the memorial ring and the eater trails', async () => {
+  const app = createApp({ seed: 1 });
+  for (let i = 0; i < 3; i++) await app.fetch(post('/tick', {}));
+  const w = (await (await app.fetch(new Request('http://localhost/world'))).json()) as {
+    daily: {
+      day: number;
+      winner: { species: string; kills: number } | null;
+      biggestIntervention: unknown;
+      deaths: Record<string, number>;
+      mvp: { strongest: unknown; burner: unknown; saddest: unknown };
+    };
+    obituaries: { id: number; cause: string; diedTick: number; titles: string[] }[];
+    eaters: Record<string, number[]>;
+    creatures: { offspring: number; maxMeal: number }[];
+  };
+  assert.equal(typeof w.daily.day, 'number');
+  assert.equal(typeof w.daily.deaths, 'object');
+  assert.ok('mvp' in w.daily, 'the day names an MVP');
+  assert.ok(Array.isArray(w.obituaries));
+  assert.ok(w.obituaries.length <= 12, 'the payload ships the near ring, not the whole book');
+  for (const o of w.obituaries) {
+    assert.ok(typeof o.cause === 'string' && typeof o.diedTick === 'number');
+    assert.ok(Array.isArray(o.titles));
+  }
+  assert.equal(typeof w.eaters, 'object');
+  assert.ok(w.creatures.every((c) => typeof c.offspring === 'number' && typeof c.maxMeal === 'number'));
+});

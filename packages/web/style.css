@@ -326,6 +326,9 @@ body.view-observe {
 .prop b { color: var(--fg-2); font-weight: 500; }
 .props-y { margin-top: calc(var(--sp)); }
 #pulse-play { margin-left: auto; }
+.daily .prop, #reports .prop { padding: 1px 0; }
+.memorial { padding: calc(var(--sp)) 0; border-bottom: 1px solid var(--glass-border); }
+.memorial .epitaph { color: var(--fg-3); font-size: 9px; margin-top: 2px; }
 .rules-hint {
   margin-top: calc(var(--sp) * 2);
   font-size: 9px;
