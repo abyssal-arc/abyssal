@@ -95,19 +95,6 @@
         <div id="endpoints"></div>
       </section>
     </div>
-    <div id="addr-card" class="glass" hidden>
-      <span class="tx-close">×</span>
-      <div class="addr-h"></div>
-      <div id="addr-stats"></div>
-      <div id="addr-tank" hidden>
-        <div class="addr-sub" data-i18n="tankStanding">In the tank</div>
-        <div id="addr-tank-body"></div>
-      </div>
-      <div class="addr-sub" data-i18n="addrRecent">Recent flows</div>
-      <div id="addr-flows"></div>
-      <a class="explore" href="#" target="_blank" rel="noopener" data-i18n="addrExplorer">View on explorer</a>
-      <button id="addr-world" class="dock-btn" data-i18n="viewInTank" hidden>view in tank</button>
-    </div>
     <div id="observe-empty" class="obs-empty" hidden>
       <div class="glass obs-card">
         <p data-i18n="observeOffline">Live Arc observatory is offline.</p>
@@ -118,6 +105,22 @@
   </main>
 
   <div id="tx-card" class="glass" hidden></div>
+
+  <!-- Outside #observe-view on purpose: whales are clickable in the tank view,
+       and an ancestor with [hidden] would take this card down with it. -->
+  <div id="addr-card" class="glass" hidden>
+    <span class="tx-close">×</span>
+    <div class="addr-h"></div>
+    <div id="addr-stats"></div>
+    <div id="addr-tank" hidden>
+      <div class="addr-sub" data-i18n="tankStanding">In the tank</div>
+      <div id="addr-tank-body"></div>
+    </div>
+    <div class="addr-sub" data-i18n="addrRecent">Recent flows</div>
+    <div id="addr-flows"></div>
+    <a class="explore" href="#" target="_blank" rel="noopener" data-i18n="addrExplorer">View on explorer</a>
+    <button id="addr-world" class="dock-btn" data-i18n="viewInTank" hidden>view in tank</button>
+  </div>
 
   <div id="banner" hidden></div>
 
