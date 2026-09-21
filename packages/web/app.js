@@ -140,21 +140,15 @@ const HUE_BUCKETS = 24;
 const CREATURE_VISUAL_SCALE = 1.3;
 const spriteCache = new Map();
 
-/* ---------- procedural creature sprites (v8 "glasslight") ---------- */
+/* ---------- procedural creature sprites (v9 "cybertron") ---------- */
 /**
- * v8 "glasslight": translucent glass bodies with one bright rim, an inner dark
- * line for glass thickness, a specular sheen, an additive core and photophore
- * dots. Silhouettes are slender and tapered so nothing aliases into noise at
- * the 18-40px the tank draws most bodies at, and the value contrast keeps each
- * species readable as an animal rather than a shape.
+ * v9 "cybertron": dark angular bodies with neon edge lighting, holographic
+ * iridescent panels, circuit-board traces, data-stream particles, scan-lines
+ * and glitch offsets. Tron Legacy meets deep-sea fauna.
  */
 const hsl = hsla;
-/**
- * v8 "glasslight": translucent glass bodies, one bright rim, an inner glow core
- * and photophore dots. Silhouettes are slender and tapered; nothing spiky that
- * would alias away at the 18-40px the tank draws.
- */
-/** Translucent glass fill, top-lit, with a mid highlight band. */
+
+/** Translucent glass fill — kept for the leviathan painter. */
 function glass(g, hue, y0, y1) {
   const gr = g.createLinearGradient(0, y0, 0, y1);
   gr.addColorStop(0, hsl(hue, 58, 66, 0.4));
@@ -164,30 +158,7 @@ function glass(g, hue, y0, y1) {
   return gr;
 }
 
-/** A soft specular sheen along the top of a body. */
-function sheen(g, hue, x, y, rx, ry, rot = -0.25) {
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.translate(x, y);
-  g.rotate(rot);
-  const gr = g.createRadialGradient(0, 0, 0, 0, 0, rx);
-  gr.addColorStop(0, hsl(hue, 60, 92, 0.16));
-  gr.addColorStop(1, hsl(hue, 60, 92, 0));
-  g.fillStyle = gr;
-  g.beginPath();
-  g.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
-  g.fill();
-  g.restore();
-}
-
-/** Inner dark line just inside the rim: reads as glass thickness. */
-function innerLine(g, hue, alpha = 0.35) {
-  g.strokeStyle = hsl(hue, 70, 12, alpha);
-  g.lineWidth = 1.6;
-  g.stroke();
-}
-
-/** Additive inner core so the animal carries its own light. */
+/** Additive inner core glow — useful for neon eyes and thrusters. */
 function core(g, hue, x, y, r, a = 0.3) {
   g.save();
   g.globalCompositeOperation = 'lighter';
@@ -201,7 +172,7 @@ function core(g, hue, x, y, r, a = 0.3) {
   g.restore();
 }
 
-/** A bright photophore dot. */
+/** A bright data dot / photophore. */
 function dot(g, hue, x, y, r = 1.4, a = 0.9) {
   g.save();
   g.globalCompositeOperation = 'lighter';
@@ -216,539 +187,505 @@ function dot(g, hue, x, y, r = 1.4, a = 0.9) {
   g.restore();
 }
 
-function rimStroke(g, hue, alpha = 0.9, width = 1.4) {
-  g.strokeStyle = hsl(hue, 92, 86, alpha);
-  g.lineWidth = width;
-  g.stroke();
-}
-
-/** Glowing energy vein: a thin additive stroke along a path. */
-function energyVein(g, hue, points, alpha = 0.5, width = 0.7) {
+/** Neon edge: wide dim glow + bright thin stroke along an angular path. */
+function neonEdge(g, hue, points, alpha = 0.9, width = 1.5, closed = true) {
+  const build = () => {
+    g.beginPath();
+    g.moveTo(points[0][0], points[0][1]);
+    for (let i = 1; i < points.length; i++) g.lineTo(points[i][0], points[i][1]);
+    if (closed) g.closePath();
+  };
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 72, alpha);
+  build();
+  g.strokeStyle = hsl(hue, 100, 60, alpha * 0.18);
+  g.lineWidth = width * 4;
+  g.stroke();
+  build();
+  g.strokeStyle = hsl(hue, 100, 65, alpha * 0.4);
+  g.lineWidth = width * 2;
+  g.stroke();
+  build();
+  g.strokeStyle = hsl(hue, 100, 78, alpha);
   g.lineWidth = width;
-  g.beginPath();
-  g.moveTo(points[0][0], points[0][1]);
-  for (let i = 1; i < points.length; i++) {
-    if (i < points.length - 1) {
-      const xc = (points[i][0] + points[i + 1][0]) / 2;
-      const yc = (points[i][1] + points[i + 1][1]) / 2;
-      g.quadraticCurveTo(points[i][0], points[i][1], xc, yc);
-    } else {
-      g.lineTo(points[i][0], points[i][1]);
+  g.stroke();
+  g.restore();
+}
+
+/** Circuit traces: angular lines with junction dots, thin and subtle. */
+function circuitTrace(g, hue, paths, alpha = 0.4) {
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 80, 65, alpha);
+  g.lineWidth = 0.5;
+  for (const pts of paths) {
+    g.beginPath();
+    g.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+    g.stroke();
+    for (let i = 1; i < pts.length - 1; i++) {
+      g.fillStyle = hsl(hue, 90, 75, alpha * 0.8);
+      g.beginPath();
+      g.arc(pts[i][0], pts[i][1], 0.8, 0, Math.PI * 2);
+      g.fill();
     }
   }
-  g.stroke();
-  g.strokeStyle = hsl(hue, 90, 60, alpha * 0.3);
-  g.lineWidth = width * 3;
-  g.stroke();
   g.restore();
 }
 
-/** Pulsing node: brightness varies with phase offset. */
-function pulseNode(g, hue, x, y, r, phase, offset = 0, alpha = 0.85) {
-  const p = 0.6 + 0.4 * Math.sin((phase + offset) * Math.PI * 2);
-  dot(g, hue, x, y, r * p, alpha * p);
-}
-
-/* ---------------- WHALE: abyssal leviathan ---------------- */
-function drawWhale(g, hue, ph) {
-  const beat = Math.sin(ph * Math.PI * 2);
-  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
-  g.save();
-  g.translate(64, 64);
-
-  // Crescent tail fluke with energy wake.
-  g.save();
-  g.translate(-32, 0);
-  g.rotate(beat * 0.16);
-  g.beginPath();
-  g.moveTo(2, -1.5);
-  g.quadraticCurveTo(-8, -4, -15, -13);
-  g.quadraticCurveTo(-9, -4, -11, 0);
-  g.quadraticCurveTo(-9, 4, -14, 11);
-  g.quadraticCurveTo(-8, 4, 2, 1.5);
-  g.closePath();
-  g.fillStyle = hsl(hue, 60, 46, 0.5);
-  g.fill();
-  g.strokeStyle = hsl(hue, 90, 82, 0.6);
-  g.lineWidth = 1;
-  g.stroke();
-  // Tail energy wake — gradient fade trailing behind
-  g.globalCompositeOperation = 'lighter';
-  const wakeGr = g.createLinearGradient(-11, 0, -26, 0);
-  wakeGr.addColorStop(0, hsl(hue, 100, 70, 0.4 * pulse));
-  wakeGr.addColorStop(1, hsl(hue, 100, 60, 0));
-  g.fillStyle = wakeGr;
-  g.beginPath();
-  g.moveTo(-11, -5);
-  g.quadraticCurveTo(-20, -3, -26, 0);
-  g.quadraticCurveTo(-20, 3, -11, 5);
-  g.closePath();
-  g.fill();
-  g.restore();
-
-  // Long pectoral blade with edge glow.
-  g.beginPath();
-  g.moveTo(10, 5);
-  g.quadraticCurveTo(2, 12, -10, 17);
-  g.quadraticCurveTo(-2, 10, 2, 4);
-  g.closePath();
-  g.fillStyle = hsl(hue, 60, 40, 0.55);
-  g.fill();
-  g.strokeStyle = hsl(hue, 90, 80, 0.45);
-  g.lineWidth = 1;
-  g.stroke();
+/** Horizontal scan-lines overlay for holographic display effect. */
+function scanLines(g, hue, x, y, w, h, alpha = 0.07, spacing = 3) {
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 75, 0.3 * pulse);
-  g.lineWidth = 2;
-  g.beginPath();
-  g.moveTo(10, 5);
-  g.quadraticCurveTo(2, 12, -10, 17);
-  g.stroke();
-  g.restore();
-
-  // Dorsal fin.
-  g.beginPath();
-  g.moveTo(-2, -10);
-  g.quadraticCurveTo(2, -16, 7, -10);
-  g.closePath();
-  g.fillStyle = hsl(hue, 60, 50, 0.5);
-  g.fill();
-
-  // Sleek body.
-  g.beginPath();
-  g.moveTo(34, -3);
-  g.bezierCurveTo(30, -9, 18, -11, 4, -11);
-  g.bezierCurveTo(-12, -11, -26, -6, -33, -1.5);
-  g.lineTo(-33, 1.5);
-  g.bezierCurveTo(-26, 6, -12, 10, 4, 10);
-  g.bezierCurveTo(18, 10, 30, 7, 34, 3);
-  g.quadraticCurveTo(36, 0, 34, -3);
-  g.closePath();
-  g.fillStyle = glass(g, hue, -12, 11);
-  g.fill();
-  sheen(g, hue, 8, -6, 20, 5);
-  g.beginPath();
-  g.moveTo(34, -3);
-  g.bezierCurveTo(30, -9, 18, -11, 4, -11);
-  g.bezierCurveTo(-12, -11, -26, -6, -33, -1.5);
-  rimStroke(g, hue);
-  g.beginPath();
-  g.moveTo(31, -2.5);
-  g.bezierCurveTo(27, -7.5, 17, -9.5, 4, -9.5);
-  g.bezierCurveTo(-11, -9.5, -24, -5, -30, -1.5);
-  innerLine(g, hue);
-
-  // Bioluminescent energy veins along body.
-  const veinA = 0.25 + 0.2 * pulse;
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 68, veinA);
-  g.lineWidth = 0.6;
-  g.beginPath();
-  g.moveTo(28, -2);
-  g.quadraticCurveTo(14, -6, 0, -5);
-  g.quadraticCurveTo(-14, -4, -28, -1);
-  g.stroke();
-  g.beginPath();
-  g.moveTo(26, 2);
-  g.quadraticCurveTo(10, 6, -6, 5);
-  g.quadraticCurveTo(-18, 4, -30, 1);
-  g.stroke();
-  // Branching vein tendrils.
-  g.strokeStyle = hsl(hue, 90, 65, veinA * 0.6);
-  g.lineWidth = 0.4;
-  for (let i = 0; i < 5; i++) {
-    const vx = 22 - i * 11;
-    const vy = -2 + Math.sin(i * 1.2 + ph * Math.PI * 2) * 2;
+  g.strokeStyle = hsl(hue, 60, 80, alpha);
+  g.lineWidth = 0.5;
+  for (let sy = y; sy < y + h; sy += spacing) {
     g.beginPath();
-    g.moveTo(vx, vy);
-    g.quadraticCurveTo(vx - 3, vy - 4, vx - 6, vy - 5);
-    g.stroke();
-    g.beginPath();
-    g.moveTo(vx, vy + 3);
-    g.quadraticCurveTo(vx - 3, vy + 6, vx - 5, vy + 7);
+    g.moveTo(x, sy);
+    g.lineTo(x + w, sy);
     g.stroke();
   }
-  // Soft vein halo.
-  g.strokeStyle = hsl(hue, 85, 60, veinA * 0.15);
-  g.lineWidth = 3;
-  g.beginPath();
-  g.moveTo(28, -2);
-  g.quadraticCurveTo(0, -5, -28, -1);
-  g.stroke();
-  g.restore();
-
-  // Belly rim.
-  g.beginPath();
-  g.moveTo(-33, 1.5);
-  g.bezierCurveTo(-26, 6, -12, 10, 4, 10);
-  g.bezierCurveTo(18, 10, 30, 7, 34, 3);
-  g.strokeStyle = hsl(hue, 80, 78, 0.4);
-  g.lineWidth = 1;
-  g.stroke();
-
-  // Enhanced photophore array along belly.
-  const photoBase = 0.6 + 0.35 * pulse;
-  for (let i = 0; i < 6; i++) {
-    const px = 24 - i * 10;
-    const py = 6.5 - i * 0.5 + Math.sin(i * 0.8 + ph * Math.PI * 2) * 0.5;
-    dot(g, hue, px, py, 1.3 - i * 0.08, photoBase);
-    if (i < 3) dot(g, hue, px + 2, py - 1, 0.7, photoBase * 0.5);
-  }
-  // Internal energy cores.
-  core(g, hue, 10, -1, 14, 0.22 + 0.12 * pulse);
-  core(g, hue, -8, 1, 10, 0.15 + 0.08 * pulse);
-  // Eye — intense layered glow.
-  dot(g, hue, 26, -3, 2.0, 1);
-  core(g, hue, 26, -3, 5, 0.4 + 0.15 * pulse);
   g.restore();
 }
 
-/* ---------------- ALGO: crystalline dart ---------------- */
-function drawAlgo(g, hue, ph) {
-  const beat = Math.sin(ph * Math.PI * 2);
-  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
-  g.save();
-  g.translate(64, 64);
-
-  // Thruster tail flame — bright core + gradient cone pulsing at the rear.
+/** Flowing data particles interpolated along a path. */
+function dataParticles(g, hue, positions, phase, alpha = 0.8) {
   g.save();
   g.globalCompositeOperation = 'lighter';
-  const flameGr = g.createLinearGradient(-28, 0, -46, 0);
-  flameGr.addColorStop(0, hsl(hue, 100, 78, 0.5 * pulse));
-  flameGr.addColorStop(0.5, hsl(hue, 100, 66, 0.22 * pulse));
-  flameGr.addColorStop(1, hsl(hue, 100, 60, 0));
-  g.fillStyle = flameGr;
-  g.beginPath();
-  g.moveTo(-28, -4);
-  g.quadraticCurveTo(-40, -2 - beat, -46, 0);
-  g.quadraticCurveTo(-40, 2 + beat, -28, 4);
-  g.closePath();
-  g.fill();
-  g.restore();
-  core(g, hue, -28, 0, 8, 0.35 * pulse);
-
-  // Swept wing fins.
-  for (const s of [-1, 1]) {
+  const count = 4;
+  for (let i = 0; i < count; i++) {
+    const t = (phase + i / count) % 1;
+    const idx = t * (positions.length - 1);
+    const lo = Math.floor(idx);
+    const hi = Math.min(lo + 1, positions.length - 1);
+    const frac = idx - lo;
+    const px = positions[lo][0] + (positions[hi][0] - positions[lo][0]) * frac;
+    const py = positions[lo][1] + (positions[hi][1] - positions[lo][1]) * frac;
+    const bright = 0.5 + 0.5 * Math.sin(t * Math.PI);
+    g.fillStyle = hsl(hue, 100, 85, alpha * bright);
     g.beginPath();
-    g.moveTo(8, s * 7);
-    g.quadraticCurveTo(-2, s * (16 + beat), -14, s * (19 + beat));
-    g.quadraticCurveTo(-6, s * 10, -10, s * 5);
-    g.closePath();
-    g.fillStyle = hsl(hue, 60, 44, 0.45);
+    g.arc(px, py, 1.0, 0, Math.PI * 2);
     g.fill();
-    g.strokeStyle = hsl(hue, 90, 82, 0.5);
-    g.lineWidth = 1;
-    g.stroke();
-    // Wing edge glow — neon leading edge along the swept wing.
+    g.fillStyle = hsl(hue, 100, 70, alpha * bright * 0.3);
+    g.beginPath();
+    g.arc(px, py, 2.4, 0, Math.PI * 2);
+    g.fill();
+  }
+  g.restore();
+}
+
+/** Holographic iridescent gradient fill (hue→violet→magenta shift). */
+function holoFill(g, hue, x0, y0, x1, y1, alpha = 0.2) {
+  const gr = g.createLinearGradient(x0, y0, x1, y1);
+  gr.addColorStop(0, hsl(hue, 90, 60, alpha));
+  gr.addColorStop(0.35, hsl(hue + 40, 85, 55, alpha * 0.8));
+  gr.addColorStop(0.65, hsl(hue + 80, 80, 50, alpha * 0.6));
+  gr.addColorStop(1, hsl(hue + 120, 90, 60, alpha * 0.4));
+  return gr;
+}
+
+/* ---------------- WHALE: Dreadnought (装甲巨鲸) ---------------- */
+function drawWhale(g, hue, ph) {
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
+  g.save();
+  g.translate(64, 64);
+
+  // Main hull — angular dreadnought polygon
+  const hull = [
+    [32, -1], [26, -9], [14, -13], [0, -14], [-14, -12], [-26, -7],
+    [-33, -2], [-34, 2], [-26, 7], [-14, 11], [0, 12], [14, 11], [26, 7], [32, 2]
+  ];
+
+  // Dark body fill
+  g.beginPath();
+  g.moveTo(hull[0][0], hull[0][1]);
+  for (let i = 1; i < hull.length; i++) g.lineTo(hull[i][0], hull[i][1]);
+  g.closePath();
+  g.fillStyle = hsl(hue, 40, 8, 0.92);
+  g.fill();
+
+  // Holographic panel + scan-lines clipped to hull
+  g.save();
+  g.beginPath();
+  g.moveTo(hull[0][0], hull[0][1]);
+  for (let i = 1; i < hull.length; i++) g.lineTo(hull[i][0], hull[i][1]);
+  g.closePath();
+  g.clip();
+  g.fillStyle = holoFill(g, hue, -30, -14, 30, 2, 0.18);
+  g.fillRect(-34, -14, 68, 16);
+  scanLines(g, hue, -34, -14, 68, 26, 0.06, 3.5);
+  g.restore();
+
+  // Armor plate seams — glowing vertical divisions
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 90, 65, 0.3 * pulse);
+  g.lineWidth = 0.6;
+  const seams = [[-18, -11, -18, 10], [-4, -14, -4, 12], [10, -13, 10, 11], [22, -9, 22, 8]];
+  for (const s of seams) {
+    g.beginPath(); g.moveTo(s[0], s[1]); g.lineTo(s[2], s[3]); g.stroke();
+  }
+  g.restore();
+
+  // Neon hull outline
+  neonEdge(g, hue, hull, 0.85, 1.5);
+
+  // Circuit traces along body length
+  circuitTrace(g, hue, [
+    [[28, -3], [20, -3], [20, -7], [8, -7], [8, -3], [-4, -3], [-4, -8], [-16, -8], [-16, -3], [-28, -3]],
+    [[26, 4], [18, 4], [18, 8], [6, 8], [6, 4], [-8, 4], [-8, 7], [-20, 7], [-20, 3], [-30, 2]]
+  ], 0.35 * pulse);
+
+  // Angular tail fin — sharp triangular fluke
+  const tail = [[-33, -2], [-46, -13], [-42, 0], [-46, 13], [-33, 2]];
+  g.beginPath();
+  g.moveTo(tail[0][0], tail[0][1]);
+  for (let i = 1; i < tail.length; i++) g.lineTo(tail[i][0], tail[i][1]);
+  g.closePath();
+  g.fillStyle = hsl(hue, 40, 6, 0.9);
+  g.fill();
+  neonEdge(g, hue, tail, 0.7, 1.2);
+
+  // Thruster ports along bottom — 4 angular slots with glow
+  for (let i = 0; i < 4; i++) {
+    const tx = 16 - i * 12;
     g.save();
     g.globalCompositeOperation = 'lighter';
-    g.strokeStyle = hsl(hue, 95, 78, 0.4 * pulse);
-    g.lineWidth = 1.4;
+    const tGr = g.createLinearGradient(tx, 11, tx, 17);
+    tGr.addColorStop(0, hsl(hue, 100, 70, 0.4 * pulse));
+    tGr.addColorStop(1, hsl(hue, 100, 60, 0));
+    g.fillStyle = tGr;
     g.beginPath();
-    g.moveTo(8, s * 7);
-    g.quadraticCurveTo(-2, s * (16 + beat), -14, s * (19 + beat));
-    g.stroke();
+    g.moveTo(tx - 3, 11); g.lineTo(tx + 3, 11);
+    g.lineTo(tx + 2, 16); g.lineTo(tx - 2, 16);
+    g.closePath(); g.fill();
     g.restore();
   }
 
-  // Trailing filaments.
-  g.strokeStyle = hsl(hue, 85, 78, 0.45);
-  g.lineWidth = 1;
-  g.beginPath();
-  g.moveTo(-28, -1);
-  g.quadraticCurveTo(-38, -3 - beat, -44, -2 - beat * 2);
-  g.moveTo(-28, 1);
-  g.quadraticCurveTo(-38, 3 + beat, -44, 2 + beat * 2);
-  g.stroke();
-
-  // Dart body.
-  g.beginPath();
-  g.moveTo(34, 0);
-  g.lineTo(14, -8);
-  g.lineTo(-16, -6);
-  g.lineTo(-28, 0);
-  g.lineTo(-16, 6);
-  g.lineTo(14, 8);
-  g.closePath();
-  g.fillStyle = glass(g, hue, -9, 9);
-  g.fill();
-  sheen(g, hue, 6, -4, 16, 4);
-  g.beginPath();
-  g.moveTo(34, 0);
-  g.lineTo(14, -8);
-  g.lineTo(-16, -6);
-  g.lineTo(-28, 0);
-  rimStroke(g, hue, 0.85, 1.3);
-  g.beginPath();
-  g.moveTo(31, 0);
-  g.lineTo(13, -6.5);
-  g.lineTo(-15, -4.8);
-  innerLine(g, hue, 0.3);
-  dot(g, hue, 2, -4, 0.9, 0.6);
-  dot(g, hue, -8, 3, 0.8, 0.5);
-  // Facet lines.
-  g.strokeStyle = hsl(hue, 75, 80, 0.3);
-  g.lineWidth = 0.8;
-  g.beginPath();
-  g.moveTo(14, -8);
-  g.lineTo(-4, 0);
-  g.lineTo(14, 8);
-  g.moveTo(-4, 0);
-  g.lineTo(-28, 0);
-  g.stroke();
-
-  // Crystal refraction lines — faceted glow along the crystal planes.
-  const refrA = 0.3 + 0.25 * pulse;
-  energyVein(g, hue, [[30, 0], [14, -7], [-4, 0], [-26, 0]], refrA, 0.7);
-  energyVein(g, hue, [[-4, 0], [14, 7], [28, 0]], refrA * 0.8, 0.6);
-  energyVein(g, hue, [[14, -8], [-4, 0], [14, 8]], refrA * 0.55, 0.5);
-
-  core(g, hue, 8, 0, 12, 0.3 + 0.12 * pulse);
-
-  // Speed particles — energy flowing aft along the body, offset by phase.
-  for (let i = 0; i < 3; i++) {
-    const sp = (ph + i * 0.33) % 1;
-    const sx = 30 - sp * 56;
-    const sy = Math.sin(sp * Math.PI * 2 + i) * 2.5;
-    dot(g, hue, sx, sy, 0.8 - i * 0.1, 0.5 + 0.3 * Math.sin(sp * Math.PI * 2));
-  }
-
-  // Visor slit — brighter, with a pulsing core glowing behind it.
-  core(g, hue, 22, -1, 7, 0.3 + 0.25 * pulse);
+  // Diamond eye — bright neon
   g.save();
   g.globalCompositeOperation = 'lighter';
-  g.fillStyle = hsl(hue, 100, 88, 0.95);
+  g.fillStyle = hsl(hue, 100, 92, 0.95);
   g.beginPath();
-  g.ellipse(22, -1, 5, 1.6 * (0.8 + 0.3 * pulse), 0, 0, Math.PI * 2);
-  g.fill();
+  g.moveTo(26, -4); g.lineTo(29, -1); g.lineTo(26, 2); g.lineTo(23, -1);
+  g.closePath(); g.fill();
   g.restore();
-  dot(g, hue, -16, 0, 1.2, 0.7);
+  core(g, hue, 26, -1, 6, 0.4 * pulse);
+
+  // Data particles flowing tail→head
+  dataParticles(g, hue, [[-30, 0], [-18, -2], [-6, 1], [6, -1], [18, 0], [28, -1]], ph, 0.7);
+
+  // Glitch effect — horizontal slice offset
+  if (ph === 0.5) {
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    g.beginPath(); g.rect(-34, -3, 68, 4); g.clip();
+    g.translate(2, 0);
+    g.strokeStyle = hsl(hue + 60, 100, 70, 0.18);
+    g.lineWidth = 1.2;
+    g.beginPath(); g.moveTo(-34, -1); g.lineTo(34, -1); g.stroke();
+    g.restore();
+  }
+
   g.restore();
 }
 
-/* ---------------- APE: armored glider ---------------- */
-function drawApe(g, hue, ph) {
-  const step = Math.sin(ph * Math.PI * 2);
+/* ---------------- ALGO: Interceptor (截击镖) ---------------- */
+function drawAlgo(g, hue, ph) {
   const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
+  const glitch = (ph === 0.25 || ph === 0.75) ? 2 : 0;
   g.save();
   g.translate(64, 64);
 
-  // Tucked leg blades, thin and swept back.
-  g.strokeStyle = hsl(hue, 70, 62, 0.5);
-  g.lineWidth = 1.2;
-  g.lineCap = 'round';
-  for (let i = 0; i < 3; i++) {
-    const x = 10 - i * 10;
-    const sw = step * 2 + i;
-    g.beginPath();
-    g.moveTo(x, 8);
-    g.quadraticCurveTo(x - 4, 12 + sw * 0.4, x - 8, 14 + sw * 0.6);
-    g.stroke();
-    // Joint energy node at each leg attachment, staggered around the body.
-    pulseNode(g, hue, x, 8, 1.3, ph, i * 0.33, 0.8);
-  }
+  // Main dart body — sharp angular stealth silhouette
+  const body = [[34, 0], [12, -7], [-12, -5], [-28, 0], [-12, 5], [12, 7]];
 
-  // Antennae, fine curves.
-  g.strokeStyle = hsl(hue, 85, 80, 0.6);
-  g.lineWidth = 1;
+  // Dark fill
   g.beginPath();
-  g.moveTo(20, -4);
-  g.quadraticCurveTo(30, -8, 38, -9 + step);
-  g.moveTo(20, 2);
-  g.quadraticCurveTo(30, 4, 38, 6 - step);
-  g.stroke();
-  // Antenna glowing tips.
-  dot(g, hue, 38, -9 + step, 1.2, 0.95);
-  dot(g, hue, 38, 6 - step, 1.2, 0.95);
-
-  // Tail fan.
-  g.beginPath();
-  g.moveTo(-20, 0);
-  g.lineTo(-30, -6);
-  g.lineTo(-28, 0);
-  g.lineTo(-30, 6);
+  g.moveTo(body[0][0], body[0][1]);
+  for (let i = 1; i < body.length; i++) g.lineTo(body[i][0], body[i][1]);
   g.closePath();
-  g.fillStyle = hsl(hue, 60, 46, 0.5);
+  g.fillStyle = hsl(hue, 35, 6, 0.93);
   g.fill();
-  // Tail fan energy edge.
-  g.save();
-  g.globalCompositeOperation = 'lighter';
-  g.strokeStyle = hsl(hue, 95, 78, 0.5 * pulse);
-  g.lineWidth = 1;
-  g.beginPath();
-  g.moveTo(-30, -6);
-  g.lineTo(-28, 0);
-  g.lineTo(-30, 6);
-  g.stroke();
-  g.restore();
 
-  // Shell: pointed front, rounded back.
-  g.beginPath();
-  g.moveTo(24, 0);
-  g.bezierCurveTo(20, -9, 8, -12, -4, -12);
-  g.bezierCurveTo(-14, -12, -20, -7, -21, 0);
-  g.bezierCurveTo(-20, 7, -14, 12, -4, 12);
-  g.bezierCurveTo(8, 12, 20, 9, 24, 0);
-  g.closePath();
-  g.fillStyle = glass(g, hue, -12, 12);
-  g.fill();
-  sheen(g, hue, 2, -6, 16, 4.5);
-  g.beginPath();
-  g.moveTo(24, 0);
-  g.bezierCurveTo(20, -9, 8, -12, -4, -12);
-  g.bezierCurveTo(-14, -12, -20, -7, -21, 0);
-  rimStroke(g, hue, 0.9, 1.4);
-  g.beginPath();
-  g.moveTo(21, 0);
-  g.bezierCurveTo(18, -7.5, 8, -10.2, -4, -10.2);
-  g.bezierCurveTo(-13, -10.2, -18, -6, -19, 0);
-  innerLine(g, hue, 0.3);
-  // Segment arcs.
-  g.strokeStyle = hsl(hue, 70, 80, 0.26);
-  g.lineWidth = 0.9;
-  for (let i = 0; i < 4; i++) {
-    const x = 12 - i * 8;
+  // Swept-back wing triangles — two angular wings
+  for (const s of [-1, 1]) {
+    const wing = [[8, s * 6], [-4, s * 20], [-16, s * 17], [-12, s * 4]];
     g.beginPath();
-    g.moveTo(x, -10 + i * 0.6);
-    g.quadraticCurveTo(x - 4, 0, x, 10 - i * 0.6);
-    g.stroke();
-  }
-  // Shell seam glow — energy leaking through the armor cracks.
-  const seamA = 0.3 + 0.3 * pulse;
-  for (let i = 0; i < 4; i++) {
-    const x = 12 - i * 8;
-    const flick = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2 + i);
-    energyVein(g, hue, [[x, -9 + i * 0.6], [x - 4, 0], [x, 9 - i * 0.6]], seamA * flick, 0.7);
-  }
-  // Shell bioluminescent spots — deterministic scatter across the carapace.
-  for (let i = 0; i < 4; i++) {
-    const sx = 14 - i * 8;
-    const sy = (i % 2 === 0 ? -5 : 5) + (i === 1 ? 2 : -1);
-    dot(g, hue, sx, sy, 0.9, 0.5 + 0.2 * Math.sin(ph * Math.PI * 2 + i * 1.3));
-  }
-  core(g, hue, 4, 0, 12, 0.26 + 0.1 * pulse);
-  // Eyes — layered glow with a core burning behind each.
-  core(g, hue, 18, -4, 4, 0.35 * pulse);
-  core(g, hue, 18, 3, 4, 0.3 * pulse);
-  dot(g, hue, 18, -4, 1.7, 1);
-  dot(g, hue, 18, 3, 1.4, 0.9);
-  g.restore();
-}
-
-/* ---------------- INSIDER: ribbon of light ---------------- */
-function drawInsider(g, hue, ph) {
-  g.save();
-  g.translate(64, 64);
-  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
-  const N = 28;
-  const xs = [];
-  const ys = [];
-  const ws = [];
-  for (let i = 0; i <= N; i++) {
-    const t = i / N;
-    xs.push(32 - t * 70);
-    ys.push(Math.sin(t * 3.6 + ph * Math.PI * 2) * (7 * (0.4 + t * 0.8)));
-    ws.push((5.5 - t * 4.4) * 0.5 + 0.4);
-  }
-  const perp = (i) => {
-    const dx = xs[Math.min(N, i + 1)] - xs[Math.max(0, i - 1)];
-    const dy = ys[Math.min(N, i + 1)] - ys[Math.max(0, i - 1)];
-    const len = Math.hypot(dx, dy) || 1;
-    return [-dy / len, dx / len];
-  };
-  // Closed ribbon body path (reused for the fill and its additive glow pass).
-  const ribbonPath = () => {
-    g.beginPath();
-    for (let i = 0; i <= N; i++) {
-      const [nx, ny] = perp(i);
-      const px = xs[i] + nx * ws[i] * 2;
-      const py = ys[i] + ny * ws[i] * 2;
-      if (i === 0) g.moveTo(px, py);
-      else g.lineTo(px, py);
-    }
-    for (let i = N; i >= 0; i--) {
-      const [nx, ny] = perp(i);
-      g.lineTo(xs[i] - nx * ws[i] * 2, ys[i] - ny * ws[i] * 2);
-    }
+    g.moveTo(wing[0][0], wing[0][1]);
+    for (let i = 1; i < wing.length; i++) g.lineTo(wing[i][0], wing[i][1]);
     g.closePath();
-  };
-  // Open edge path at a given offset multiplier (2 dorsal, -2 ventral, etc.).
-  const edgePath = (mul) => {
+    g.fillStyle = hsl(hue, 35, 7, 0.9);
+    g.fill();
+    neonEdge(g, hue, wing, 0.75, 1.2);
+    // Scan-lines concentrated on wings
+    g.save();
     g.beginPath();
-    for (let i = 0; i <= N; i++) {
-      const [nx, ny] = perp(i);
-      const px = xs[i] + nx * ws[i] * mul;
-      const py = ys[i] + ny * ws[i] * mul;
-      if (i === 0) g.moveTo(px, py);
-      else g.lineTo(px, py);
-    }
-    g.stroke();
-  };
-  // Ribbon body.
-  ribbonPath();
-  g.fillStyle = glass(g, hue, -8, 8);
-  g.fill();
-  // Whole-ribbon glow increase — additive second pass, bright at the head.
+    g.moveTo(wing[0][0], wing[0][1]);
+    for (let i = 1; i < wing.length; i++) g.lineTo(wing[i][0], wing[i][1]);
+    g.closePath(); g.clip();
+    scanLines(g, hue, -18, s > 0 ? 4 : -20, 28, 16, 0.09, 3);
+    g.restore();
+  }
+
+  // Neon body edge
+  neonEdge(g, hue, body, 0.9, 1.5);
+
+  // Central spine with circuit nodes
   g.save();
   g.globalCompositeOperation = 'lighter';
-  ribbonPath();
-  const bodyGr = g.createLinearGradient(32, 0, -38, 0);
-  bodyGr.addColorStop(0, hsl(hue, 100, 72, 0.28 * pulse));
-  bodyGr.addColorStop(1, hsl(hue, 100, 62, 0.05));
-  g.fillStyle = bodyGr;
-  g.fill();
-  // Edge-lit dorsal & ventral: a wide soft glow underneath each bright core.
-  g.strokeStyle = hsl(hue, 95, 70, 0.18);
-  g.lineWidth = 3.2;
-  edgePath(2);
-  g.strokeStyle = hsl(hue, 95, 86, 0.9);
-  g.lineWidth = 1.5;
-  edgePath(2);
-  g.strokeStyle = hsl(hue, 95, 80, 0.34);
-  g.lineWidth = 0.9;
-  edgePath(1.1);
-  g.strokeStyle = hsl(hue, 90, 68, 0.16);
-  g.lineWidth = 3;
-  edgePath(-2);
-  g.strokeStyle = hsl(hue, 92, 84, 0.62);
-  g.lineWidth = 1.3;
-  edgePath(-2);
-  // Ethereal wisps — short energy tendrils branching off the ribbon.
-  g.strokeStyle = hsl(hue, 95, 78, 0.22 * pulse);
-  g.lineWidth = 0.8;
-  for (let i = 0; i < 3; i++) {
-    const wi = 5 + i * 8;
-    const [nx, ny] = perp(wi);
-    const bx = xs[wi] + nx * ws[wi] * 2;
-    const by = ys[wi] + ny * ws[wi] * 2;
-    const dir = i % 2 === 0 ? 1 : -1;
-    g.beginPath();
-    g.moveTo(bx, by);
-    g.quadraticCurveTo(bx - 5, by + dir * 7, bx - 11, by + dir * (9 + Math.sin(ph * Math.PI * 2 + i) * 2));
-    g.stroke();
+  g.strokeStyle = hsl(hue, 90, 70, 0.45 * pulse);
+  g.lineWidth = 0.7;
+  g.beginPath(); g.moveTo(30, 0); g.lineTo(-24, 0); g.stroke();
+  for (let i = 0; i < 5; i++) {
+    const nx = 24 - i * 11;
+    g.fillStyle = hsl(hue, 100, 80, 0.55 * pulse);
+    g.beginPath(); g.arc(nx, 0, 1.0, 0, Math.PI * 2); g.fill();
   }
   g.restore();
-  // Head teardrop with eye.
+
+  // Engine exhaust — bright triangular glow cone at rear
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  const exGr = g.createLinearGradient(-28, 0, -46, 0);
+  exGr.addColorStop(0, hsl(hue, 100, 80, 0.55 * pulse));
+  exGr.addColorStop(0.4, hsl(hue, 100, 65, 0.2 * pulse));
+  exGr.addColorStop(1, hsl(hue, 100, 60, 0));
+  g.fillStyle = exGr;
   g.beginPath();
-  g.moveTo(32, ys[0] - 4);
-  g.quadraticCurveTo(40, ys[0] - 1, 39, ys[0] + 1);
-  g.quadraticCurveTo(37, ys[0] + 3, 32, ys[0] + 4);
-  g.closePath();
-  g.fillStyle = hsl(hue, 60, 52, 0.6);
-  g.fill();
-  // Head concentrated light — intense focal point at the leading edge.
-  core(g, hue, 30, ys[1], 11, 0.3 + 0.18 * pulse);
-  core(g, hue, 33, ys[0], 6, 0.4 * pulse);
-  // Energy pulse nodes — staggered offsets create a traveling pulse.
-  for (let i = 4, k = 0; i < N - 2; i += 5, k++) {
-    pulseNode(g, hue, xs[i], ys[i], 1.3, ph, k * 0.2, 0.85);
+  g.moveTo(-28, -4); g.lineTo(-46, 0); g.lineTo(-28, 4);
+  g.closePath(); g.fill();
+  g.restore();
+
+  // Glitch effect — prominent digital instability on this species
+  if (glitch > 0) {
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    g.beginPath(); g.rect(-30, -4, 64, 3); g.clip();
+    g.translate(glitch, 0);
+    g.strokeStyle = hsl(hue + 90, 100, 75, 0.25);
+    g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(-28, -2); g.lineTo(32, -2); g.stroke();
+    g.restore();
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    g.beginPath(); g.rect(-30, 2, 64, 3); g.clip();
+    g.translate(-glitch, 0);
+    g.strokeStyle = hsl(hue - 40, 100, 70, 0.2);
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(-28, 3); g.lineTo(32, 3); g.stroke();
+    g.restore();
   }
-  dot(g, hue, 34, ys[0] - 1.5, 1.7, 1);
+
+  // Visor — bright angular diamond eye slit
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = hsl(hue, 100, 92, 0.95);
+  g.beginPath();
+  g.moveTo(28, -2); g.lineTo(33, 0); g.lineTo(28, 2); g.lineTo(24, 0);
+  g.closePath(); g.fill();
+  g.restore();
+  core(g, hue, 28, 0, 6, 0.35 * pulse);
+
+  g.restore();
+}
+
+/* ---------------- APE: Hexapod (六边形装甲节肢) ---------------- */
+function drawApe(g, hue, ph) {
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
+  g.save();
+  g.translate(64, 64);
+
+  // Hexagonal shell vertices — flat-top hexagon
+  const R = 15;
+  const hex = [];
+  for (let i = 0; i < 6; i++) {
+    const a = (Math.PI / 3) * i - Math.PI / 6;
+    hex.push([Math.cos(a) * R * 1.3, Math.sin(a) * R]);
+  }
+
+  // 6 angular legs — 3 per side, 2 segments each, sharp joints
+  for (let side = -1; side <= 1; side += 2) {
+    for (let i = 0; i < 3; i++) {
+      const bx = -9 + i * 9;
+      const by = side * 13;
+      const mx = bx + (i - 1) * 4;
+      const my = side * 21;
+      const tx = mx + (i - 1) * 3;
+      const ty = side * 27;
+      g.strokeStyle = hsl(hue, 55, 38, 0.8);
+      g.lineWidth = 1.2;
+      g.beginPath(); g.moveTo(bx, by); g.lineTo(mx, my); g.lineTo(tx, ty); g.stroke();
+      // Neon edge on legs
+      g.save();
+      g.globalCompositeOperation = 'lighter';
+      g.strokeStyle = hsl(hue, 90, 65, 0.25 * pulse);
+      g.lineWidth = 2.5;
+      g.beginPath(); g.moveTo(bx, by); g.lineTo(mx, my); g.lineTo(tx, ty); g.stroke();
+      g.restore();
+      // Pulsing joint dots
+      const jp = 0.5 + 0.5 * Math.sin((ph + i * 0.15 + (side > 0 ? 0.08 : 0)) * Math.PI * 2);
+      dot(g, hue, mx, my, 1.0 * jp, 0.7 * jp);
+      dot(g, hue, tx, ty, 0.8 * jp, 0.5 * jp);
+    }
+  }
+
+  // Hex shell — dark fill
+  g.beginPath();
+  g.moveTo(hex[0][0], hex[0][1]);
+  for (let i = 1; i < 6; i++) g.lineTo(hex[i][0], hex[i][1]);
+  g.closePath();
+  g.fillStyle = hsl(hue, 40, 7, 0.93);
+  g.fill();
+
+  // Holographic sheen + scan-lines clipped to hex
+  g.save();
+  g.beginPath();
+  g.moveTo(hex[0][0], hex[0][1]);
+  for (let i = 1; i < 6; i++) g.lineTo(hex[i][0], hex[i][1]);
+  g.closePath(); g.clip();
+  g.fillStyle = holoFill(g, hue, -R, -R, R, R, 0.16);
+  g.fillRect(-R * 1.5, -R, R * 3, R * 2);
+  scanLines(g, hue, -R * 1.5, -R, R * 3, R * 2, 0.05, 4);
+  g.restore();
+
+  // Circuit board pattern inside hex shell
+  circuitTrace(g, hue, [
+    [[-8, -6], [-8, 0], [0, 0], [0, -8], [8, -8]],
+    [[-6, 6], [0, 6], [0, 2], [6, 2], [6, 8]],
+    [[-12, 0], [-8, 0], [-4, 4], [4, 4], [8, 0], [12, 0]]
+  ], 0.4 * pulse);
+
+  // Neon hex edge
+  neonEdge(g, hue, hex, 0.9, 1.5);
+
+  // Angular antennae with bright tips
+  for (const s of [-1, 1]) {
+    g.strokeStyle = hsl(hue, 70, 55, 0.7);
+    g.lineWidth = 0.8;
+    g.beginPath();
+    g.moveTo(17, s * 4); g.lineTo(25, s * 9); g.lineTo(33, s * 7);
+    g.stroke();
+    dot(g, hue, 33, s * 7, 1.3, 0.9 * pulse);
+  }
+
+  // Armored visor — triangular slit at front, glowing
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = hsl(hue, 100, 88, 0.9);
+  g.beginPath();
+  g.moveTo(19, -3); g.lineTo(24, 0); g.lineTo(19, 3);
+  g.closePath(); g.fill();
+  g.restore();
+  core(g, hue, 20, 0, 5, 0.35 * pulse);
+
+  // Data particles circulating inside hexagon
+  dataParticles(g, hue, hex, ph, 0.6);
+
+  g.restore();
+}
+
+/* ---------------- INSIDER: Data Serpent (数据蛇) ---------------- */
+function drawInsider(g, hue, ph) {
+  const pulse = 0.7 + 0.3 * Math.sin(ph * Math.PI * 2);
+  g.save();
+  g.translate(64, 64);
+
+  // Generate 9 diamond segments along a sine-wave path
+  const SEGS = 9;
+  const segs = [];
+  for (let i = 0; i < SEGS; i++) {
+    const t = i / (SEGS - 1);
+    const x = 30 - t * 62;
+    const y = Math.sin(t * 3.2 + ph * Math.PI * 2) * (5 + t * 4);
+    const size = 6.5 - t * 3.8;
+    segs.push({ x, y, size, hueOff: i * 14 });
+  }
+
+  // Connecting data-link lines between segments
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < SEGS - 1; i++) {
+    const a = segs[i], b = segs[i + 1];
+    g.strokeStyle = hsl(hue + a.hueOff, 90, 70, 0.45 * pulse);
+    g.lineWidth = 1.0;
+    g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+    // Wider glow pass
+    g.strokeStyle = hsl(hue + a.hueOff, 90, 60, 0.12);
+    g.lineWidth = 3;
+    g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+  }
+  g.restore();
+
+  // Draw each diamond/rhombus segment (tail first so head overlaps)
+  for (let i = SEGS - 1; i >= 0; i--) {
+    const s = segs[i];
+    const segHue = hue + s.hueOff;
+    const diamond = [
+      [s.x + s.size, s.y],
+      [s.x, s.y - s.size * 0.6],
+      [s.x - s.size, s.y],
+      [s.x, s.y + s.size * 0.6]
+    ];
+    // Dark fill
+    g.beginPath();
+    g.moveTo(diamond[0][0], diamond[0][1]);
+    for (let j = 1; j < 4; j++) g.lineTo(diamond[j][0], diamond[j][1]);
+    g.closePath();
+    g.fillStyle = hsl(segHue, 35, 7, 0.92);
+    g.fill();
+    // Holographic fill on leading segments
+    if (i < 5) {
+      g.save();
+      g.beginPath();
+      g.moveTo(diamond[0][0], diamond[0][1]);
+      for (let j = 1; j < 4; j++) g.lineTo(diamond[j][0], diamond[j][1]);
+      g.closePath(); g.clip();
+      g.fillStyle = holoFill(g, segHue, s.x - s.size, s.y - s.size, s.x + s.size, s.y + s.size, 0.18);
+      g.fillRect(s.x - s.size, s.y - s.size, s.size * 2, s.size * 2);
+      g.restore();
+    }
+    // Neon edge per segment
+    neonEdge(g, segHue, diamond, 0.8 - i * 0.04, 1.3 - i * 0.06);
+  }
+
+  // Head segment — larger with triangular eye visor
+  const head = segs[0];
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.fillStyle = hsl(hue, 100, 92, 0.95);
+  g.beginPath();
+  g.moveTo(head.x + 3, head.y - 2.5);
+  g.lineTo(head.x + 9, head.y);
+  g.lineTo(head.x + 3, head.y + 2.5);
+  g.closePath(); g.fill();
+  g.restore();
+  core(g, hue, head.x + 5, head.y, 6, 0.4 * pulse);
+
+  // Data particles flowing through connections (like data in a network cable)
+  const pts = segs.map(s => [s.x, s.y]);
+  dataParticles(g, hue + 30, pts, ph, 0.75);
+  dataParticles(g, hue + 60, pts, (ph + 0.5) % 1, 0.5);
+
+  // Scan-lines on head segment
+  g.save();
+  g.beginPath(); g.rect(head.x - 8, head.y - 6, 16, 12); g.clip();
+  scanLines(g, hue, head.x - 8, head.y - 6, 16, 12, 0.08, 3);
+  g.restore();
+
+  // Glitch on tail segments
+  if (ph === 0.75) {
+    g.save();
+    g.globalCompositeOperation = 'lighter';
+    const ts = segs[SEGS - 2];
+    g.beginPath(); g.rect(ts.x - 6, ts.y - 2, 12, 3); g.clip();
+    g.translate(-1.5, 0);
+    g.strokeStyle = hsl(hue + 120, 100, 70, 0.2);
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(ts.x - 6, ts.y); g.lineTo(ts.x + 6, ts.y); g.stroke();
+    g.restore();
+  }
+
   g.restore();
 }
 
@@ -933,7 +870,7 @@ function creatureFrames(archetype, hueBucket) {
   return frames;
 }
 
-/** Additive bioluminescent halo per hue bucket, drawn under each creature. */
+/** Additive neon bloom per hue bucket — sharp center, fast falloff, color fringe. */
 const glowCache = new Map();
 function creatureGlow(hueBucket) {
   let s = glowCache.get(hueBucket);
@@ -943,11 +880,12 @@ function creatureGlow(hueBucket) {
   c.width = c.height = 96;
   const g = c.getContext('2d');
   const grad = g.createRadialGradient(48, 48, 0, 48, 48, 48);
-  grad.addColorStop(0, hsla(hue, 100, 72, 0.65));
-  grad.addColorStop(0.15, hsla(hue, 100, 80, 0.4));
-  grad.addColorStop(0.4, hsla(hue, 100, 60, 0.22));
-  grad.addColorStop(0.6, hsla(hue + 20, 90, 55, 0.06));
-  grad.addColorStop(1, hsla(hue, 100, 60, 0));
+  // Sharp neon bloom: bright core → fast falloff → complementary fringe ring → transparent
+  grad.addColorStop(0, hsla(hue, 100, 70, 0.7));
+  grad.addColorStop(0.2, hsla(hue, 100, 60, 0.3));
+  grad.addColorStop(0.5, hsla(hue + 30, 90, 55, 0.1));
+  grad.addColorStop(0.8, hsla(hue, 100, 50, 0));
+  grad.addColorStop(1, hsla(hue, 100, 50, 0));
   g.fillStyle = grad;
   g.fillRect(0, 0, 96, 96);
   glowCache.set(hueBucket, c);
