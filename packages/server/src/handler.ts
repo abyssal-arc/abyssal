@@ -332,6 +332,9 @@ export function createApp(options: AppOptions = {}) {
         y: e.y,
         radius: e.radius,
         ticksRemaining: e.expiresTick - world.tick,
+        life: e.life,
+        affected: e.affected,
+        tx: e.tx,
         payer: e.payer,
         paid: e.paid,
       })),
@@ -405,6 +408,10 @@ export function createApp(options: AppOptions = {}) {
       height: world.config.height,
       // Live top addresses by two-way volume; the tank embodies them as whales.
       whales: arcFeed ? arcFeed.whalesPayload() : [],
+      // Who ate each meteor's plankton, so a meteor is a character with a trail.
+      eaters: Object.fromEntries(
+        txRain.map((t) => [t.hash, (world.eaters[t.hash] ?? []).slice(0, 8)]),
+      ),
       // The two hidden rules, surfaced so the tank is never a black box.
       tax: dominantTax(world),
       propositions: propositions(),
@@ -564,6 +571,32 @@ export function createApp(options: AppOptions = {}) {
         return json({ error: 'day pass required', accepts: [await burnOffer(rpcUrl, 'pass', options.token)] }, 402);
       }
       const obs = arcFeed?.observePayload();
+      const kind = url.searchParams.get('kind') ?? 'csv';
+      if (kind === 'digest') {
+        const cfg = world.config;
+        const day = Math.floor(world.tick / cfg.ticksPerDay);
+        const digest = {
+          day,
+          instance: options.instance ?? 'local',
+          population: world.creatures.length,
+          births: world.totalBorn,
+          deaths: world.totalDied,
+          predations: world.totalPredations,
+          species: world.creatures.reduce<Record<string, number>>((acc, c) => {
+            acc[c.archetype] = (acc[c.archetype] ?? 0) + 1;
+            return acc;
+          }, {}),
+          propositions: propositions(),
+        };
+        return new Response(JSON.stringify(digest, null, 2), {
+          headers: { 'content-type': 'application/json', 'content-disposition': `attachment; filename="abyssal-day-${day}.json"` },
+        });
+      }
+      if (kind === 'replay') {
+        return new Response(JSON.stringify({ pulse: obs?.pulse ?? [], flows: obs?.flows ?? [] }), {
+          headers: { 'content-type': 'application/json', 'content-disposition': 'attachment; filename="abyssal-replay.json"' },
+        });
+      }
       const rows = ['t,volume,count,x402'];
       for (const p of obs?.pulse ?? []) rows.push(`${p.t},${p.volume},${p.count},${p.x402}`);
       rows.push('t,from,to,amount,x402');
@@ -651,6 +684,7 @@ export function createApp(options: AppOptions = {}) {
       const result = applyIntervention(world, intervention as NonNullable<typeof intervention>, {
         payer: verdict.payer,
         paid: `${ABYS_PRICES[type]} ABYS`,
+        tx: txHash,
       });
       // Record only after the paid action succeeded: a burned receipt that
       // bought nothing must stay spendable.

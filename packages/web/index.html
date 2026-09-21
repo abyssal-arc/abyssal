@@ -133,6 +133,7 @@
         <div class="board-title" data-i18n="elders">Elders</div>
         <div id="lb-elders" class="board-list"></div>
       </div>
+      <div class="rules-hint" data-i18n="rulesHint"></div>
       <div id="props" class="props" hidden></div>
       <div id="world-legend" hidden>
         <span><i class="lg-creature"></i><span data-i18n="legendCreature">creature — hover to inspect</span></span>
@@ -191,7 +192,9 @@
       <div><i class="sg-dot market"></i><span data-i18n="marketHelp">MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter</span></div>
     </div>
     <div class="analytics-body">
-      <button id="export-csv" class="dock-btn" data-i18n="exportCsv">Export CSV</button>
+      <button class="dock-btn" data-export="csv" data-i18n="exportCsv">Export CSV</button>
+      <button class="dock-btn" data-export="replay" data-i18n="exportReplay">Export replay</button>
+      <button class="dock-btn" data-export="digest" data-i18n="exportDigest">Day digest</button>
       <div id="chart-wrap">
         <div class="section-title" data-i18n="popHistory">Population history</div>
         <canvas id="chart"></canvas>

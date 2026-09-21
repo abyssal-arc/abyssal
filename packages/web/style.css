@@ -326,6 +326,12 @@ body.view-observe {
 .prop b { color: var(--fg-2); font-weight: 500; }
 .props-y { margin-top: calc(var(--sp)); }
 #pulse-play { margin-left: auto; }
+.rules-hint {
+  margin-top: calc(var(--sp) * 2);
+  font-size: 9px;
+  line-height: 1.5;
+  color: var(--fg-3);
+}
 #addr-world { margin-top: calc(var(--sp) * 2); }
 .langs { position: relative; }
 .lang-menu {

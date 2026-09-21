@@ -860,6 +860,7 @@ function processSnapshot(snap, recv) {
   if (Array.isArray(snap.whales)) {
     chainWhales = snap.whales;
   }
+  if (snap.eaters) worldEaters = snap.eaters;
   const dtMs = prev ? at - prev.at : POLL_MS;
   const cell = 60;
   const grid = new Map();
@@ -934,11 +935,15 @@ function processSnapshot(snap, recv) {
 // Lane/phase come from the server (`w.lane`), never re-derived here, so the
 // animal on screen is exactly where the server dropped its food.
 let chainWhales = [];
+/** tx hash to creature ids that ate its plankton, from the snapshot. */
+let worldEaters = {};
 /** address -> { t, amount } of its last transfer: the feed pulse + label. */
 const whaleFeed = new Map();
 /** Screen-space hit targets refreshed every frame by drawWhales. */
 let whaleHits = [];
 /** Screen-space hit targets for the sim creatures, refreshed every frame. */
+/** Paid zones, refreshed every frame, so weather can be clicked back to its burn. */
+let effectHits = [];
 const creatureHits = [];
 /** Silence after which a whale has faded to a ghost of itself. */
 const WHALE_QUIET_MS = 180000;
@@ -1743,6 +1748,11 @@ function showTxCard(flow) {
     `<div class="tx-row"><span class="k">${t('txTo')}</span><span class="v">${shortAddr(flow.to)}</span></div>` +
     `<div class="tx-row"><span class="k">${t('txAmount')}</span><span class="v">${flow.amount >= 1000 ? fmtUsd(flow.amount) : `${flow.amount.toFixed(2)} USDC`}</span></div>` +
     (flow.block ? `<div class="tx-row"><span class="k">${t('txBlock')}</span><span class="v">#${flow.block.toLocaleString()}</span></div>` : '') +
+    ((worldEaters[flow.tx] ?? []).length
+      ? `<div class="tx-row"><span class="k">${t('eatenBy')}</span><span class="v">${(worldEaters[flow.tx] ?? [])
+          .map((id) => latestSnap?.byId.get(id)?.name ?? `#${id}`)
+          .join(', ')}</span></div>`
+      : '') +
     `<div>${x402 ? `<span class="x402-badge">x402</span> ${t('txX402Note')}` : t('txPlainNote')}</div>` +
     `<a class="explore" href="${explorerTxUrl}${flow.tx}" target="_blank" rel="noopener">${t('txVerify')}</a>`;
   el.querySelector('.tx-close').addEventListener('click', () => { el.hidden = true; });
@@ -2380,6 +2390,7 @@ function drawAbyssFrame(now, ct) {
   }
 
   // 6) Persistent zone overlays (poison cloud, feast glow).
+  effectHits = [];
   if (state) {
     for (const e of state.activeEffects) {
       const sprite = e.kind === 'poison' ? CLOUD_PURPLE : e.kind === 'feast' ? CLOUD_GREEN : null;
@@ -2392,13 +2403,34 @@ function drawAbyssFrame(now, ct) {
       wctx.globalAlpha = 0.5 * pulse;
       wctx.drawImage(sprite, px - pr / 2, py - pr / 2, pr, pr);
       wctx.globalAlpha = 1;
+      // Weather is a traceable vote: how long it lasts, how many it touched,
+      // and a signature ring that fades as the burn spends down.
+      if (e.life) {
+        const left = Math.max(0, Math.min(1, e.ticksRemaining / e.life));
+        wctx.fillStyle = 'rgba(140, 190, 255, 0.35)';
+        wctx.fillRect(px - pr / 2, py + pr / 2 + 4, pr * left, 2);
+      }
+      if (typeof e.affected === 'number') {
+        wctx.font = '9px ui-monospace, SFMono-Regular, Menlo, monospace';
+        wctx.fillStyle = 'rgba(147, 163, 189, 0.8)';
+        wctx.textAlign = 'center';
+        wctx.fillText(`${e.affected} ${t('affectedLabel')}`, px, py + pr / 2 + 14);
+        wctx.textAlign = 'left';
+      }
       if (e.payer) {
+        const left = e.life ? Math.max(0, Math.min(1, e.ticksRemaining / e.life)) : 1;
+        wctx.strokeStyle = `rgba(255, 204, 111, ${0.5 * left})`;
+        wctx.lineWidth = 1.5;
+        wctx.beginPath();
+        wctx.arc(px, py, pr / 2 + 6, 0, TAU);
+        wctx.stroke();
         // Paid interventions are signed on the water: who burned, how much.
         wctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
         wctx.fillStyle = 'rgba(230, 237, 247, 0.75)';
         wctx.textAlign = 'center';
         wctx.fillText(`${shortAddr(e.payer)} · ${e.paid ?? ''}`, px, py - pr / 2 - 6);
         wctx.textAlign = 'left';
+        effectHits.push({ x: px, y: py, r: pr / 2, tx: e.tx });
       }
     }
   }
@@ -3296,6 +3328,9 @@ function canvasToWorld(ev) {
 }
 
 worldCanvas.addEventListener('click', (ev) => {
+  const rect = worldCanvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  const my = ev.clientY - rect.top;
   if (!latestSnap) return;
   const pos = canvasToWorld(ev);
   if (targeting) {
@@ -3314,6 +3349,11 @@ worldCanvas.addEventListener('click', (ev) => {
   if (c) {
     selectedId = c.id;
     renderCard(c);
+    return;
+  }
+  const zone = effectHits.slice().reverse().find((h) => Math.hypot(h.x - mx, h.y - my) < h.r);
+  if (zone?.tx) {
+    window.open(explorerTxUrl + zone.tx, '_blank', 'noopener');
     return;
   }
   const wh = whaleHitAt(ev);
@@ -3444,7 +3484,8 @@ document.getElementById('pulse-play')?.addEventListener('click', (ev) => {
   ev.currentTarget.textContent = replayOn ? '\u23F8' : '\u25B6';
 });
 
-document.getElementById('export-csv')?.addEventListener('click', async () => {
+document.querySelectorAll('[data-export]').forEach((btn) => btn.addEventListener('click', async () => {
+  const kind = btn.dataset.export;
   const eth = window.ethereum;
   let payer = null;
   if (eth) {
@@ -3455,7 +3496,7 @@ document.getElementById('export-csv')?.addEventListener('click', async () => {
   }
   if (!payer) { toast(t('needWallet'), true); return; }
   const grab = async () => {
-    const r = await fetch(`/export?pass=${payer}`);
+    const r = await fetch(`/export?pass=${payer}&kind=${kind}`);
     if (!r.ok) throw r.status;
     return r.text();
   };
@@ -3469,7 +3510,7 @@ document.getElementById('export-csv')?.addEventListener('click', async () => {
       toast(t('failed', { error: status }), true);
     }
   }
-});
+}));
 
 /* ---------- panel collapse, dock drawers, welcome layer ---------- */
 

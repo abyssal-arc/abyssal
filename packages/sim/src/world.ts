@@ -70,6 +70,8 @@ export interface Creature {
 }
 
 export interface Food {
+  /** Tx hash whose landing spawned this pellet, for the meteor-to-eater trail. */
+  src?: string;
   id: number;
   x: number;
   y: number;
@@ -98,6 +100,12 @@ export interface TimedEffect {
   /** Poison only: kills attributed so far, for the backlash rule. */
   kills?: number;
   backlashed?: boolean;
+  /** Full lifetime in ticks, so the client can draw a time bar. */
+  life?: number;
+  /** Creatures inside the zone when it was paid for. */
+  affected?: number;
+  /** The burn transaction that paid for this, so weather stays traceable. */
+  tx?: string;
 }
 
 export type CullType = 'harvest' | 'judgment';
@@ -182,6 +190,8 @@ export interface World {
   /** Recent paid feeds, so the same spot cannot be fed into a permanent feast. */
   feedFatigue: { x: number; y: number; until: number }[];
   /** Cull history: hourly harvests and daily judgment days. */
+  /** Tx hash to the creatures that ate its plankton, for the meteor trail. */
+  eaters: Record<string, number[]>;
   culls: CullRecord[];
   /** Ring buffer of recent positioned events for visualization. */
   eventLog: SimEvent[];
@@ -404,6 +414,7 @@ export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG):
     totalDied: 0,
     totalFoodSpawned: 0,
     totalPredations: 0,
+    eaters: {},
   };
   for (let i = 0; i < config.initialPopulation; i++) {
     world.creatures.push(
@@ -424,10 +435,11 @@ export function createWorld(seed: number, config: WorldConfig = DEFAULT_CONFIG):
   return world;
 }
 
-function spawnFood(world: World, x: number, y: number, energy?: number): void {
+function spawnFood(world: World, x: number, y: number, energy?: number, src?: string): void {
   if (world.foods.length >= world.config.maxFood) return;
   world.foods.push({
     id: world.nextFoodId++,
+    src,
     x: wrap(x, world.config.width),
     y: wrap(y, world.config.height),
     energy: energy ?? world.config.foodEnergy,
@@ -561,7 +573,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
     for (let i = 0; i < count; i++) {
       const a = rng.range(0, Math.PI * 2);
       const d = Math.sqrt(rng.next()) * (10 + size * 30);
-      spawnFood(world, x + Math.cos(a) * d, y + Math.sin(a) * d, energy);
+      spawnFood(world, x + Math.cos(a) * d, y + Math.sin(a) * d, energy, tx.hash);
     }
     // An explicit landing site means the money belongs to an address the world
     // embodies, so a big enough fall is a *local* boom: creatures near enough
@@ -741,6 +753,10 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
       foodDistSq <= cfg.eatRadius * cfg.eatRadius
     ) {
       c.energy = Math.min(cfg.maxEnergy, c.energy + nearestFood.energy);
+      if (nearestFood.src) {
+        const list = (world.eaters[nearestFood.src] ??= []);
+        if (list.length < 8 && !list.includes(c.id)) list.push(c.id);
+      }
       world.foods.splice(world.foods.indexOf(nearestFood), 1);
     }
 
@@ -926,10 +942,16 @@ const FEED_FATIGUE_RADIUS = 200;
 /** Kills inside one poison zone before the tank answers with a short famine. */
 const POISON_BACKLASH_KILLS = 10;
 
+export interface InterventionMeta {
+  payer?: string;
+  paid?: string;
+  tx?: string;
+}
+
 export function applyIntervention(
   world: World,
   intervention: Intervention,
-  meta?: { payer?: string; paid?: string },
+  meta?: InterventionMeta,
 ): InterventionResult {
   const cfg = world.config;
   switch (intervention.type) {
@@ -1049,6 +1071,7 @@ export function fromJSON(json: string): World {
   // Backfill fields added after older snapshots were written.
   rest.eventLog ??= [];
   rest.nextEventSeq ??= 1;
+  rest.eaters ??= {};
   for (const c of rest.creatures ?? []) {
     c.kills ??= 0;
     c.devouredTotal ??= 0;
