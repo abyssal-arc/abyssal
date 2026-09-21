@@ -131,11 +131,11 @@ const spriteCache = new Map();
 
 /* ---------- procedural creature sprites (v8 "glasslight") ---------- */
 /**
- * v8 "glasslight": translucent glass bodies with one bright rim, an inner glow
- * core and photophore dots. Silhouettes are slender and tapered so nothing
- * aliases into noise at the 18-40px the tank draws most bodies at, and the
- * value contrast (bright rim, dark interior, one accent) keeps each species
- * readable as an animal rather than a shape.
+ * v8 "glasslight": translucent glass bodies with one bright rim, an inner dark
+ * line for glass thickness, a specular sheen, an additive core and photophore
+ * dots. Silhouettes are slender and tapered so nothing aliases into noise at
+ * the 18-40px the tank draws most bodies at, and the value contrast keeps each
+ * species readable as an animal rather than a shape.
  */
 const hsl = hsla;
 /**
@@ -143,13 +143,37 @@ const hsl = hsla;
  * and photophore dots. Silhouettes are slender and tapered; nothing spiky that
  * would alias away at the 18-40px the tank draws.
  */
-/** Translucent glass fill, top-lit. */
+/** Translucent glass fill, top-lit, with a mid highlight band. */
 function glass(g, hue, y0, y1) {
   const gr = g.createLinearGradient(0, y0, 0, y1);
-  gr.addColorStop(0, hsl(hue, 55, 62, 0.34));
-  gr.addColorStop(0.45, hsl(hue, 62, 30, 0.62));
-  gr.addColorStop(1, hsl(hue, 70, 74, 0.22));
+  gr.addColorStop(0, hsl(hue, 58, 66, 0.4));
+  gr.addColorStop(0.28, hsl(hue, 50, 46, 0.5));
+  gr.addColorStop(0.55, hsl(hue, 66, 26, 0.68));
+  gr.addColorStop(1, hsl(hue, 72, 76, 0.24));
   return gr;
+}
+
+/** A soft specular sheen along the top of a body. */
+function sheen(g, hue, x, y, rx, ry, rot = -0.25) {
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.translate(x, y);
+  g.rotate(rot);
+  const gr = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+  gr.addColorStop(0, hsl(hue, 60, 92, 0.16));
+  gr.addColorStop(1, hsl(hue, 60, 92, 0));
+  g.fillStyle = gr;
+  g.beginPath();
+  g.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+  g.fill();
+  g.restore();
+}
+
+/** Inner dark line just inside the rim: reads as glass thickness. */
+function innerLine(g, hue, alpha = 0.35) {
+  g.strokeStyle = hsl(hue, 70, 12, alpha);
+  g.lineWidth = 1.6;
+  g.stroke();
 }
 
 /** Additive inner core so the animal carries its own light. */
@@ -243,12 +267,27 @@ function drawWhale(g, hue, ph) {
   g.closePath();
   g.fillStyle = glass(g, hue, -12, 11);
   g.fill();
-  // Top rim, bright.
+  sheen(g, hue, 8, -6, 20, 5);
+  // Top rim, bright, then an inner dark line for glass thickness.
   g.beginPath();
   g.moveTo(34, -3);
   g.bezierCurveTo(30, -9, 18, -11, 4, -11);
   g.bezierCurveTo(-12, -11, -26, -6, -33, -1.5);
   rimStroke(g, hue);
+  g.beginPath();
+  g.moveTo(31, -2.5);
+  g.bezierCurveTo(27, -7.5, 17, -9.5, 4, -9.5);
+  g.bezierCurveTo(-11, -9.5, -24, -5, -30, -1.5);
+  innerLine(g, hue);
+  // Muscle lines.
+  g.strokeStyle = hsl(hue, 60, 78, 0.18);
+  g.lineWidth = 0.8;
+  g.beginPath();
+  g.moveTo(26, -4);
+  g.quadraticCurveTo(4, -6, -20, -3);
+  g.moveTo(24, 4);
+  g.quadraticCurveTo(2, 6, -18, 3);
+  g.stroke();
   // Belly rim, softer.
   g.beginPath();
   g.moveTo(-33, 1.5);
@@ -312,12 +351,20 @@ function drawAlgo(g, hue, ph) {
   g.closePath();
   g.fillStyle = glass(g, hue, -9, 9);
   g.fill();
+  sheen(g, hue, 6, -4, 16, 4);
   g.beginPath();
   g.moveTo(34, 0);
   g.lineTo(14, -8);
   g.lineTo(-16, -6);
   g.lineTo(-28, 0);
   rimStroke(g, hue, 0.85, 1.3);
+  g.beginPath();
+  g.moveTo(31, 0);
+  g.lineTo(13, -6.5);
+  g.lineTo(-15, -4.8);
+  innerLine(g, hue, 0.3);
+  dot(g, hue, 2, -4, 0.9, 0.6);
+  dot(g, hue, -8, 3, 0.8, 0.5);
   // Facet lines.
   g.strokeStyle = hsl(hue, 75, 80, 0.3);
   g.lineWidth = 0.8;
@@ -390,11 +437,17 @@ function drawApe(g, hue, ph) {
   g.closePath();
   g.fillStyle = glass(g, hue, -12, 12);
   g.fill();
+  sheen(g, hue, 2, -6, 16, 4.5);
   g.beginPath();
   g.moveTo(24, 0);
   g.bezierCurveTo(20, -9, 8, -12, -4, -12);
   g.bezierCurveTo(-14, -12, -20, -7, -21, 0);
   rimStroke(g, hue, 0.9, 1.4);
+  g.beginPath();
+  g.moveTo(21, 0);
+  g.bezierCurveTo(18, -7.5, 8, -10.2, -4, -10.2);
+  g.bezierCurveTo(-13, -10.2, -18, -6, -19, 0);
+  innerLine(g, hue, 0.3);
   // Segment arcs.
   g.strokeStyle = hsl(hue, 70, 80, 0.26);
   g.lineWidth = 0.9;
@@ -462,6 +515,20 @@ function drawInsider(g, hue, ph) {
   }
   g.stroke();
   g.restore();
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.strokeStyle = hsl(hue, 95, 80, 0.3);
+  g.lineWidth = 0.9;
+  g.beginPath();
+  for (let i = 0; i <= N; i++) {
+    const [nx, ny] = perp(i);
+    const px = xs[i] + nx * ws[i] * 1.1;
+    const py = ys[i] + ny * ws[i] * 1.1;
+    if (i === 0) g.moveTo(px, py);
+    else g.lineTo(px, py);
+  }
+  g.stroke();
+  g.restore();
   // Ventral edge, soft.
   g.strokeStyle = hsl(hue, 80, 76, 0.3);
   g.lineWidth = 0.9;
@@ -505,6 +572,152 @@ function bakeCreature(archetype, hue, phase) {
   return canvas;
 }
 
+/**
+ * Resident chain whales are not fauna: they get their own painter, a grand
+ * gold-rimmed leviathan, so a live address never reads as just another fish.
+ */
+const leviathanCache = new Map();
+function leviathanFrames(hueBucket) {
+  let frames = leviathanCache.get(hueBucket);
+  if (frames) return frames;
+  const hue = PALETTE_HUES[hueBucket % PALETTE_HUES.length];
+  frames = [0, 0.25, 0.5, 0.75].map((p) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = SPRITE;
+    drawLeviathan(canvas.getContext('2d'), hue, p);
+    return canvas;
+  });
+  leviathanCache.set(hueBucket, frames);
+  return frames;
+}
+
+/**
+ * The chain leviathan: a resident whale embodying a live address. Deliberately
+ * not one of the four species: bigger, gold-marked (it is made of money), with a
+ * grand crescent fluke and a falcate dorsal, so nobody mistakes it for fauna.
+ */
+const GOLD = 42;
+
+function drawLeviathan(g, hue, ph) {
+  const beat = Math.sin(ph * Math.PI * 2);
+  g.save();
+  g.translate(64, 64);
+  g.scale(1.12, 1.12);
+
+  // Broad crescent flukes, beating slowly.
+  g.save();
+  g.translate(-40, 0);
+  g.rotate(beat * 0.12);
+  g.beginPath();
+  g.moveTo(3, -2);
+  g.bezierCurveTo(-6, -6, -12, -12, -16, -20);
+  g.bezierCurveTo(-10, -10, -9, -4, -10, 0);
+  g.bezierCurveTo(-9, 4, -10, 10, -16, 18);
+  g.bezierCurveTo(-12, 11, -6, 6, 3, 2);
+  g.closePath();
+  g.fillStyle = hsl(hue, 58, 40, 0.55);
+  g.fill();
+  g.strokeStyle = hsl(GOLD, 90, 70, 0.5);
+  g.lineWidth = 1;
+  g.stroke();
+  g.restore();
+
+  // Long slender pectoral fin.
+  g.beginPath();
+  g.moveTo(8, 6);
+  g.bezierCurveTo(0, 14, -10, 20, -20, 23);
+  g.bezierCurveTo(-10, 15, -4, 9, 0, 4);
+  g.closePath();
+  g.fillStyle = hsl(hue, 58, 34, 0.6);
+  g.fill();
+  g.strokeStyle = hsl(hue, 85, 78, 0.4);
+  g.lineWidth = 1;
+  g.stroke();
+
+  // Falcate dorsal fin, set far back.
+  g.beginPath();
+  g.moveTo(-14, -13);
+  g.bezierCurveTo(-11, -20, -7, -21, -4, -14);
+  g.closePath();
+  g.fillStyle = hsl(hue, 58, 44, 0.55);
+  g.fill();
+
+  // Grand body: arched back, blunt head, long taper.
+  const arch = beat * 1.2;
+  g.beginPath();
+  g.moveTo(42, -2);
+  g.bezierCurveTo(38, -10, 26, -14, 8, -14 - arch * 0.3);
+  g.bezierCurveTo(-12, -14, -30, -8, -41, -2);
+  g.lineTo(-41, 2);
+  g.bezierCurveTo(-30, 7, -12, 12, 8, 12);
+  g.bezierCurveTo(26, 12, 38, 8, 42, 4);
+  g.quadraticCurveTo(44, 1, 42, -2);
+  g.closePath();
+  g.fillStyle = glass(g, hue, -15, 13);
+  g.fill();
+
+  // Sheen on the back.
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  g.translate(6, -8);
+  g.rotate(-0.12);
+  const sh = g.createRadialGradient(0, 0, 0, 0, 0, 24);
+  sh.addColorStop(0, hsl(hue, 60, 92, 0.15));
+  sh.addColorStop(1, hsl(hue, 60, 92, 0));
+  g.fillStyle = sh;
+  g.beginPath();
+  g.ellipse(0, 0, 24, 6, 0, 0, Math.PI * 2);
+  g.fill();
+  g.restore();
+
+  // Gold rim along the back: this animal is made of money.
+  g.beginPath();
+  g.moveTo(42, -2);
+  g.bezierCurveTo(38, -10, 26, -14, 8, -14 - arch * 0.3);
+  g.bezierCurveTo(-12, -14, -30, -8, -41, -2);
+  g.strokeStyle = hsl(GOLD, 95, 74, 0.85);
+  g.lineWidth = 1.5;
+  g.stroke();
+  // Inner dark line for glass thickness.
+  g.beginPath();
+  g.moveTo(39, -1.5);
+  g.bezierCurveTo(35, -8.5, 25, -12.2, 8, -12.2);
+  g.bezierCurveTo(-11, -12.2, -28, -6.8, -38, -1.5);
+  g.strokeStyle = hsl(hue, 70, 10, 0.4);
+  g.lineWidth = 1.6;
+  g.stroke();
+  // Belly rim, cool and soft.
+  g.beginPath();
+  g.moveTo(-41, 2);
+  g.bezierCurveTo(-30, 7, -12, 12, 8, 12);
+  g.bezierCurveTo(26, 12, 38, 8, 42, 4);
+  g.strokeStyle = hsl(hue, 80, 78, 0.35);
+  g.lineWidth = 1;
+  g.stroke();
+
+  // Throat grooves and a curved mouth line.
+  g.strokeStyle = hsl(hue, 60, 80, 0.22);
+  g.lineWidth = 0.8;
+  for (let i = 0; i < 3; i++) {
+    g.beginPath();
+    g.moveTo(38 - i * 3, 3 + i * 2);
+    g.quadraticCurveTo(28 - i * 3, 6 + i * 2, 18 - i * 3, 6 + i * 2);
+    g.stroke();
+  }
+  g.beginPath();
+  g.moveTo(41, 2);
+  g.quadraticCurveTo(34, 5, 27, 4.5);
+  g.strokeStyle = hsl(hue, 50, 12, 0.6);
+  g.lineWidth = 1.1;
+  g.stroke();
+
+  // Gold photophore line along the flank, and the eye.
+  for (let i = 0; i < 7; i++) {
+    dot(g, GOLD, 26 - i * 10, 6 - i * 0.5, 1.1, 0.8);
+  }
+  dot(g, GOLD, 33, -4, 2, 1);
+  g.restore();
+}
 /** Animation frames for an archetype + hue bucket (4-frame sine sway). */
 // Curated jewel palette instead of a full 360° rainbow: cool bioluminescent
 // teals→violets→magentas with a few warm gold accents. Genetic hue still
@@ -1026,7 +1239,7 @@ function drawWhales(now, sx, sy, shX, shY, ct) {
     const size = (68 + Math.min(54, Math.log10(w.volume + 1) * 26)) *
       (1 - (w.rank - 1) * 0.05) * (1 - 0.2 * quiet) * (1 + 0.05 * Math.sin(t / 900 + lane.phaseW));
     const bucket = lane.seed % HUE_BUCKETS;
-    const frames = creatureFrames('WHALE', bucket);
+    const frames = leviathanFrames(bucket);
     const frame = frames[Math.floor(t / 220 + (lane.seed % 4)) % frames.length];
     const px = vx(x * sx) + shX;
     const py = vy(y * sy) + shY;
