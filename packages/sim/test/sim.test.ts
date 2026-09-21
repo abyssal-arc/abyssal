@@ -760,7 +760,7 @@ test('obituaries: a starvation death is written up with the life it lived', () =
   const c = world.creatures[0];
   c.kills = 9;
   c.offspring = 5;
-  c.maxMeal = 42;
+  c.maxMeal = 26.64610953522815;
   c.boomTouched = true;
   c.energy = 0.05;
   for (let i = 0; i < 5 && world.creatures.length > 0; i++) tick(world, { chain: 0, market: 0 });
@@ -773,7 +773,7 @@ test('obituaries: a starvation death is written up with the life it lived', () =
   assert.equal(o.diedTick, world.tick);
   assert.equal(o.kills, 9);
   assert.equal(o.offspring, 5);
-  assert.equal(o.maxMeal, 42);
+  assert.equal(o.maxMeal, 26.6, 'a meal is recorded to one decimal, not to the last bit');
   assert.deepEqual(o.titles.sort(), ['apex', 'lineageBearer', 'whalefallSurvivor']);
   const ev = world.eventLog.find((e) => e.type === 'memorial');
   assert.equal(ev?.name, c.name);

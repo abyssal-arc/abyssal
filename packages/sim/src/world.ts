@@ -545,7 +545,9 @@ function memorialize(world: World, c: Creature, cause: string): void {
     cause,
     kills: c.kills,
     offspring: c.offspring,
-    maxMeal: c.maxMeal,
+    // Rounded here rather than in every viewer: an obituary is a record to
+    // read, and a raw meal energy prints as 26.64610953522815.
+    maxMeal: Math.round(c.maxMeal * 10) / 10,
     titles: titlesFor(c, cause),
   });
   if (world.obituaries.length > 24) world.obituaries.length = 24;
