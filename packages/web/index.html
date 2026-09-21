@@ -72,7 +72,12 @@
         </div>
       </section>
       <section class="glass obs-card obs-pulse-card">
-        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><button id="pulse-play" class="icon-btn" data-i18n-title="replay" title="Replay the last 90 seconds">&#9654;</button><span class="obs-sub" id="pulse-sub"></span></div>
+        <div class="obs-head"><span data-i18n="pulseTitle">USDC volume pulse</span><button id="pulse-play" class="icon-btn" data-i18n-title="replay" title="Replay the last 90 seconds">&#9654;</button><span class="obs-sub" id="pulse-sub"></span>
+          <span class="obs-actions">
+            <button class="dock-btn mini" data-export="csv" data-i18n="exportCsv">Export CSV</button>
+            <button class="dock-btn mini" data-export="replay" data-i18n="exportReplay">Export replay</button>
+          </span>
+        </div>
         <canvas id="pulse"></canvas>
         <div class="flowmap-legend">
           <span><i class="lg-plain"></i><span data-i18n="pulseLegendV">USDC volume per bucket</span></span>
@@ -193,26 +198,28 @@
       <span class="da-label" data-i18n="dayAnchor">Day digest</span>
       <code id="day-digest">–</code>
       <span class="da-note" data-i18n="dayAnchorNote">preview · commits on-chain at day end</span>
+      <button class="dock-btn mini" data-export="digest" data-i18n="exportDigest">Export digest</button>
     </div>
-    <div class="sig-guide">
-      <div><i class="sg-dot chain"></i><span data-i18n="chainHelp">CHAIN temp = Arc USDC activity: food spawn 0.2×–1.8×, sky weather, feast/normal/famine regime</span></div>
-      <div><i class="sg-dot market"></i><span data-i18n="marketHelp">MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter</span></div>
-    </div>
-    <div class="analytics-body">
-      <button class="dock-btn" data-export="csv" data-i18n="exportCsv">Export CSV</button>
-      <button class="dock-btn" data-export="replay" data-i18n="exportReplay">Export replay</button>
-      <button class="dock-btn" data-export="digest" data-i18n="exportDigest">Day digest</button>
-      <div class="section-title" data-i18n="dailyTitle">Today in the abyss</div>
-      <div id="daily-report" class="daily"></div>
-      <div class="section-title" data-i18n="reportsTitle">Battle reports</div>
-      <div id="reports"></div>
-      <div id="chart-wrap">
-        <div class="section-title" data-i18n="popHistory">Population history</div>
-        <canvas id="chart"></canvas>
+    <div class="analytics-grid">
+      <div class="analytics-side">
+        <div class="sig-guide">
+          <div><i class="sg-dot chain"></i><span data-i18n="chainHelp">CHAIN temp = Arc USDC activity: food spawn 0.2×–1.8×, sky weather, feast/normal/famine regime</span></div>
+          <div><i class="sg-dot market"></i><span data-i18n="marketHelp">MARKET temp = volatility: creature speed 1–2×, metabolism 1–1.5×, movement jitter</span></div>
+        </div>
+        <div class="section-title" data-i18n="dailyTitle">Today in the abyss</div>
+        <div id="daily-report" class="daily"></div>
+        <div class="section-title" data-i18n="reportsTitle">Battle reports</div>
+        <div id="reports"></div>
       </div>
-      <div id="temps-wrap">
-        <div class="section-title" data-i18n="tempsTitle">Chain &amp; Market</div>
-        <canvas id="temps"></canvas>
+      <div class="analytics-charts">
+        <div id="chart-wrap">
+          <div class="section-title" data-i18n="popHistory">Population history</div>
+          <canvas id="chart"></canvas>
+        </div>
+        <div id="temps-wrap">
+          <div class="section-title" data-i18n="tempsTitle">Chain &amp; Market</div>
+          <canvas id="temps"></canvas>
+        </div>
       </div>
     </div>
   </div>

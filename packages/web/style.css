@@ -323,7 +323,10 @@ body.view-observe {
 .props[hidden] { display: none; }
 .props-h { letter-spacing: 1.2px; text-transform: uppercase; margin-bottom: calc(var(--sp)); }
 .prop { display: flex; justify-content: space-between; gap: calc(var(--sp) * 2); padding: 1px 0; }
-.prop b { color: var(--fg-2); font-weight: 500; }
+.prop span { flex: 0 0 auto; }
+/* A value like a hash fragment must wrap inside a narrow column, not push the
+   row wider than its drawer. */
+.prop b { color: var(--fg-2); font-weight: 500; min-width: 0; text-align: right; overflow-wrap: anywhere; }
 .props-y { margin-top: calc(var(--sp)); }
 #pulse-play { margin-left: auto; }
 .daily .prop, #reports .prop { padding: 1px 0; }
@@ -587,16 +590,59 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 .day-anchor { display: flex; align-items: baseline; gap: calc(var(--sp) * 2); margin-bottom: calc(var(--sp) * 2); font-size: 10px; }
 .day-anchor .da-label { color: var(--fg-3); text-transform: uppercase; letter-spacing: 1.2px; }
 .day-anchor code { font-family: var(--font-display); font-size: 11px; color: #ffd166; letter-spacing: 0.5px; }
-.day-anchor .da-note { margin-left: auto; color: var(--fg-3); font-size: 9px; }
+.day-anchor .da-note { color: var(--fg-3); font-size: 9px; }
+.day-anchor .mini { margin-left: auto; }
+
+/* Compact button for header rows, where a full dock button shouts. */
+.dock-btn.mini {
+  font-size: 9px;
+  padding: 2px calc(var(--sp) * 2);
+  letter-spacing: 0.6px;
+  border-color: var(--glass-border);
+  color: var(--fg-3);
+}
+.dock-btn.mini:hover { color: var(--fg-1); border-color: var(--accent); }
+.obs-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
 
 .sig-guide { display: flex; flex-direction: column; gap: 4px; margin-bottom: calc(var(--sp) * 2); font-size: 10px; color: var(--fg-2); }
 .sig-guide .sg-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
 .sig-guide .sg-dot.chain { background: var(--accent); }
 .sig-guide .sg-dot.market { background: #d8c832; }
 
-.analytics-body { display: flex; gap: calc(var(--sp) * 3); height: 30vh; }
-#chart-wrap, #temps-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-#chart, #temps { flex: 1; width: 100%; background: rgba(7, 12, 22, 0.6); border-radius: var(--radius-sm); cursor: crosshair; }
+/* The data drawer gets the room the charts need: text down the left, the two
+   charts stacked on the right at close to full drawer width. */
+#drawer-analytics { width: min(1180px, calc(100vw - 24px)); max-height: 74vh; }
+.analytics-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 330px) 1fr;
+  gap: calc(var(--sp) * 4);
+  align-items: start;
+}
+.analytics-side {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--sp));
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 4px;
+  min-width: 0;
+}
+.analytics-charts {
+  display: grid;
+  grid-template-rows: 1fr 1fr;
+  gap: calc(var(--sp) * 3);
+  height: 60vh;
+  min-width: 0;
+}
+#chart-wrap, #temps-wrap { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#chart, #temps {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  background: rgba(7, 12, 22, 0.6);
+  border-radius: var(--radius-sm);
+  cursor: crosshair;
+}
 
 /* ---------- obituaries ---------- */
 #death-stats { font-size: 10px; color: var(--fg-3); margin-bottom: calc(var(--sp)); }
@@ -763,6 +809,7 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 .obs-head {
   position: relative;
   display: flex; align-items: baseline; justify-content: space-between; gap: calc(var(--sp) * 2);
+  flex-wrap: wrap;
   font-family: var(--font-display);
   font-size: 12px; font-weight: 500; letter-spacing: 1.4px; color: var(--fg-1);
   margin-bottom: calc(var(--sp) * 2);
@@ -895,7 +942,13 @@ body.view-observe .drawer, body.view-observe #banner { display: none !important;
   #board { left: calc(var(--sp) * 3); }
   #panel { right: calc(var(--sp) * 3); }
   .drawer { bottom: calc(var(--sp) * 24); max-height: 50vh; }
-  .analytics-body { flex-direction: column; height: 50vh; }
+  /* One column on a phone: the drawer itself scrolls, the charts keep a height
+     a finger can read instead of splitting the viewport in two. */
+  #drawer-analytics { max-height: 62vh; }
+  .analytics-grid { grid-template-columns: 1fr; gap: calc(var(--sp) * 3); }
+  .analytics-side { max-height: none; overflow: visible; }
+  .analytics-charts { grid-template-rows: auto auto; height: auto; }
+  #chart, #temps { height: 30vh; flex: 0 0 auto; }
   #observe-view { top: calc(var(--sp) * 26); display: flex; flex-direction: column; overflow-y: auto; }
   .obs-col { flex: 0 0 auto; }
   /* Flex-basis-0 canvases contribute nothing to grid row sizing, so give them
