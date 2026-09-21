@@ -333,14 +333,22 @@ export function createApp(options: AppOptions = {}) {
     return origin !== new URL(req.url).origin && !allowlist.includes(origin);
   }
 
-  function json(data: unknown, status = 200): Response {
-    return new Response(JSON.stringify(data), {
-      status,
-      headers: {
-        'content-type': 'application/json; charset=utf-8',
-        'access-control-allow-origin': '*',
-      },
-    });
+  /**
+   * `cacheSec` lets the edge absorb the poll storm: every viewer of one tank
+   * asks the same question every second or two, and each of those requests
+   * lands on the Durable Object, whose free allowance is tiny. A few seconds of
+   * shared edge freshness costs nothing visually (the client interpolates) and
+   * cuts origin load by the number of concurrent viewers.
+   */
+  function json(data: unknown, status = 200, cacheSec = 0): Response {
+    const headers: Record<string, string> = {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+    };
+    if (cacheSec > 0) {
+      headers['cache-control'] = 'public, s-maxage=' + cacheSec + ', stale-while-revalidate=' + cacheSec * 3;
+    }
+    return new Response(JSON.stringify(data), { status, headers });
   }
 
   function countdown(intervalTicks: number, cullRatio: number) {
@@ -714,8 +722,8 @@ export function createApp(options: AppOptions = {}) {
       return json(apiIndex());
     }
 
-    if (req.method === 'GET' && path === '/state') return json(statePayload());
-    if (req.method === 'GET' && path === '/world') return json(worldPayload());
+    if (req.method === 'GET' && path === '/state') return json(statePayload(), 200, 3);
+    if (req.method === 'GET' && path === '/world') return json(worldPayload(), 200, 3);
 
     if (req.method === 'GET' && path === '/history') {
       // The charts draw CHART_SLOTS points and decimate whatever they receive,
@@ -724,13 +732,13 @@ export function createApp(options: AppOptions = {}) {
       const window = Math.min(positiveInt(url.searchParams.get('window'), HISTORY_WINDOW_MAX), HISTORY_WINDOW_MAX);
       const slots = Math.min(positiveInt(url.searchParams.get('slots'), 0), window);
       const stats = world.statsLog.slice(-window);
-      return json({ stats: slots > 0 ? decimate(stats, slots) : stats });
+      return json({ stats: slots > 0 ? decimate(stats, slots) : stats }, 200, 3);
     }
 
     if (req.method === 'GET' && path === '/judgments') {
       const type = url.searchParams.get('type');
       const culls = type ? world.culls.filter((c) => c.type === type) : world.culls;
-      return json({ judgments: culls });
+      return json({ judgments: culls }, 200, 3);
     }
 
     if (req.method === 'GET' && path === '/events') {
@@ -756,12 +764,12 @@ export function createApp(options: AppOptions = {}) {
         state: statePayload(),
         events,
         txRain: rainAfter(url.searchParams.get('tx')),
-      });
+      }, 200, 3);
     }
 
     if (req.method === 'GET' && path === '/reports') {
       scoreReports();
-      return json({ reports: reports.slice(-12).reverse() });
+      return json({ reports: reports.slice(-12).reverse() }, 200, 3);
     }
 
     // One address's standing in the tank: what it burned, what it earned, and
@@ -842,10 +850,10 @@ export function createApp(options: AppOptions = {}) {
     }
 
     if (req.method === 'GET' && path === '/observe') {
-      if (!arcFeed) return json({ available: false });
+      if (!arcFeed) return json({ available: false }, 200, 3);
       const addr = url.searchParams.get('addr');
-      if (addr) return json({ available: true, ...arcFeed.addressPayload(addr) });
-      return json({ available: true, ...arcFeed.observePayload() });
+      if (addr) return json({ available: true, ...arcFeed.addressPayload(addr) }, 200, 3);
+      return json({ available: true, ...arcFeed.observePayload() }, 200, 3);
     }
 
     if (req.method === 'POST' && path === '/tick') {

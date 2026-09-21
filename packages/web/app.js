@@ -31,7 +31,7 @@ const cctx = chartCanvas.getContext('2d');
 const tempsCanvas = document.getElementById('temps');
 const tctx = tempsCanvas.getContext('2d');
 
-const POLL_MS = 400;
+const POLL_MS = 1500;
 const RENDER_DELAY = 700;     // ms behind the newest snapshot
 const BUFFER_KEEP = 6;
 const DEAD_RECKON_MAX = 1000; // ms of velocity extrapolation before holding
@@ -1430,8 +1430,10 @@ function resetTimeline() {
 async function poll() {
   const bootstrap = stale;
   try {
-    const q = `since=${lastEventSeq}&tx=${encodeURIComponent(lastTxHash)}`;
-    const snap = await getJSON(`/snapshot?${q}${bootstrap ? '&tail=6' : ''}`);
+    // One canonical URL per mode, so the edge can cache the answer and every
+    // viewer of one tank shares a single origin fetch instead of each polling
+    // the Durable Object personally. Events are filtered locally by seq.
+    const snap = await getJSON(bootstrap ? '/snapshot?tail=6' : '/snapshot');
     const recv = clock();
     stale = false;
     if (bootstrap) resetTimeline();
@@ -1457,6 +1459,7 @@ async function poll() {
     renderDaily(snap.world.daily);
     renderMemorials(snap.world.obituaries);
     if (snap.events.length > 0) {
+      const fresh = bootstrap ? snap.events : snap.events.filter((e) => e.seq > lastEventSeq);
       for (const e of snap.events) lastEventSeq = Math.max(lastEventSeq, e.seq);
       if (bootstrap) {
         // Cold start: the server already capped this to the last few entries
@@ -1464,12 +1467,12 @@ async function poll() {
         // freshly loaded page opens as calm as one that has been watching.
         suppressFx = true;
         try {
-          handleEvents(snap.events, true);
+          handleEvents(fresh, true);
         } finally {
           suppressFx = false;
         }
-      } else {
-        handleEvents(snap.events);
+      } else if (fresh.length > 0) {
+        handleEvents(fresh);
       }
     }
     if (snap.txRain) {
@@ -1512,7 +1515,7 @@ async function pollAux() {
   } catch { /* keep stale aux data */ }
 }
 pollAux();
-setInterval(() => { if (!document.hidden) pollAux(); }, 10000);
+setInterval(() => { if (!document.hidden) pollAux(); }, 30000);
 
 /* ---------- OBSERVE: Arc USDC flow observatory ---------- */
 
@@ -1564,7 +1567,7 @@ async function pollObserve() {
 }
 setInterval(() => {
   if (view === 'observe' && !document.hidden) pollObserve();
-}, 3000);
+}, 6000);
 
 /**
  * Returning to a tab that has been hidden is a soft cold start: every poller
