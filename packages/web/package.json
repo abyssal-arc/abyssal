@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/pure.test.js"
+    "test": "node --test test/pure.test.js test/render.test.js"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "jsdom": "^27.0.1"
   }
 }
