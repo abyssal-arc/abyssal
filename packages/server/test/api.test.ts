@@ -730,6 +730,7 @@ test('the render payload carries the daily report, the memorial ring and the eat
   const w = (await (await app.fetch(new Request('http://localhost/world'))).json()) as {
     daily: {
       day: number;
+      maxFall: { day: number; size: number; hash: string } | null;
       winner: { species: string; kills: number } | null;
       biggestIntervention: unknown;
       deaths: Record<string, number>;
@@ -742,6 +743,7 @@ test('the render payload carries the daily report, the memorial ring and the eat
   assert.equal(typeof w.daily.day, 'number');
   assert.equal(typeof w.daily.deaths, 'object');
   assert.ok('mvp' in w.daily, 'the day names an MVP');
+  assert.ok(w.daily.maxFall === null || w.daily.maxFall.hash, 'no fall today reads as no line at all');
   assert.ok(Array.isArray(w.obituaries));
   assert.ok(w.obituaries.length <= 12, 'the payload ships the near ring, not the whole book');
   for (const o of w.obituaries) {

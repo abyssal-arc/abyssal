@@ -438,7 +438,8 @@ export function createApp(options: AppOptions = {}) {
       .sort((a, b) => b.affectedIds.length - a.affectedIds.length)[0];
     return {
       day,
-      maxFall: dayMaxFall.day === day ? dayMaxFall : null,
+      // Null until something actually fell today, so the line does not read $0.00.
+      maxFall: dayMaxFall.day === day && dayMaxFall.hash ? dayMaxFall : null,
       winner: winner ? { species: winner[0], kills: winner[1] } : null,
       biggestIntervention: biggest
         ? { tx: biggest.tx, type: biggest.type, affected: biggest.affectedIds.length }
