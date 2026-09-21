@@ -355,6 +355,24 @@ test('chain whales: lane is a pure function of the address and stays in the tank
   assert.ok(checked > 400);
 });
 
+test('whale ranking ignores the burn sinks and the token itself', async () => {
+  const { ArcUsdcFeed } = await import('../src/arc.js');
+  const feed = new ArcUsdcFeed('http://127.0.0.1:1');
+  const now = Date.now();
+  const burner = '0x' + 'a1'.repeat(20);
+  (feed as unknown as { flows: unknown[] }).flows = [
+    { t: now, block: 1, tx: '0x01', from: burner, to: '0x0000000000000000000000000000000000000000', amount: 9000, x402: true },
+    { t: now, block: 1, tx: '0x02', from: burner, to: '0x000000000000000000000000000000000000dead', amount: 500, x402: false },
+    { t: now, block: 2, tx: '0x03', from: '0x' + 'b2'.repeat(20), to: '0x' + 'c3'.repeat(20), amount: 10, x402: false },
+  ];
+  const addrs = feed.whalesPayload().map((r) => r.address);
+  assert.ok(!addrs.includes('0x0000000000000000000000000000000000000000'), 'the zero sink is not an actor');
+  assert.ok(!addrs.includes('0x000000000000000000000000000000000000dead'), 'the blackhole is not an actor');
+  const top = feed.whalesPayload()[0];
+  assert.equal(top.address, burner, 'a burner still ranks on the money it moved');
+  assert.equal(top.volume, 9500);
+});
+
 test('x402: an authorization signed by another account is caught before Circle sees it', async () => {
   const seller = privateKeyToAccount('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
   const buyer = privateKeyToAccount('0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a');

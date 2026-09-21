@@ -35,6 +35,16 @@ import type { MarketSample } from './market.js';
 export const ARC_CHAIN_ID = 5042;
 /** Native USDC on Arc mainnet. */
 export const ARC_USDC_ADDRESS = '0x3600000000000000000000000000000000000000';
+/**
+ * Addresses that hold or eat USDC but never act: the burn sinks and the token
+ * itself. Ranking them as whales would put the null address at the top of the
+ * tank, since every burn-to-pay transfer ends there.
+ */
+const NON_ACTORS = new Set([
+  ARC_USDC_ADDRESS,
+  '0x0000000000000000000000000000000000000000',
+  '0x000000000000000000000000000000000000dead',
+]);
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 /** Arc produces a block roughly every 500ms. */
 const BLOCK_MS = 500;
@@ -396,8 +406,8 @@ export class ArcUsdcFeed implements ChainFeed {
     };
     for (const f of this.flows) {
       if (f.t < cutoff) continue;
-      touch(f.to, f.amount, true, f);
-      touch(f.from, f.amount, false, f);
+      if (!NON_ACTORS.has(f.to)) touch(f.to, f.amount, true, f);
+      if (!NON_ACTORS.has(f.from)) touch(f.from, f.amount, false, f);
     }
     const r2 = (n: number) => Math.round(n * 100) / 100;
     return [...byAddr.values()]
