@@ -28,6 +28,35 @@ export interface ChainTx {
   whale?: { address: string; rank: number; volume: number };
 }
 
+/**
+ * A rank meter's carry-over. The window is the whole point of it: a reading is
+ * the fraction of recent scores below the current one, so a meter that lost its
+ * window is not a meter with a stale reading but one with no scale at all.
+ */
+export interface MeterState {
+  window: number[];
+  smooth: number | null;
+}
+
+/**
+ * What a feed needs to survive an eviction. Deliberately tiny — the block it
+ * reached and the numbers its temperatures are computed from — because the
+ * things left out are the things that are cheap to observe again: the flow
+ * history and the pulse buckets both refill within a few polls, whereas a lost
+ * `lastBlock` costs a 3600-block backfill and a lost window costs ~90 polls of
+ * readings that cannot rank themselves.
+ */
+export interface FeedState {
+  /** Highest block already accounted for; `-1` means the feed has never landed one. */
+  lastBlock: number;
+  level: MeterState;
+  turbulence: MeterState;
+  chainTemp: number;
+  marketTemp: number;
+  prevVolume: number;
+  prevTemp: number;
+}
+
 export interface ChainFeed {
   readonly name: string;
   sample(): Promise<ChainSample>;
@@ -44,6 +73,17 @@ export interface ChainFeed {
    * `ArcUsdcFeed.settle`.
    */
   settle?(): Promise<void>;
+  /**
+   * Carry-over for a runtime whose object does not outlive its invocation.
+   * Optional because a feed with nothing worth resuming — the offline one,
+   * whose state is a sinusoid and a PRNG — should not have to invent any.
+   *
+   * `importState` must land before the first poll, not merely before the first
+   * response: a poll that runs first is a poll that backfills from `-1`, which
+   * is exactly the work the restored state exists to skip.
+   */
+  exportState?(): FeedState;
+  importState?(s: FeedState): void;
 }
 
 function clamp01(v: number): number {

@@ -207,7 +207,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (110 total)
+npm test           # sim + server + web tests (112 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -357,6 +357,29 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   Senders now come in batches of 24 out to `MAX_SENDER_BLOCKS`, trading
   round-trips for the same concurrency, and a failed batch leaves those flows
   unknown rather than costing the whole poll.
+- **And the feed's own state has to be durable.** With the clock and the
+  heartbeat both fixed, production produced a stranger fault: an x402 share that
+  measured 60–82% inside a live pulse bucket and 0% across the window around it.
+  The object is not resident — a cron fire wakes it, and nothing guarantees it is
+  still there for the next one — and everything the feed knew lived in that
+  object's memory. So each eviction restarted it at `lastBlock = -1`: a
+  3600-block backfill once a minute, which resolves no senders at all (every
+  flow it produces is `x402: null`), rebuilds the pulse series wholesale, and
+  pushes ~9400 flows through a 6000-slot ring — enough to evict the live
+  readings a viewer actually asked for. The numerator had been resolved and the
+  denominator had been backfilled, and the backfill kept winning because it kept
+  happening. `lastBlock` and the two rank meters' windows now ride in the
+  persisted ledger: small, and the only parts an eviction cannot re-derive.
+  `flows` and `pulse` stay in memory, because both refill within a few polls and
+  a restored copy of either would be indistinguishable from a fresh one.
+  `warmFeed()` hydrates *before* it settles, and that ordering is load-bearing
+  rather than tidy — `settle()` starts a poll on a cold feed, and a poll that
+  runs first backfills no matter how faithfully the block was saved. A restored
+  block can also be arbitrarily old, so a gap wider than `MAX_LIVE_SPAN` resumes
+  as a backfill instead of one very wide live poll: a live poll stamps every log
+  it reads with `now`, and resuming across an hour that way would fold an hour of
+  transfers into a single 15s bucket — a spike that never happened, sitting in
+  the history for a day.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -403,13 +426,18 @@ looking at.
 
 Two things in `/state` are **isolate state, not world state**, and a reader who
 assumes otherwise will misdiagnose a healthy tank. The world (tick, population,
-creatures, the day anchor) is durable and survives eviction; the chain telemetry
-around it does not. `feedStatus`, `chainTemp`, `chainDelta`, `marketTemp` and
-`blockNumber` are only ever written inside `advance()`, and a request that lands
-on a freshly booted object is served before any advance has run — `catchUp()`
-returns early because nothing has elapsed yet. Such a request reports the
-boot-time initializers: `feedStatus: "synthetic"`, both temperatures pinned at
-`0.5`, and no `blockNumber` field at all.
+creatures, the day anchor) is durable and survives eviction, and so — since the
+feed-state repair above — is the chain feed's own idea of where it got to and how
+hot that was. The five fields that *report* it are still not durable:
+`feedStatus`, `chainTemp`, `chainDelta`, `marketTemp` and `blockNumber` are
+handler locals written only inside `advance()`, and a request that lands on a
+freshly booted object is served before any advance has run — `catchUp()` returns
+early because nothing has elapsed yet. Such a request reports the boot-time
+initializers: `feedStatus: "synthetic"`, both temperatures pinned at `0.5`, and
+no `blockNumber` field at all — even though the feed behind that payload has
+already hydrated a real block and a real temperature from storage and would hand
+them over on the next `advance()`, which is the cron's job and lands within the
+minute.
 
 `feedStatus` and `blockNumber` now agree by construction, and that is a repair
 rather than a convenience. `"live"` used to mean *Arc is configured*, which is
@@ -423,10 +451,13 @@ running, because the cron is the only caller that waits for one.
 
 One more reading that looks like a fault and is not. `chainTemp` and
 `marketTemp` are rank percentiles, and a rank taken against an empty window is
-`0.5` by construction — so a feed that has just landed its first poll reports
-`feedStatus: "live"` next to temperatures of exactly `0.5`. It takes a second
-reading on the same object before either can move, and the meters are isolate
-state, so an eviction buys another minute or two of neutral.
+`0.5` by construction — so a feed that has just landed its very first poll
+reports `feedStatus: "live"` next to temperatures of exactly `0.5`, and it takes
+a second reading before either can move. That is now a cold-*feed* condition
+rather than a cold-object one: the meters' windows ride in the ledger, so an
+eviction no longer empties them and no longer buys another minute or two of
+neutral. What still reads `0.5` right after an eviction is the payload's own
+copy, for the reason in the paragraph above — no `advance()` has run yet.
 
 Once the object holds they do move — and not monotonically, since a rank
 percentile tracks the flow rather than climbing it. Production readings taken in
@@ -604,12 +635,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-110 tests on `node:test`, no test framework dependency:
+112 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 48 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, the chain feed's heartbeat and its x402 sender resolution against a stubbed JSON-RPC |
+| `@abyssal/server` | 50 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, its x402 sender resolution, and the feed state that lets an evicted object resume instead of re-backfilling |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
@@ -634,7 +665,12 @@ Still open:
   published seed rather than on an attestation anybody can verify
   independently. Setting one needs more than the secret: `lastCommittedDay`
   lives in the isolate too, so an eviction between two day boundaries would
-  commit the same day twice. That bookkeeping has to become durable first.
+  commit the same day twice. That bookkeeping has to become durable first. The
+  ledger that now carries `lastAdvanceAt` and the feed state is the obvious home
+  for it, but it needs a stronger guarantee than either: `save()` is
+  fire-and-forget (`void storage.put`), and a lost write costs a backfill when
+  what it carries is a block number and a duplicate on-chain transaction when
+  what it carries is a commit guard.
 - **Paid data tier.** `facilitator.ts` is complete and unused. Historical API
   access in USDC would be its first product; today the only paid data is the day
   pass, which burns ABYS.

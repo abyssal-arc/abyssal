@@ -31,7 +31,7 @@
  * handler degrade to the synthetic feed.
  */
 import { Rng } from '@abyssal/sim';
-import type { ChainFeed, ChainSample, ChainTx } from './chain.js';
+import type { ChainFeed, ChainSample, ChainTx, FeedState, MeterState } from './chain.js';
 import type { MarketSample } from './market.js';
 
 export const ARC_CHAIN_ID = 5042;
@@ -64,6 +64,17 @@ const SENDERS_BATCH = 24;
  * flows as unknown beats spending ten serial batches on them.
  */
 const MAX_SENDER_BLOCKS = 240;
+/**
+ * Widest span a poll may treat as live rather than as history. A cron-spaced
+ * poll is ~120 blocks, so this leaves room for a couple of late or missed beats
+ * before the feed concludes it lost time. Past it, backfilling is the honest
+ * move: a live poll stamps every log it reads with `now`, so resuming across a
+ * long gap that way folds an hour of transfers into a single 15s pulse bucket
+ * and into /observe's five-minute window, reporting a spike that never
+ * happened. Backfill gives them their real per-block timestamps and marks x402
+ * unknown, which is what a gap that wide actually is.
+ */
+const MAX_LIVE_SPAN = 300;
 /**
  * Per-call RPC ceiling. Without one, a hung `eth_getLogs` leaves `inflight` set
  * forever, and since `kick()` returns the promise already in flight instead of
@@ -134,6 +145,23 @@ export class FlowMeter {
 
   get value(): number {
     return this.smooth === null ? 0.5 : this.smooth;
+  }
+
+  /** Carry-over for a runtime that evicts the object between polls. */
+  exportState(): MeterState {
+    return { window: [...this.window], smooth: this.smooth };
+  }
+
+  /**
+   * Resume from stored scores. Defensive because these bytes come back out of
+   * Durable Object storage, where a truncated value should cost a cold scale
+   * rather than a boot.
+   */
+  importState(s: MeterState): void {
+    const w = s?.window;
+    this.window = Array.isArray(w) ? w.filter((n) => Number.isFinite(n)).slice(-this.maxWindow) : [];
+    const sm = s?.smooth;
+    this.smooth = typeof sm === 'number' && Number.isFinite(sm) ? clamp01(sm) : null;
   }
 }
 
@@ -342,6 +370,47 @@ export class ArcUsdcFeed implements ChainFeed {
   async settle(): Promise<void> {
     const p = this.kick(Date.now());
     if (p) await p;
+  }
+
+  /**
+   * Carry-over for a runtime whose object does not outlive its invocation.
+   * `lastBlock` is the part that matters most: without it every cold boot is a
+   * 3600-block backfill, and a backfill resolves no senders (so every flow it
+   * produces is `x402: null`), rebuilds the pulse history wholesale, and pushes
+   * thousands of flows through the ring — enough on a busy chain to evict the
+   * live readings a viewer actually came for, every single minute. The meters
+   * ride along so the temperatures resume as ranks against their own history
+   * instead of restarting at 0.5 and spending ~90 polls earning a scale back.
+   *
+   * `flows` and `pulse` deliberately do not. They are the two large structures
+   * in here, both refill within a few polls, and a restored copy of either
+   * would be indistinguishable from a fresh one — the worst kind of state to
+   * carry across an eviction.
+   */
+  exportState(): FeedState {
+    return {
+      lastBlock: this.lastBlock,
+      level: this.level.exportState(),
+      turbulence: this.turbulence.exportState(),
+      chainTemp: this.chainTemp,
+      marketTemp: this.marketTemp,
+      prevVolume: this.prevVolume,
+      prevTemp: this.prevTemp,
+    };
+  }
+
+  importState(s: FeedState): void {
+    if (!s || typeof s !== 'object') return;
+    // Anything but a real block number is worse than none: the next poll would
+    // compute `from = lastBlock + 1` off garbage and read a range nobody chose.
+    // Leaving it at -1 costs a backfill, which is the cold-start path anyway.
+    if (Number.isInteger(s.lastBlock) && s.lastBlock >= 0) this.lastBlock = s.lastBlock;
+    if (s.level) this.level.importState(s.level);
+    if (s.turbulence) this.turbulence.importState(s.turbulence);
+    if (Number.isFinite(s.chainTemp)) this.chainTemp = clamp01(s.chainTemp);
+    if (Number.isFinite(s.marketTemp)) this.marketTemp = clamp01(s.marketTemp);
+    if (Number.isFinite(s.prevVolume)) this.prevVolume = s.prevVolume;
+    if (Number.isFinite(s.prevTemp)) this.prevTemp = clamp01(s.prevTemp);
   }
 
   /** Start a poll if one is due; returns the promise in flight, or null. */
@@ -592,7 +661,11 @@ export class ArcUsdcFeed implements ChainFeed {
     try {
       const latest = parseInt((await this.rpc('eth_blockNumber', [])) as string, 16);
       if (!Number.isFinite(latest)) throw new Error('bad block number');
-      const isBackfill = this.lastBlock < 0;
+      // A restored `lastBlock` can be arbitrarily old: the state outlives the
+      // object, but the cron that kept it fresh may not have run for an hour.
+      // See MAX_LIVE_SPAN for why that resumes as a backfill and not as one
+      // very wide live poll.
+      const isBackfill = this.lastBlock < 0 || latest - this.lastBlock > MAX_LIVE_SPAN;
       const from = isBackfill ? Math.max(0, latest - this.backfillBlocks) : this.lastBlock + 1;
       if (from > latest) {
         this.lastBlock = latest;

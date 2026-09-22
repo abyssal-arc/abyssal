@@ -2,7 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
 import { createApp, type LedgerSnapshot, type WorldStore } from '../src/handler.js';
-import type { ChainFeed } from '../src/chain.js';
+import type { ChainFeed, FeedState } from '../src/chain.js';
 import type { MarketFeed } from '../src/market.js';
 import { serveStatic } from '../src/static.js';
 import {
@@ -1212,6 +1212,8 @@ function memStore() {
     store,
     seedClock: (t: number) => { state = { ...state, lastAdvanceAt: t }; },
     clock: () => state.lastAdvanceAt,
+    seedFeedState: (f: FeedState) => { state = { ...state, feedState: f }; },
+    feedState: () => state.feedState,
   };
 }
 
@@ -1508,6 +1510,132 @@ test('a poll wider than the old 24-block gate still resolves x402', async () => 
       obs.flows.slice(-2).map((f) => f.x402),
       [true, true],
       'and the per-flow mark survives a wide poll, which is what the tx drawer reads',
+    );
+  } finally {
+    rpc.close();
+  }
+});
+
+/* ---------- the feed outliving the object that held it ---------- */
+
+/** A quiet market feed: these tests are about the chain feed, not the price. */
+const quietMarket: MarketFeed = { name: 'test-market', sample: async () => ({ temp: 0.5 }) };
+
+/** A stored feed state, shaped like one coming back out of Durable Object storage. */
+const feedStateAt = (lastBlock: number): FeedState => ({
+  lastBlock,
+  level: { window: [1, 2, 3], smooth: 0.4 },
+  turbulence: { window: [0.1, 0.2], smooth: 0.6 },
+  chainTemp: 0.4,
+  marketTemp: 0.6,
+  prevVolume: 12,
+  prevTemp: 0.4,
+});
+
+test('an evicted object resumes the feed instead of backfilling from scratch', async () => {
+  // The Durable Object is not resident: the cron wakes it, it answers, and it is
+  // collected. Everything the feed knew lived in that object's memory, so every
+  // eviction restarted it at `lastBlock = -1` — a 3600-block backfill a minute,
+  // which resolves no senders (so every flow it produces is `x402: null`),
+  // rebuilds the pulse series wholesale, and pushes enough flows through the ring
+  // to evict the live readings a viewer came for. In production that read as an
+  // x402 share of 60-82% inside a live pulse bucket and 0% across the window
+  // around it: the numerator had been resolved, the denominator had been
+  // backfilled, and the backfill kept winning because it kept happening.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const { server: rpc, calls, setHead } = chainRpcStub(4096, 2);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  const m = memStore();
+  try {
+    // The object that is about to be evicted: one backfill, then two live polls,
+    // so its rank meters have a window worth carrying over.
+    const first = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 32, pollEveryMs: 0 });
+    await first.settle();
+    setHead(4096 + 118);
+    await first.settle();
+    setHead(4096 + 236);
+    await first.settle();
+    const appA = createApp({ seed: 1, chainFeed: first, store: m.store, marketFeed: quietMarket });
+    m.seedClock(Date.now() - 60_000);
+    await appA.catchUp();
+    // `catchUp()` calls `advance()`, which samples the feed, which on a feed with
+    // no throttle at all kicks one more poll and deliberately does not await it.
+    // Drain it here, before the head moves: left in flight it reads the *new*
+    // head, resolves senders for a span of its own, and lands those fetches
+    // wherever it likes relative to the count below. Production cannot hit this
+    // — there the throttle is 2s and `advance()` follows `warmFeed()` by
+    // milliseconds — but a test that races is a test that lies.
+    await first.settle();
+
+    assert.equal(
+      m.feedState()?.lastBlock,
+      4096 + 236,
+      'the ledger carries the block the feed reached — the one thing an eviction cannot re-derive',
+    );
+
+    // The next object: cold memory, warm storage, one cron interval later.
+    const second = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 32 });
+    const appB = createApp({ seed: 1, chainFeed: second, store: m.store, marketFeed: quietMarket });
+    setHead(4096 + 354);
+    const blocksBefore = calls.blocks;
+    // `warmFeed` is the cron's opening move and must hydrate first: `settle()`
+    // starts a poll on a cold feed, and a poll that runs before the stored block
+    // is restored backfills no matter how faithfully the block was saved.
+    await appB.warmFeed();
+
+    // A backfill fetches no full blocks, so a non-zero count is itself the proof
+    // of a resume: the span was narrow enough to be treated as live.
+    assert.equal(
+      calls.blocks - blocksBefore,
+      118,
+      'the new object polled forward from the stored block instead of re-backfilling 3600 of them',
+    );
+    const carried = second.exportState();
+    assert.ok(
+      carried.level.window.length >= 4,
+      `the rank window came back with it (got ${carried.level.window.length} scores, a cold feed has 1 after its first poll), so the temperature is a rank against history rather than a fresh initializer`,
+    );
+    assert.ok(
+      second.observePayload().stats.x402Count > 0,
+      'and the x402 signal survived the eviction, which is what the whole repair was for',
+    );
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a stored block too far behind re-backfills instead of reporting the gap as now', async () => {
+  // Resuming is only honest while the gap is a missed beat. A live poll stamps
+  // every log it reads with `now`, so resuming across an hour that way folds an
+  // hour of transfers into one 15s pulse bucket and into /observe's five-minute
+  // window — a spike that never happened, sitting in the history for a day, and
+  // x402 marks claimed for the newest 240 blocks only. Persisting `lastBlock`
+  // without this guard would trade a loud failure for a quiet lie.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 20_000;
+  const { server: rpc, calls } = chainRpcStub(HEAD, 2);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  const m = memStore();
+  // An hour of Arc at 500ms a block, unwatched.
+  m.seedFeedState(feedStateAt(HEAD - 7200));
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 32 });
+    const app = createApp({ seed: 1, chainFeed: feed, store: m.store, marketFeed: quietMarket });
+    const blocksBefore = calls.blocks;
+    await app.warmFeed();
+    assert.equal(
+      calls.blocks - blocksBefore,
+      0,
+      'a gap that wide is history rather than a live span, so no senders are fetched and no x402 is claimed for transfers nobody resolved',
+    );
+    const flows = feed.observePayload().flows;
+    assert.ok(flows.length > 0, 'the backfill still landed its flows');
+    const age = Date.now() - flows[0].t;
+    assert.ok(
+      age > 10_000,
+      `backfilled flows carry their own block's time (oldest is ${Math.round(age / 1000)}s old); a live poll would have stamped the whole hour as happening now`,
     );
   } finally {
     rpc.close();

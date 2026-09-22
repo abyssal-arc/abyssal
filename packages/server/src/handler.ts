@@ -26,7 +26,7 @@ import {
   type World,
 } from '@abyssal/sim';
 import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
-import { SyntheticFeed, type ChainFeed, type ChainTx } from './chain.js';
+import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
   ABYS_PRICES,
@@ -169,6 +169,16 @@ export interface LedgerSnapshot {
    * forgives the entire idle gap.
    */
   lastAdvanceAt: number;
+  /**
+   * Where the chain feed got to, and the numbers its temperatures rank
+   * themselves against. Absent when the feed has nothing worth resuming — the
+   * offline one is a sinusoid and a PRNG. Without it a cold object rebuilds the
+   * feed from `lastBlock = -1` on every eviction, which means a 3600-block
+   * backfill a minute: no senders resolved, so no x402 signal; a pulse history
+   * rebuilt from scratch each time; and enough backfilled flows through the ring
+   * to push out the live ones a viewer asked for.
+   */
+  feedState?: FeedState;
 }
 
 /**
@@ -184,6 +194,8 @@ export interface LedgerLoad {
   fossils?: Partial<FossilBoard>;
   /** Absent in ledgers written before the wall clock was persisted. */
   lastAdvanceAt?: number;
+  /** Absent in ledgers written before the feed was resumable. */
+  feedState?: FeedState;
 }
 
 export interface WorldStore {
@@ -1836,6 +1848,12 @@ export function createApp(options: AppOptions = {}) {
       if (typeof s.lastAdvanceAt === 'number' && s.lastAdvanceAt < lastAdvanceAt) {
         lastAdvanceAt = s.lastAdvanceAt;
       }
+      // Restore the feed here rather than at first use. On the cron path this
+      // runs from inside `warmFeed()`, and that ordering is load-bearing:
+      // `settle()` starts a poll on a cold feed, and a poll that runs before the
+      // stored block is back in place is a poll that backfills from -1 — the
+      // exact work the persisted state exists to skip.
+      if (s.feedState) chainFeed.importState?.(s.feedState);
     })();
     return hydrated;
   }
@@ -1847,6 +1865,7 @@ export function createApp(options: AppOptions = {}) {
       flares,
       fossils,
       lastAdvanceAt,
+      feedState: chainFeed.exportState?.(),
     });
   }
 
@@ -1903,8 +1922,15 @@ export function createApp(options: AppOptions = {}) {
      * forever on initializer temperatures with no transfer ever raining. The
      * cron handler calls this because it has nobody waiting on it, which makes
      * it the feed's heartbeat.
+     *
+     * Hydration is first and not optional, for the same reason it is in
+     * `catchUp()`: this is the cron's opening move, `settle()` starts a poll on
+     * a feed that has never landed one, and a poll that runs before the stored
+     * block is restored backfills 3600 blocks from -1. The persisted feed state
+     * would then be written back having bought nothing.
      */
     async warmFeed(): Promise<void> {
+      await hydrate();
       await chainFeed.settle?.();
     },
     start(ms = 250): void {
