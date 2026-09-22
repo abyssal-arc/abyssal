@@ -214,14 +214,20 @@ npx wrangler secret put ABYS_TOKEN_ADDRESS   # the deployed token contract
 npx wrangler deploy                # assets + worker + DO migration
 ```
 
-Bind `www.abyssal-arc.com` — the canonical host the site is published at — by
-adding `abyssal-arc.com` as a Cloudflare zone (NS switch at the registrar) and
-then Workers → Custom domains, or a `routes` entry in `wrangler.toml`. Both the
-apex and `www` are bound and both serve the same tank; the web client calls the
-API by relative path, so each host is same-origin with itself and no CORS
-allowlist is involved. Cloudflare issues a free Universal SSL certificate for
-the zone automatically and the custom domain terminates on it; there is no
+The site is published at **https://www.abyssal-arc.com**, and that hostname is
+bound to the worker by DNS records managed in the Cloudflare account — not by
+`wrangler.toml`, which deliberately declares no `routes`. Claiming the hostname
+there as well makes the API refuse the whole deploy with `already has externally
+managed DNS records [100117]`, so the account and the config file must not both
+speak for it. The web client calls the API by relative path, so the host is
+same-origin with itself and no CORS allowlist is involved. Cloudflare issues a
+free Universal SSL certificate for the zone automatically; there is no
 certificate management anywhere in this repo.
+
+To publish a deployment under a hostname of your own, add the zone to Cloudflare
+(NS switch at the registrar) and bind it under Workers → Custom domains. Only
+reach for a `routes` entry in `wrangler.toml` when nothing else already claims
+the name.
 
 ### One tank per deployment
 

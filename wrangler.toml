@@ -2,6 +2,18 @@ name = "abyssal"
 main = "packages/server/src/worker.ts"
 compatibility_date = "2026-09-01"
 
+# No `routes` in this file, on purpose. www.abyssal-arc.com reaches the worker
+# through DNS records managed at the account level, and declaring the hostname
+# here as a custom domain makes the API refuse the entire deploy:
+#
+#   Hostname 'www.abyssal-arc.com' already has externally managed DNS records
+#   (A, CNAME, etc). Delete them first or try a different hostname. [100117]
+#
+# An earlier revision kept a `routes` block down under `[triggers]`, where TOML
+# turned it into `triggers.routes`: wrangler warned "Unexpected fields found in
+# triggers field" and ignored it, so deploys kept succeeding by accident rather
+# than by design. The binding lives in the Cloudflare account, not in this file.
+
 # The web client ships as Workers Static Assets; any path that is not a file
 # falls through to the Worker and routes into the Durable Object.
 [assets]
@@ -20,16 +32,6 @@ new_sqlite_classes = ["AbyssalWorld"]
 # the gaps between alarms.
 [triggers]
 crons = ["* * * * *"]
-
-# Custom domain: Cloudflare issues the Universal SSL certificate for the zone
-# automatically once the domain is active on the account. www is the canonical
-# host the site is published at; the apex stays bound so a bare-domain link does
-# not dead-end, and both serve this same tank. The client calls the API by
-# relative path, so each host is same-origin with itself and needs no allowlist.
-routes = [
-  { pattern = "abyssal-arc.com", custom_domain = true },
-  { pattern = "www.abyssal-arc.com", custom_domain = true },
-]
 
 # Deployed ABYS contract on Arc mainnet (public information; a proxy whose
 # implementation answers decimals() = 18, which the offer math reads live).
