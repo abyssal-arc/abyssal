@@ -207,7 +207,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (103 total)
+npm test           # sim + server + web tests (106 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -319,6 +319,16 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
 - `ctx.storage.setAlarm()` is the other mechanism, and this repo does not use
   it. An `alarm()` method with nothing arming it is unreachable code, not a
   second safety net — it was removed for exactly that reason.
+- **The wall clock has to be durable.** `catchUp()` computes what is owed from
+  `lastAdvanceAt`, and an isolate that boots without it starts from
+  `Date.now()`, finds zero elapsed, and silently forgives the entire idle gap.
+  A cron that lands on a cold object — which is every cron, if the object is
+  evicted between fires — then advances nothing at all, and the tank runs at
+  whatever fraction of real time its viewer traffic happens to leave behind.
+  `lastAdvanceAt` therefore rides in the persisted ledger, `catchUp()` hydrates
+  before it measures, and the stored clock is only ever allowed to move the
+  local one backwards, so skew between isolates cannot pin the world. `api.test.ts`
+  pins all three halves.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -544,12 +554,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-103 tests on `node:test`, no test framework dependency:
+106 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 41 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape |
+| `@abyssal/server` | 44 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()` |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs

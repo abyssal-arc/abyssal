@@ -162,6 +162,13 @@ export interface LedgerSnapshot {
   adoptions: [string, number[]][];
   flares: Flare[];
   fossils: FossilBoard;
+  /**
+   * Wall-clock ms the world was last advanced against. This has to be durable:
+   * `catchUp()` measures the owed ticks against it, and an isolate that boots
+   * without it starts from `Date.now()`, finds nothing elapsed, and silently
+   * forgives the entire idle gap.
+   */
+  lastAdvanceAt: number;
 }
 
 /**
@@ -175,6 +182,8 @@ export interface LedgerLoad {
   adoptions?: [string, number[]][];
   flares?: Flare[];
   fossils?: Partial<FossilBoard>;
+  /** Absent in ledgers written before the wall clock was persisted. */
+  lastAdvanceAt?: number;
 }
 
 export interface WorldStore {
@@ -1798,6 +1807,14 @@ export function createApp(options: AppOptions = {}) {
           if (Array.isArray(rows)) fossils[cat] = rows.slice(0, FOSSILS_PER_CATEGORY);
         }
       }
+      // Take the stored clock only when it is older than this isolate's own.
+      // On a cold boot the local value is `Date.now()`, so the stored one wins
+      // and the idle gap becomes owed ticks; on a warm isolate the local value
+      // is more recent and must not be dragged backwards, and a clock from an
+      // isolate whose wall time ran ahead is ignored for the same reason.
+      if (typeof s.lastAdvanceAt === 'number' && s.lastAdvanceAt < lastAdvanceAt) {
+        lastAdvanceAt = s.lastAdvanceAt;
+      }
     })();
     return hydrated;
   }
@@ -1808,6 +1825,7 @@ export function createApp(options: AppOptions = {}) {
       adoptions: [...adoptions.entries()],
       flares,
       fossils,
+      lastAdvanceAt,
     });
   }
 
@@ -1823,14 +1841,25 @@ export function createApp(options: AppOptions = {}) {
      * 250ms interval (a Worker isolate sleeps between requests). The chain is
      * sampled once and the elapsed ticks are replayed with it, capped so a
      * long idle gap cannot stall a request.
+     *
+     * Hydration comes first and is not optional: the owed ticks are measured
+     * against the persisted `lastAdvanceAt`, and this runs before `fetch()` —
+     * which is where hydration used to happen — so a cold isolate would
+     * otherwise always find zero elapsed and never move the world at all.
      */
     async catchUp(maxTicks = 240): Promise<number> {
+      await hydrate();
       const elapsed = Math.min(maxTicks, Math.floor((Date.now() - lastAdvanceAt) / 250));
       if (elapsed <= 0) return 0;
       await advance();
       for (let i = 1; i < elapsed; i++) {
         tickWorld(world, { chain: chainTemp, market: marketTemp }, []);
       }
+      // Persist the clock alongside the world. This write lands before the
+      // caller's world snapshot, so a crash in between leaves the tank short a
+      // few ticks rather than replaying ones it already lived — the safe
+      // direction, since a replay would run culls and predations twice.
+      saveStore();
       return elapsed;
     },
     start(ms = 250): void {

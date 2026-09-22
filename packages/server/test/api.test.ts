@@ -1,7 +1,9 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
-import { createApp } from '../src/handler.js';
+import { createApp, type LedgerSnapshot, type WorldStore } from '../src/handler.js';
+import type { ChainFeed } from '../src/chain.js';
+import type { MarketFeed } from '../src/market.js';
 import { serveStatic } from '../src/static.js';
 import {
   ARC_USDC,
@@ -1176,4 +1178,70 @@ test('the render payload carries paid identity, and only for those who have any'
   assert.equal(plain.baseName, undefined, 'an unmodified tank pays nothing for the extra fields');
   assert.equal(plain.ark, undefined);
   assert.equal(plain.legendary, undefined);
+});
+
+/* ---------- the durable wall clock behind catchUp ---------- */
+
+/**
+ * A Worker isolate is torn down between requests, and the cron that keeps an
+ * unwatched tank alive lands on a cold one every time. `catchUp()` measures the
+ * owed ticks against `lastAdvanceAt`, so unless that clock is persisted every
+ * cold boot starts from `Date.now()`, finds zero elapsed, and silently forgives
+ * the whole idle gap. That is the regression which made the declared cron a
+ * no-op: the world only advanced while somebody happened to be watching.
+ *
+ * Both feeds are stubbed because `catchUp()` samples the chain for real.
+ */
+const offlineFeeds: { chainFeed: ChainFeed; marketFeed: MarketFeed } = {
+  chainFeed: {
+    name: 'test-chain',
+    sample: async () => ({ temp: 0.5, delta: 0, blockNumber: 1 }),
+    recentTxs: () => [],
+  },
+  marketFeed: { name: 'test-market', sample: async () => ({ temp: 0.5 }) },
+};
+
+/** An in-memory stand-in for the Durable Object's ledger storage. */
+function memStore() {
+  let state: Partial<LedgerSnapshot> = {};
+  const store: WorldStore = {
+    load: async () => state,
+    save: (s) => { state = s; },
+  };
+  return {
+    store,
+    seedClock: (t: number) => { state = { ...state, lastAdvanceAt: t }; },
+    clock: () => state.lastAdvanceAt,
+  };
+}
+
+test('a cold isolate replays the idle gap from the persisted wall clock', async () => {
+  const m = memStore();
+  // A minute of unattended wall clock, owed by whoever boots next.
+  m.seedClock(Date.now() - 60_000);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const advanced = await app.catchUp();
+  assert.equal(advanced, 240, '60s at 250ms/tick is 240 ticks, and the cap is 240');
+  assert.equal(app.world.tick, 240, 'and the world actually lived them');
+  assert.ok(
+    (m.clock() ?? 0) > Date.now() - 5_000,
+    'the advanced clock is persisted, so the next isolate inherits it rather than the gap',
+  );
+});
+
+test('with no persisted clock a first boot owes nothing and stays put', async () => {
+  const m = memStore();
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  assert.equal(await app.catchUp(), 0, 'a world with no history has no gap to replay');
+  assert.equal(app.world.tick, 0);
+});
+
+test('a clock from the future is ignored instead of pinning the tank', async () => {
+  const m = memStore();
+  // Clock skew between isolates must not be able to freeze the world: hydrate
+  // only ever moves the local clock backwards, never forwards.
+  m.seedClock(Date.now() + 60_000);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  assert.equal(await app.catchUp(), 0);
+  assert.equal(app.world.tick, 0);
 });
