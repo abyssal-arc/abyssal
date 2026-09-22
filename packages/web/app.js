@@ -1373,6 +1373,7 @@ async function pollObserve() {
     empty.hidden = true;
     obsData = d;
     renderObsStats();
+    renderObsVenues();
     renderObsEndpoints();
     if (addrCardAddr && !document.getElementById('addr-card').hidden) openAddrCard(addrCardAddr);
     drawPulse();
@@ -1404,10 +1405,18 @@ pollObserve().then(() => {
 
 function renderObsStats() {
   const s = obsData.stats;
+  // The share is over the transfers whose rail was actually read, so it names
+  // that denominator whenever it is not the whole window. A backfill resolves
+  // nothing, and with a real x402 share near one percent an unqualified number
+  // would read as a collapse rather than as a gap in coverage.
+  const read = s.resolved !== undefined && s.transfers > 0 ? s.resolved / s.transfers : 1;
+  const shareTxt = s.resolved === 0 || !s.transfers
+    ? '—'
+    : `${(s.x402Share * 100).toFixed(1)}%${read < 1 ? ` ${t('obsShareRead', { n: Math.round(read * 100) })}` : ''}`;
   const stats = [
     [t('obsTransfers'), s.transfers.toLocaleString(), ''],
     [t('obsVolume'), fmtUsd(s.volume), ''],
-    [t('obsX402Share'), `${(s.x402Share * 100).toFixed(1)}%`, 'gold'],
+    [t('obsX402Share'), shareTxt, 'gold'],
     [t('obsBlock'), `#${obsData.lastBlock.toLocaleString()}`, 'sm'],
   ];
   document.getElementById('obs-stats').innerHTML = stats
@@ -1415,6 +1424,60 @@ function renderObsStats() {
     .join('');
   document.getElementById('obs-window').textContent = t('obsWindow', { n: Math.round(obsData.windowSeconds / 60) });
   document.getElementById('pulse-sub').textContent = t('pulseHint');
+}
+
+/**
+ * Rails panel: which contract settled each transfer inside the window.
+ *
+ * Rows are per venue rather than per kind, so a viewer can see the actual shape
+ * of Arc's USDC flow — one Universal Router and a long tail of uncatalogued
+ * contracts — which is what the old sender-vs-payer heuristic collapsed into a
+ * single number it then called x402. The kind chips above the rows carry the
+ * totals; a row's own kind tag keeps the two readings connected.
+ */
+function renderObsVenues() {
+  const el = document.getElementById('venues');
+  if (!el) return;
+  const rows = obsData.venueRows ?? [];
+  const cov = obsData.venueCoverage ?? null;
+  const kinds = (obsData.venues ?? []).filter((v) => v.count > 0);
+  const max = Math.max(...rows.map((r) => r.volume), 1);
+  // A catalogued venue arrives with a name; an uncatalogued one is only an
+  // address, and a full 42-character address would break the row.
+  const nameOf = (r) =>
+    r.label && r.label.startsWith('0x') ? shortAddr(r.label) : esc(r.label ?? t(`venue_${r.kind}`));
+  el.innerHTML =
+    (kinds.length
+      ? `<div class="vchips">${kinds
+          .map(
+            (v) =>
+              `<span class="vchip v-${v.kind}">${esc(t(`venue_${v.kind}`))}` +
+              `<b>${v.count.toLocaleString()}</b></span>`,
+          )
+          .join('')}</div>`
+      : '') +
+    `<div class="vrows">${rows
+      .map((r, i) => {
+        // The token's own address is the venue for x402 and direct rows; a card
+        // for it would list every flow in the window, which answers nothing.
+        const clickable = r.address && r.address !== obsData.usdc ? r.address : '';
+        return (
+          `<div class="ep${i < 3 ? ' top' : ''}"${clickable ? ` data-vaddr="${esc(clickable)}"` : ''}>` +
+          `<span class="rank">${i + 1}</span>` +
+          `<span class="mid"><span class="addr">${nameOf(r)}</span>` +
+          `<span class="volbar v-${r.kind}" style="width:${Math.round((r.volume / max) * 100)}%"></span></span>` +
+          `<span class="right"><span class="amt">${fmtUsd(r.volume)}</span>` +
+          `<span class="vtag v-${r.kind}">${esc(t(`venue_${r.kind}`))}</span></span>` +
+          `</div>`
+        );
+      })
+      .join('')}</div>` +
+    (cov && cov.unattributed > 0
+      ? `<div class="vcov">${esc(t('venueUnattributed', { n: cov.unattributed.toLocaleString() }))}</div>`
+      : '');
+  el.querySelectorAll('.ep[data-vaddr]').forEach((row) => {
+    row.addEventListener('click', () => openAddrCard(row.dataset.vaddr));
+  });
 }
 
 function renderObsEndpoints() {
@@ -1486,6 +1549,10 @@ async function openAddrCard(address) {
         return `<div class="af ${isIn ? 'in' : 'out'}${f.x402 ? ' x402' : ''}">` +
           `<span class="dir">${isIn ? '↓' : '↑'}</span>` +
           `<span class="who" title="${other}">${shortAddr(other)}</span>` +
+          // The rail this one settled on. Omitted rather than shown as a
+          // placeholder when the feed never resolved the transaction, so an
+          // empty slot means "not looked up" and never "none".
+          (f.venue ? `<span class="vtag v-${f.venue}">${esc(t(`venue_${f.venue}`))}</span>` : '') +
           `<span class="amt">${f.amount >= 1000 ? fmtUsd(f.amount) : `${f.amount.toFixed(2)} USDC`}</span>` +
           `<span class="when">${new Date(f.t).toTimeString().slice(0, 8)}</span></div>`;
       }).join('')
@@ -1773,6 +1840,10 @@ function computePulseBars(pts) {
       volume: slice.reduce((s, p) => s + p.volume, 0),
       count: slice.reduce((s, p) => s + p.count, 0),
       x402: slice.reduce((s, p) => s + p.x402, 0),
+      // Carried through the grouping because it is the bar's denominator: a bar
+      // built entirely from unresolved buckets has no x402 share to draw, and
+      // without this it would draw one of zero.
+      resolved: slice.reduce((s, p) => s + (p.resolved || 0), 0),
     });
   }
   return bars;
@@ -1781,24 +1852,49 @@ function computePulseBars(pts) {
 /**
  * Historical buckets arrive already at display resolution; normalize them to
  * the live bar shape and carry the x402 portion as a 0..1 fraction (live bars
- * derive it from x402/count instead).
+ * derive it from x402/resolved instead). The fraction is over resolved volume
+ * rather than total volume, and is null where nothing was resolved, so a
+ * backfilled stretch of history draws as unknown instead of as zero.
  */
 function computeHistoryBars(hist) {
   const span = Math.max(1, Math.round((hist.bucketMs || 60000) / 1000));
-  return hist.buckets.map((b) => ({
-    t: b.t,
-    span,
-    volume: b.volume,
-    count: b.count,
-    x402: 0,
-    x402Share: b.volume > 0 ? Math.min(1, Math.max(0, (b.x402Volume || 0) / b.volume)) : 0,
-  }));
+  return hist.buckets.map((b) => {
+    // Absent means the payload predates the field, in which case volume is the
+    // only denominator there ever was; an explicit zero means the bucket was
+    // rebuilt from history and nothing in it was resolved, which is unknown
+    // rather than a share of zero.
+    const resVol = b.resolvedVolume === undefined ? b.volume : b.resolvedVolume;
+    return {
+      t: b.t,
+      span,
+      volume: b.volume,
+      count: b.count,
+      x402: 0,
+      x402Share: resVol > 0 ? Math.min(1, Math.max(0, (b.x402Volume || 0) / resVol)) : null,
+    };
+  });
 }
 
-/** x402 fraction of a bar, from whichever source produced it. */
+/**
+ * x402 fraction of a bar, from whichever source produced it — or null when the
+ * bar's transactions were never read, which is a different claim from a share
+ * of zero. A backfill resolves no venues, so without this the stretch of
+ * history it lands would paint flat and read as "no machine payments happened"
+ * rather than as "not looked at".
+ *
+ * `resolved === undefined` falls back to the count-based share: an absent field
+ * means the payload predates it, whereas an explicit zero is a measurement.
+ */
 function x402ShareOf(p) {
   if (p.x402Share !== undefined) return p.x402Share;
-  return p.count > 0 ? Math.min(1, p.x402 / p.count) : 0;
+  if (p.resolved === 0) return null;
+  const den = p.resolved !== undefined ? p.resolved : p.count;
+  return den > 0 ? Math.min(1, p.x402 / den) : 0;
+}
+
+/** A share for display: `—` when unknown, so the panel never shows a made-up 0%. */
+function fmtShare(v) {
+  return v === null || v === undefined ? '—' : `${Math.round(v * 100)}%`;
 }
 
 /** True when a fetched historical range is on screen (brushing is allowed). */
@@ -1891,10 +1987,17 @@ function drawPulse() {
       capBar(pctx, x, y, barW, xh, barW / 2);
     }
     // Bright cap dot, additive so busy columns read as a glowing skyline.
+    // Three states rather than two: gold says machine payments were found,
+    // cyan says the transactions were read and none were, and a dim dot says
+    // this stretch was never resolved at all — history landed by a backfill,
+    // which reads no transaction bodies. Painting that last one cyan would
+    // turn "not looked at" into "none happened".
     pctx.globalCompositeOperation = 'lighter';
     pctx.fillStyle = share > 0
       ? 'rgba(255, 236, 180, 0.7)'
-      : 'rgba(190, 246, 255, 0.5)';
+      : share === null
+        ? 'rgba(150, 168, 182, 0.28)'
+        : 'rgba(190, 246, 255, 0.5)';
     pctx.beginPath();
     pctx.arc(x + barW / 2, y, Math.max(0.9, barW / 2), 0, Math.PI * 2);
     pctx.fill();
@@ -1919,7 +2022,7 @@ function drawPulse() {
     pctx.stroke();
     const b = bars[idx];
     pctx.fillStyle = 'rgba(255, 236, 180, 0.9)';
-    pctx.fillText(`${fmtUsd(b.volume)} · ${Math.round(x402ShareOf(b) * 100)}% x402`, x + 4, 0);
+    pctx.fillText(`${fmtUsd(b.volume)} · ${fmtShare(x402ShareOf(b))} x402`, x + 4, 0);
   }
 
   pctx.fillStyle = 'rgba(201, 214, 232, 0.45)';
@@ -1968,21 +2071,33 @@ function drawBrush(bars, bw, top, plotH, base, w) {
   pctx.moveTo(Math.round(x1) - 0.5, top); pctx.lineTo(Math.round(x1) - 0.5, base);
   pctx.stroke();
 
-  let vol = 0, cnt = 0, x402Vol = 0;
+  let vol = 0, cnt = 0, x402Vol = 0, resVol = 0;
   for (let i = lo; i <= hi; i++) {
     vol += bars[i].volume;
     cnt += bars[i].count;
-    x402Vol += bars[i].volume * x402ShareOf(bars[i]);
+    const share = x402ShareOf(bars[i]);
+    // An unresolved bar adds to the volume total but not to the share's
+    // denominator: folding it in would report the selection as carrying fewer
+    // machine payments than it did, by however much history the brush happened
+    // to cover. `resVol` is the denominator that stays honest about it.
+    if (share !== null) {
+      x402Vol += bars[i].volume * share;
+      resVol += bars[i].volume;
+    }
   }
   const t0 = bars[lo].t;
   const t1 = bars[hi].t + bars[hi].span * 1000;
   const spanMin = Math.max(1, Math.round((t1 - t0) / 60000));
   const hhmm = (t) => new Date(t).toTimeString().slice(0, 5);
-  const x402Pct = vol > 0 ? Math.round((x402Vol / vol) * 100) : 0;
+  const x402Txt = resVol > 0 ? `${Math.round((x402Vol / resVol) * 100)}%` : '—';
   const lines = [
     `${hhmm(t0)}\u2013${hhmm(t1)}  \u00b7  ${spanMin}m`,
     `${fmtUsd(vol)}  \u00b7  ${cnt.toLocaleString()} tx`,
-    `x402 ${x402Pct}%`,
+    // The share names its own denominator when part of the selection was never
+    // resolved, so a low reading cannot be mistaken for a low x402 chain.
+    resVol > 0 && resVol < vol
+      ? `x402 ${x402Txt} of ${Math.round((resVol / vol) * 100)}% read`
+      : `x402 ${x402Txt}`,
   ];
   pctx.save();
   pctx.font = '10px monospace';
@@ -2034,7 +2149,7 @@ pulseCanvas.addEventListener('mousemove', (ev) => {
   const when = p.span > 15 ? `${hhmmss(p.t)}\u2013${hhmmss(p.t + p.span * 1000)}` : hhmmss(p.t);
   tipEl.hidden = false;
   tipEl.innerHTML = `<b>${when}</b> \u00b7 ${fmtUsd(p.volume)}<br>` +
-    `${t('obsTransfers')} ${p.count} \u00b7 x402 ${Math.round(x402ShareOf(p) * 100)}%`;
+    `${t('obsTransfers')} ${p.count} \u00b7 x402 ${fmtShare(x402ShareOf(p))}`;
   tipEl.style.left = `${Math.min(ev.clientX + 14, window.innerWidth - tipEl.offsetWidth - 8)}px`;
   tipEl.style.top = `${Math.min(ev.clientY + 14, window.innerHeight - tipEl.offsetHeight - 8)}px`;
 });
@@ -4703,6 +4818,10 @@ document.addEventListener('langchange', () => {
   applyChainStrings();
   if (obsData && view === 'observe') {
     renderObsStats();
+    // The rails panel is the one observatory list with translated text in it —
+    // endpoints render addresses only — so it is the one that has to be redrawn
+    // when the language changes rather than left showing the previous one.
+    renderObsVenues();
   }
   if (lastStats) drawCharts();
   if (lastCulls) renderObituaries(lastCulls);

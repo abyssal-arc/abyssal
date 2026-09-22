@@ -20,8 +20,9 @@ meal can be traced back to the payment that rained it.
 Two views over one data source:
 
 - **OBSERVE** — the Arc USDC flow observatory. Live payment map, volume pulse
-  with 1h/24h time-travel, endpoint ranking, a scrolling transfer ticker,
-  per-address drill-down. Free to watch.
+  with 1h/24h time-travel, a breakdown of which rail each transfer settled on,
+  endpoint ranking, a scrolling transfer ticker, per-address drill-down. Free to
+  watch.
 - **WORLD** — a deterministic ecosystem driven by that same flow. Chain
   congestion sets the food spawn rate, market turbulence sets the excitation,
   and the window's biggest payers swim through the tank as whales whose own
@@ -207,7 +208,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (112 total)
+npm test           # sim + server + web tests (119 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -345,26 +346,28 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   now drains `6 × (ticks − 1)` and deals them out six a tick — the density the
   250ms loop produces — so the minute's transfers all land instead of only the
   first six.
-- **A tick-loop constant hiding in the data itself.** Telling a relayed transfer
-  from a plain one — the x402 signal this observatory is named after — needs the
-  submitting tx, which means full blocks, and those were only fetched when a poll
-  spanned 24 blocks or fewer. That ceiling fits the default 2s poll interval with
-  room to spare and nothing slower: Arc produces a block every 500ms (measured on
-  mainnet, 0.500–0.510 s/block over the last 600), so a cron-spaced poll spans
-  ~120 and the gate never opened. Every flow came back `x402: null` and the
-  machine-payment share read as exactly zero — intermittently, which is worse
-  than never, because a viewer polling fast enough did fit under the gate.
-  Senders now come in batches of 24 out to `MAX_SENDER_BLOCKS`, trading
-  round-trips for the same concurrency, and a failed batch leaves those flows
-  unknown rather than costing the whole poll.
+- **A tick-loop constant hiding in the data itself.** Knowing which contract
+  settled a transfer needs the submitting tx, which means full blocks, and those
+  were only fetched when a poll spanned 24 blocks or fewer. That ceiling fits the
+  default 2s poll interval with room to spare and nothing slower: Arc produces a
+  block every 500ms (measured on mainnet, 0.500–0.510 s/block over the last 600),
+  so a cron-spaced poll spans ~120 and the gate never opened. Every flow came
+  back unresolved and the machine-payment share read as exactly zero —
+  intermittently, which is worse than never, because a viewer polling fast enough
+  did fit under the gate. Transaction bodies now come in batches of 24 out to
+  `MAX_VENUE_BLOCKS`, trading round-trips for the same concurrency, and a failed
+  batch leaves those flows unattributed rather than costing the whole poll.
 - **And the feed's own state has to be durable.** With the clock and the
-  heartbeat both fixed, production produced a stranger fault: an x402 share that
-  measured 60–82% inside a live pulse bucket and 0% across the window around it.
+  heartbeat both fixed, production produced a stranger fault: a flagged share
+  that measured 60–82% inside a live pulse bucket and 0% across the window
+  around it. What the flag was counting turned out to be wrong too — that is the
+  next bullet — but the disagreement between the two readings was real, and it
+  had a different cause.
   The object is not resident — a cron fire wakes it, and nothing guarantees it is
   still there for the next one — and everything the feed knew lived in that
   object's memory. So each eviction restarted it at `lastBlock = -1`: a
-  3600-block backfill once a minute, which resolves no senders at all (every
-  flow it produces is `x402: null`), rebuilds the pulse series wholesale, and
+  3600-block backfill once a minute, which resolves no venues at all (every
+  flow it produces is unattributed), rebuilds the pulse series wholesale, and
   pushes ~9400 flows through a 6000-slot ring — enough to evict the live
   readings a viewer actually asked for. The numerator had been resolved and the
   denominator had been backfilled, and the backfill kept winning because it kept
@@ -380,6 +383,38 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   it reads with `now`, and resuming across an hour that way would fold an hour of
   transfers into a single 15s bucket — a spike that never happened, sitting in
   the history for a day.
+- **And the signal itself was measuring the wrong thing.** With the feed durable
+  and resolving, production reported a machine-payment share of 85%. That number
+  was wrong by roughly ninetyfold, and it was wrong in the direction that flatters.
+  The criterion was `tx.from != transfer.from` — somebody other than the payer
+  submitted this — which is true of every internal leg of every DEX swap, because
+  a swap moves USDC out of a pool contract. Measured against mainnet, 129 of 134
+  flagged flows had a *contract* on the paying side, which cannot be an x402
+  payer: an x402 payer is the party whose signature authorized the movement. The
+  real thing is a fact rather than an inference — x402 settles USDC through
+  EIP-3009, so it is a transaction addressed to the token itself carrying
+  `transferWithAuthorization` (`0xe3ee160e`). Of 2283 mainnet transactions
+  sampled, 20 were that: about 0.9%. Of the 87 addressed to USDC directly, 57 were
+  `approve`, which is not a payment either.
+  `venue.ts` now classifies every flow onto a rail — `x402`, `swap`, `aa`,
+  `direct`, `contract`, `unknown` — from the contract called and the method
+  called, against a registry read off mainnet (Universal Router, ERC-4337
+  EntryPoint v0.7, the V3 SwapRouter, two V4-style proxies, a DAG aggregator) with
+  a selector fallback for routers too new to be catalogued. Three refusals are
+  load-bearing. ERC-4337 bundles are **not** counted as x402 even though one
+  could be carrying an authorization, because telling that apart needs internal
+  traces the feed does not fetch — which makes the reported share a floor rather
+  than an estimate. `multicall` is **not** counted as a swap, because its real
+  action lives in calldata nobody decodes. And an uncatalogued venue is labelled
+  with its bare address rather than a plausible name.
+  The last piece is the denominator. A backfill reads no transaction bodies, so
+  its flows are unattributed; folding them into the share's denominator would
+  halve a one-percent reading and make a gap in coverage look like a collapse.
+  `stats.resolved` and each pulse bucket's `resolved` therefore travel with the
+  counts, the share is computed over what was actually read, and the client draws
+  an unresolved stretch as unknown — a dim cap on the chart, `—` in the panel —
+  rather than as zero. `x402: null` and `x402: false` stay distinct all the way
+  through to the CSV export, where an unresolved row gets an empty cell.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -490,7 +525,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/lineage` | Family tree of one creature: `?id=<n>&depth=<n>` returns ancestors and descendants |
 | GET | `/hall-of-fame` | The fossil wall: all-time top five per category |
 | GET | `/who?addr=0x…` | One address in the tank: burns, badges, day pass, board rank, its own battle reports |
-| GET | `/observe` | Arc USDC flow observatory: window stats, endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
+| GET | `/observe` | Arc USDC flow observatory: window stats, venue breakdown (which rail each transfer settled on — x402, swap, ERC-4337, direct), endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
 | GET | `/export?pass=0x…&kind=` | Day-pass download of the observation window: `csv`, `replay` or `digest` |
 | POST | `/intervene` | One of nine interventions, gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
@@ -635,12 +670,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-112 tests on `node:test`, no test framework dependency:
+119 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 50 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, its x402 sender resolution, and the feed state that lets an evicted object resume instead of re-backfilling |
+| `@abyssal/server` | 57 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address, and that a backfilled window reports no share rather than a share of zero |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs

@@ -1167,10 +1167,41 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 .ep.top .addr { color: var(--fg-1); }
 .ep .mid { flex: 1 1 auto; min-width: 0; }
 .ep .addr { font-family: var(--font-display); font-size: 11px; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ep .volbar { height: 3px; border-radius: 2px; background: var(--accent); margin-top: 3px; opacity: 0.7; }
+.ep .volbar { height: 3px; border-radius: 2px; background: var(--vc, var(--accent)); margin-top: 3px; opacity: 0.7; }
 .ep .right { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; flex: 0 0 auto; }
 .ep .amt { font-family: var(--font-display); font-size: 12px; font-variant-numeric: tabular-nums; color: var(--fg-1); }
 .ep .x4tag { font-size: 9px; color: #ffd166; font-family: var(--font-display); }
+
+/* ---------- rails: the venue breakdown ---------- */
+/*
+ * One colour per rail, defined as a custom property so the chip, the row's
+ * volume bar and the row's tag all read as the same kind without repeating the
+ * hex. `.ep .volbar` picks it up through `var(--vc, var(--accent))`, which is
+ * why the endpoint rows — carrying no `v-*` class — still render in accent.
+ * x402 keeps the gold the flow ticker and the chords already use for it, so the
+ * panel and the tank cannot disagree about which transfers are machine payments.
+ */
+.v-x402 { --vc: #ffd166; }
+.v-swap { --vc: var(--accent); }
+.v-aa { --vc: #9d8cff; }
+.v-direct { --vc: #6fd6c3; }
+.v-contract { --vc: #7d8ea3; }
+.v-unknown { --vc: #55606e; }
+
+#venues { display: flex; flex-direction: column; gap: calc(var(--sp) * 1.5); overflow-y: auto; min-height: 0; }
+.vchips { display: flex; flex-wrap: wrap; gap: 4px; flex: 0 0 auto; }
+.vchip {
+  display: inline-flex; align-items: baseline; gap: 4px; padding: 2px 6px;
+  border-radius: var(--radius-sm); border-left: 2px solid var(--vc);
+  background: rgba(7, 12, 22, 0.5);
+  font-family: var(--font-display); font-size: 10px; color: var(--vc);
+}
+.vchip b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--fg-1); }
+.vrows { display: flex; flex-direction: column; gap: calc(var(--sp) * 1.5); }
+.vtag { font-size: 9px; font-family: var(--font-display); color: var(--vc); }
+/* Unattributed flows are a statement about our own coverage, so it reads as
+   metadata rather than as another row competing for attention. */
+.vcov { flex: 0 0 auto; font-size: 10px; color: var(--fg-3); }
 
 .obs-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
 .obs-empty[hidden] { display: none; }
@@ -1210,6 +1241,8 @@ body.view-world #addr-card { bottom: auto; max-height: 70vh; }
 .af .amt { margin-left: auto; color: var(--fg-1); flex: 0 0 auto; }
 .af.x402 .amt { color: #ffd166; }
 .af .when { color: var(--fg-3); font-size: 9px; flex: 0 0 auto; }
+/* Fixed-basis so the rail tag keeps its wording while `.who` is what ellipsizes. */
+.af .vtag { flex: 0 0 auto; }
 .addr-empty { padding: calc(var(--sp) * 2) 0; font-size: 11px; line-height: 1.6; color: var(--fg-3); }
 #addr-card a.explore { display: inline-block; margin-top: calc(var(--sp) * 2.5); color: var(--accent); font-size: 11px; text-decoration: none; border-bottom: 1px solid transparent; transition: border-color var(--ease); }
 #addr-card a.explore:hover { border-bottom-color: var(--accent); }
@@ -1299,6 +1332,8 @@ body.view-observe .drawer, body.view-observe #banner { display: none !important;
   .obs-pulse-card { flex: 0 0 auto; }
   .obs-endpoints-card { flex: 0 0 auto; }
   #endpoints { max-height: 38vh; }
+  .obs-venues-card { flex: 0 0 auto; }
+  #venues { max-height: 30vh; }
   .viewtabs button { padding: 4px 10px; letter-spacing: 1px; }
   #tx-card { left: calc(var(--sp) * 3); right: calc(var(--sp) * 3); width: auto; bottom: calc(var(--sp) * 20); }
 }

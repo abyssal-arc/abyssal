@@ -1251,28 +1251,47 @@ test('a clock from the future is ignored instead of pinning the tank', async () 
 /* ---------- the chain feed's heartbeat in a runtime with no interval ---------- */
 
 /**
+ * Overrides the transaction body the stub serves, so a test can put a flow on a
+ * rail other than x402. `to: null` models a contract creation, which has no
+ * destination to classify.
+ */
+type StubTx = { to?: string | null; input?: string };
+
+/**
  * A JSON-RPC stub answering the calls a poll makes: the head, the log chunks,
- * and the full blocks that carry tx senders. `transfersPerChunk` fills each
- * `eth_getLogs` range with that many USDC transfers, enough to give the flow
- * ring and the pulse series something to hold. Every block reports its transfer
- * as submitted by a relayer rather than by the payer, which is the x402 signal,
- * so a poll that resolves senders at all is observable in `stats.x402Count`.
+ * and the full blocks that carry each transaction's destination and calldata.
+ * `transfersPerChunk` fills each `eth_getLogs` range with that many USDC
+ * transfers, enough to give the flow ring and the pulse series something to
+ * hold. By default every block reports its transfer as an EIP-3009
+ * authorization submitted by a relayer against the USDC contract itself, which
+ * is the x402 rail, so a poll that resolves venues at all is observable in
+ * `stats.x402Count`; pass `tx` to put it on a different one.
  * `calls` counts polls and block fetches so a test can tell one round of RPC
  * from two, `setHead` moves the chain forward between polls to widen a span,
  * and `delayMs` makes a poll slow enough to outlast the feed's own throttle —
  * without it a local stub answers in under a millisecond and the throttle can
  * never be observed expiring.
  */
-function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0) {
+function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?: StubTx) {
   const from = '0x' + 'cd'.repeat(20);
   const to = '0x' + 'ef'.repeat(20);
-  /** Submits the transfer on the payer's behalf: `tx.from != transfer.from`. */
+  /**
+   * Submits the transfer on the payer's behalf, which is what a facilitator does
+   * for an EIP-3009 authorization. The venue no longer depends on noticing that:
+   * it is read off the transaction's destination and calldata, so the default
+   * body below is addressed to the USDC contract itself and carries
+   * `transferWithAuthorization`. `relayer` stays in the body because a real one
+   * has it, and because a stub that quietly dropped the field the old heuristic
+   * needed would not prove the new one is independent of it.
+   */
   const relayer = '0x' + 'ab'.repeat(20);
+  /** transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32) */
+  const X402_INPUT = '0xe3ee160e' + '00'.repeat(32);
   const topic = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
   /**
    * Keyed by the block that carries it, so `eth_getLogs` and
    * `eth_getBlockByNumber` agree on which hash belongs to which block and a
-   * sender lookup can actually hit.
+   * venue lookup can actually hit.
    */
   const txHash = (n: number) => `0x${(n * 100).toString(16).padStart(64, '0')}`;
   const calls = { heads: 0, blocks: 0 };
@@ -1292,7 +1311,15 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0) {
       result = `0x${currentHead.toString(16)}`;
     } else if (call.method === 'eth_getBlockByNumber') {
       const n = parseInt(call.params?.[0] as string, 16);
-      result = { number: call.params?.[0], transactions: [{ hash: txHash(n), from: relayer }] };
+      result = {
+        number: call.params?.[0],
+        transactions: [{
+          hash: txHash(n),
+          from: relayer,
+          to: tx && 'to' in tx ? tx.to : ARC_USDC,
+          input: tx?.input ?? X402_INPUT,
+        }],
+      };
     } else if (call.method === 'eth_getLogs') {
       const p = (call.params?.[0] ?? {}) as Record<string, string>;
       const start = parseInt(p.fromBlock, 16);
@@ -1628,7 +1655,7 @@ test('a stored block too far behind re-backfills instead of reporting the gap as
     assert.equal(
       calls.blocks - blocksBefore,
       0,
-      'a gap that wide is history rather than a live span, so no senders are fetched and no x402 is claimed for transfers nobody resolved',
+      'a gap that wide is history rather than a live span, so no transaction bodies are fetched and no rail is claimed for transfers nobody resolved',
     );
     const flows = feed.observePayload().flows;
     assert.ok(flows.length > 0, 'the backfill still landed its flows');
@@ -1640,4 +1667,164 @@ test('a stored block too far behind re-backfills instead of reporting the gap as
   } finally {
     rpc.close();
   }
+});
+
+/* ---------- which rail a transfer actually travelled on ---------- */
+
+// Venues below are written out rather than imported from the registry: a test
+// that reads the same table the code reads can only ever agree with itself.
+// Each address and selector was read off Arc mainnet or confirmed against the
+// 4byte directory on 2026-09-22 — what cannot be tested is whether that reading
+// was right, only that the classification follows from it.
+const ROUTER = '0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1';      // Uniswap Universal Router
+const ENTRYPOINT = '0x0000000071727de22e5e9d8baf0edac6f37da032';   // ERC-4337 EntryPoint v0.7
+const UNCATALOGUED = '0x' + '77'.repeat(20);
+const SEL_ROUTER_EXECUTE = '0x3593564c';
+const SEL_EXACT_INPUT_SINGLE = '0x04e45aaf';
+const SEL_TRANSFER = '0xa9059cbb';
+const SEL_APPROVE = '0x095ea7b3';
+const SEL_MULTICALL = '0x5ae401dc';
+const pad = (sel: string) => sel + '00'.repeat(32);
+
+/**
+ * One live poll against a stub serving `tx` as every transaction body, handed
+ * back as the feed's /observe snapshot.
+ *
+ * The feed is seeded rather than started cold on purpose: a cold feed's first
+ * poll is a backfill, which reads no transaction bodies at all and so resolves
+ * no venues, leaving these tests nothing to assert about. Four blocks behind
+ * the head is well inside MAX_LIVE_SPAN, so the poll this triggers is a live
+ * one and every flow it lands is resolved.
+ */
+async function pollLive(tx?: StubTx) {
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 8192;
+  const { server: rpc } = chainRpcStub(HEAD, 2, 0, tx);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+  try {
+    feed.importState(feedStateAt(HEAD - 4));
+    await feed.settle();
+    return feed.observePayload();
+  } finally {
+    rpc.close();
+  }
+}
+
+test('a DEX swap is not a machine payment, however it was submitted', async () => {
+  // The whole reason the venue model exists. The stub's block body still
+  // carries `from: relayer` while the Transfer log's payer is somebody else, so
+  // the condition the old heuristic tested — submitter differs from payer —
+  // holds for every flow in this window. It used to report all of them as x402,
+  // which on mainnet measured two thirds of all USDC flow as machine payments
+  // when 129 of 134 sampled ones had a contract on the paying side.
+  const obs = await pollLive({ to: ROUTER, input: pad(SEL_ROUTER_EXECUTE) });
+  assert.ok(obs.flows.length > 0, 'the poll landed flows to classify');
+  assert.equal(obs.stats.x402Count, 0, 'a swap moves USDC out of a pool; the pool is not a payer and the router is not a facilitator');
+  assert.equal(obs.stats.x402Share, 0);
+  assert.ok(obs.flows.every((f) => f.venue === 'swap' && f.x402 === false), 'every flow is on the swap rail and none is flagged x402');
+  const swap = obs.venues.find((v) => v.kind === 'swap');
+  assert.equal(swap?.count, obs.stats.resolved, 'the swap tally accounts for everything the poll read');
+  assert.equal(obs.venueCoverage.unattributed, 0, 'a live poll resolves every flow it lands, so nothing is left unattributed');
+});
+
+test('an EIP-3009 authorization is the only thing counted, and the share names its denominator', async () => {
+  const obs = await pollLive();   // the stub's default body is transferWithAuthorization against the token
+  assert.ok(obs.stats.x402Count > 0, 'a real authorization settles on the x402 rail');
+  assert.ok(obs.stats.resolved > 0);
+  assert.equal(obs.stats.x402Count, obs.stats.resolved, 'everything read in this window was an authorization, so the share is the whole of it');
+  assert.equal(obs.stats.x402Share, 1);
+  assert.equal(obs.venueRows[0]?.kind, 'x402');
+});
+
+test('a plain transfer to the token is direct, not x402', async () => {
+  // Same destination as an authorization — the token itself — so only the
+  // method can tell them apart. This is the pair the address alone cannot
+  // separate, and the reason `direct` exists as its own rail.
+  const obs = await pollLive({ to: ARC_USDC, input: pad(SEL_TRANSFER) });
+  assert.equal(obs.stats.x402Count, 0, 'moving USDC is not the same as authorizing a machine payment');
+  const direct = obs.venues.find((v) => v.kind === 'direct');
+  assert.ok(direct && direct.count > 0, 'it lands on the direct rail instead');
+  assert.equal(obs.venues.find((v) => v.kind === 'x402')?.count, 0);
+});
+
+test('an uncatalogued router is recognised by its calldata and named by its address', async () => {
+  const obs = await pollLive({ to: UNCATALOGUED, input: pad(SEL_EXACT_INPUT_SINGLE) });
+  const row = obs.venueRows[0];
+  assert.equal(row?.kind, 'swap', 'a swap selector on an unknown contract is still a swap');
+  assert.equal(row?.label, UNCATALOGUED, 'an unnamed venue stays an address — inventing a name for it is how a guess starts looking like an observation');
+});
+
+test('a transfer emitted by a contract creation has no venue to point at', async () => {
+  const obs = await pollLive({ to: null });
+  assert.equal(obs.stats.x402Count, 0);
+  assert.ok(obs.venues.find((v) => v.kind === 'unknown')!.count > 0, 'a creation transaction is unknown');
+  assert.equal(obs.venues.find((v) => v.kind === 'contract')!.count, 0, 'unknown is a claim about the transaction, not a bucket for everything unclassified');
+  assert.equal(obs.venueCoverage.unattributed, 0, 'and it is not unattributed either: the body was read, it simply had no destination');
+  // The row's label, not just its kind: with no address to fall back on, the
+  // labelling path has nothing to key off and once named this row a direct USDC
+  // transfer — a specific claim about a transaction whose destination was never
+  // there to read.
+  const { CREATION_LABEL } = await import('../src/venue.js');
+  assert.equal(obs.venueRows[0]?.kind, 'unknown');
+  assert.equal(obs.venueRows[0]?.label, CREATION_LABEL, 'an unknown rail is labelled as unknown rather than borrowing the token label');
+  assert.equal(obs.venueRows[0]?.address, null);
+});
+
+test('a backfilled window reports no x402 share rather than a share of zero', async () => {
+  // A cold feed backfills, and a backfill reads no transaction bodies. Before
+  // the resolved count existed, that window still went into the denominator, so
+  // the headline share fell by however much history was on screen — with a real
+  // x402 share near one percent, a half-resolved window reads as half a percent
+  // and looks like a collapse rather than a gap in coverage.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 8192;
+  const { server: rpc } = chainRpcStub(HEAD, 2);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 32 });
+  try {
+    await feed.settle();   // cold: this is the backfill
+    const obs = feed.observePayload();
+    assert.ok(obs.stats.transfers > 0, 'the backfill landed real transfers');
+    assert.equal(obs.stats.resolved, 0, 'and read none of their transactions');
+    assert.equal(obs.stats.x402Share, 0);
+    assert.equal(obs.venueCoverage.attributed, 0);
+    assert.equal(obs.venueCoverage.windowFlows, obs.venueCoverage.unattributed, 'every flow in the window is unattributed rather than spread across the rails');
+    for (const v of obs.venues) {
+      assert.equal(v.count, 0, `no rail may claim a flow nobody resolved (got ${v.count} on ${v.kind})`);
+      assert.equal(v.volume, 0);
+    }
+    assert.ok(obs.pulse.length > 0, 'the pulse series was still rebuilt from history');
+    for (const p of obs.pulse) {
+      assert.equal(p.resolved, 0, `a backfilled bucket carries a count of ${p.count} and no resolved transfers, which is what lets the chart draw it as unknown`);
+    }
+    assert.ok(obs.flows.every((f) => f.venue === null && f.x402 === null), 'and the flows themselves say unknown, not false');
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the rail is decided by the contract and the method, and never by a guess', async () => {
+  const { classifyVenue, X402_LABEL, DIRECT_LABEL } = await import('../src/venue.js');
+  // A catalogued address outranks the shape of its calldata: knowing which
+  // contract this is beats recognising a selector several routers share.
+  assert.equal(classifyVenue(ARC_USDC, ENTRYPOINT, SEL_EXACT_INPUT_SINGLE).kind, 'aa');
+  // `multicall` is a wrapper whose real action sits in calldata nobody decodes,
+  // so reading it as a swap would be an inference dressed as an observation.
+  assert.equal(classifyVenue(ARC_USDC, UNCATALOGUED, SEL_MULTICALL).kind, 'contract');
+  // Either party may submit an authorization, so both spellings settle one.
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC, '0xe3ee160e').kind, 'x402');
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC, '0xef55bec6').kind, 'x402');
+  // Approving the token is not paying with it: 57 of the 87 direct USDC calls
+  // sampled on mainnet were approvals.
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC, SEL_APPROVE).kind, 'direct');
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC, SEL_APPROVE).label, DIRECT_LABEL);
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC, '0xe3ee160e').label, X402_LABEL);
+  // No destination at all cannot be a venue.
+  assert.equal(classifyVenue(ARC_USDC, null, '0xe3ee160e').kind, 'unknown');
+  // Address case and a missing selector must not change the answer.
+  assert.equal(classifyVenue(ARC_USDC, ROUTER.toUpperCase(), undefined).kind, 'swap');
+  assert.equal(classifyVenue(ARC_USDC, ARC_USDC.toUpperCase(), '0xE3EE160E').kind, 'x402');
 });

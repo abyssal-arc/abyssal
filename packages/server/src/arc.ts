@@ -17,12 +17,22 @@
  *  - Market temperature (`market()`): the same percentile trick applied to
  *    the size of the volume swing between polls, i.e. how unusual the current
  *    turbulence is relative to recent turbulence.
- *  - x402 heuristic: EIP-3009 authorized transfers are submitted by a
- *    facilitator/relayer, so `tx.from != transfer.from` marks a relayed
- *    (x402-style, gasless-for-payer) settlement. Resolving it needs the full
- *    block, so it is attempted only on live ranges and only back to
- *    `MAX_SENDER_BLOCKS`. A flow carrying `x402: null` means unknown — not
+ *  - Venue: which rail each movement travelled on, classified from the
+ *    contract the transaction called and the method it called (see venue.ts).
+ *    x402 is one venue among them — a call to the USDC token itself carrying
+ *    EIP-3009 `transferWithAuthorization` — and the rest are swaps, ERC-4337
+ *    bundles, plain transfers and uncatalogued contracts. Resolving the rail
+ *    needs the full block, so it is attempted only on live ranges and only back
+ *    to `MAX_VENUE_BLOCKS`. A flow carrying `venue: null` means unknown — not
  *    resolved — which is what backfill and an over-long catch-up produce.
+ *
+ *    This replaced a heuristic that read `tx.from != transfer.from` as x402.
+ *    That condition is true of every internal leg of every DEX swap, so it
+ *    reported a machine-payment share of roughly 85% on a chain whose USDC
+ *    flow is overwhelmingly swap routing; the real EIP-3009 share measured
+ *    about one percent of transactions. `UsdcFlow.x402` survives as a derived
+ *    convenience (`venue === 'x402'`) so the pulse series, the stats window and
+ *    the client's gold/cyan styling all keep working and simply become true.
  *
  * Polling is time-gated (default every 2s ≈ 4 blocks) and de-duplicated via
  * an in-flight promise, so being sampled twice per tick (chain + market
@@ -33,6 +43,14 @@
 import { Rng } from '@abyssal/sim';
 import type { ChainFeed, ChainSample, ChainTx, FeedState, MeterState } from './chain.js';
 import type { MarketSample } from './market.js';
+import {
+  classifyVenue,
+  emptyTally,
+  labelVenue,
+  VENUE_KINDS,
+  type VenueKind,
+  type VenueTally,
+} from './venue.js';
 
 export const ARC_CHAIN_ID = 5042;
 /** Native USDC on Arc mainnet. */
@@ -52,18 +70,22 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 const BLOCK_MS = 500;
 const LOG_CHUNK_BLOCKS = 400;
 /**
- * Blocks per batch when resolving tx senders for x402 detection. Keeps the
- * per-request concurrency the old 24-block gate allowed, and pays for a wider
- * span in round-trips rather than in simultaneous connections.
+ * Blocks per batch when resolving transaction venues. Keeps the per-request
+ * concurrency the old 24-block gate allowed, and pays for a wider span in
+ * round-trips rather than in simultaneous connections.
  */
-const SENDERS_BATCH = 24;
+const VENUE_BATCH = 24;
 /**
- * How far back one poll resolves senders. A minute of Arc is ~120 blocks, so
+ * How far back one poll resolves venues. A minute of Arc is ~120 blocks, so
  * this covers a poll that is recovering from a stall with room to spare; past
  * it the feed is replaying history nobody will inspect, and reporting those
- * flows as unknown beats spending ten serial batches on them.
+ * flows as unattributed beats spending ten serial batches on them.
+ *
+ * The venue costs no extra RPC: it is read off the same full-block bodies the
+ * relayer heuristic used to fetch, whose `to` and calldata were discarded after
+ * the submitter was taken from them.
  */
-const MAX_SENDER_BLOCKS = 240;
+const MAX_VENUE_BLOCKS = 240;
 /**
  * Widest span a poll may treat as live rather than as history. A cron-spaced
  * poll is ~120 blocks, so this leaves room for a couple of late or missed beats
@@ -71,8 +93,8 @@ const MAX_SENDER_BLOCKS = 240;
  * move: a live poll stamps every log it reads with `now`, so resuming across a
  * long gap that way folds an hour of transfers into a single 15s pulse bucket
  * and into /observe's five-minute window, reporting a spike that never
- * happened. Backfill gives them their real per-block timestamps and marks x402
- * unknown, which is what a gap that wide actually is.
+ * happened. Backfill gives them their real per-block timestamps and leaves
+ * their venue unresolved, which is what a gap that wide actually is.
  */
 const MAX_LIVE_SPAN = 300;
 /**
@@ -96,7 +118,24 @@ export interface UsdcFlow {
   to: string;
   /** Whole USDC (float). */
   amount: number;
-  /** true = relayed settlement (x402-style), false = plain transfer, null = unknown (backfill). */
+  /**
+   * Which rail this movement travelled on; null when the transaction body was
+   * never resolved (backfill, or a failed block batch), which is a different
+   * claim from any venue.
+   */
+  venue: VenueKind | null;
+  /**
+   * The contract the transaction called — the venue's identity for the
+   * leaderboard. Null exactly when `venue` is. Equal to the USDC address for
+   * `x402` and `direct`, where the token itself is the venue.
+   */
+  venueAddr: string | null;
+  /**
+   * Derived, never observed on its own: `venue === 'x402'`, or null when the
+   * venue is. Kept because the pulse series, the stats window, the sim's meteor
+   * provenance and the client's gold styling all predate the venue model and
+   * all mean this by it.
+   */
   x402: boolean | null;
 }
 
@@ -105,6 +144,19 @@ interface PulseSample {
   count: number;
   volume: number;
   x402: number;
+  /**
+   * How many of `count` had their transaction body read, and so carry a venue
+   * at all. Kept separately because the two are not interchangeable
+   * denominators: `x402 / count` reads as "no transfer in this bucket was a
+   * machine payment", which for an unresolved bucket is a claim the feed never
+   * made. Resolving a venue needs the full block, which a backfill deliberately
+   * skips, so every bucket rebuilt from history arrives with `resolved: 0` and
+   * its share is unknown rather than zero. With a real x402 share near one
+   * percent, an unresolved stretch of window does not merely blur the number —
+   * it roughly halves it, since the numerator stays put while the denominator
+   * grows.
+   */
+  resolved: number;
 }
 
 function clamp01(v: number): number {
@@ -280,9 +332,20 @@ interface RpcLog {
   transactionHash: string;
 }
 
+/**
+ * The slice of a full-block transaction we read. `input` is truncated to its
+ * first four bytes at the point of use — a swap's calldata runs to kilobytes and
+ * keeping it per transaction across a 240-block span would cost more memory
+ * than the flow ring it annotates.
+ *
+ * There is deliberately no `from`: the submitter was only ever read to compare
+ * it against the Transfer log's payer, and that comparison is the heuristic the
+ * venue model replaced.
+ */
 interface RpcBlockTx {
   hash?: string;
-  from?: string;
+  to?: string | null;
+  input?: string;
 }
 
 export interface ArcFeedOptions {
@@ -375,8 +438,8 @@ export class ArcUsdcFeed implements ChainFeed {
   /**
    * Carry-over for a runtime whose object does not outlive its invocation.
    * `lastBlock` is the part that matters most: without it every cold boot is a
-   * 3600-block backfill, and a backfill resolves no senders (so every flow it
-   * produces is `x402: null`), rebuilds the pulse history wholesale, and pushes
+   * 3600-block backfill, and a backfill resolves no venues (so every flow it
+   * produces is unattributed), rebuilds the pulse history wholesale, and pushes
    * thousands of flows through the ring — enough on a busy chain to evict the
    * live readings a viewer actually came for, every single minute. The meters
    * ride along so the temperatures resume as ranks against their own history
@@ -444,29 +507,30 @@ export class ArcUsdcFeed implements ChainFeed {
    * dense buckets (every slot in the window, empty ones zeroed) so the chart
    * draws a continuous timeline instead of skipping quiet minutes.
    */
-  historyPulse(rangeMs: number, bucketMs: number): { t: number; volume: number; count: number; x402Volume: number }[] {
+  historyPulse(rangeMs: number, bucketMs: number): { t: number; volume: number; count: number; x402Volume: number; resolvedVolume: number }[] {
     const now = Date.now();
     // Anchor the right edge to a bucket boundary so refreshes don't jitter
     // the chart's rightmost column.
     const endBucket = Math.floor(now / bucketMs) * bucketMs;
     const startBucket = endBucket - rangeMs + bucketMs;
     const slots = Math.max(1, Math.round(rangeMs / bucketMs));
-    const out: { t: number; volume: number; count: number; x402Volume: number }[] = [];
+    const out: { t: number; volume: number; count: number; x402Volume: number; resolvedVolume: number }[] = [];
     for (let i = 0; i < slots; i++) {
-      out.push({ t: startBucket + i * bucketMs, volume: 0, count: 0, x402Volume: 0 });
+      out.push({ t: startBucket + i * bucketMs, volume: 0, count: 0, x402Volume: 0, resolvedVolume: 0 });
     }
     // The flows ring carries per-transfer x402 flags but is capped far short
     // of 24h, so x402Volume falls back to a count-weighted estimate from the
     // pulse buckets when the flow is too old. Good enough for a gold-cap
     // overlay; the precise number lives in the live /observe stream.
-    const flowByBucket = new Map<number, { vol: number; x402Vol: number }>();
+    const flowByBucket = new Map<number, { vol: number; x402Vol: number; resVol: number }>();
     for (const f of this.flows) {
       if (f.t < startBucket) continue;
       const key = Math.floor(f.t / bucketMs) * bucketMs;
       let e = flowByBucket.get(key);
-      if (!e) { e = { vol: 0, x402Vol: 0 }; flowByBucket.set(key, e); }
+      if (!e) { e = { vol: 0, x402Vol: 0, resVol: 0 }; flowByBucket.set(key, e); }
       e.vol += f.amount;
       if (f.x402) e.x402Vol += f.amount;
+      if (f.venue) e.resVol += f.amount;
     }
     for (const p of this.pulse) {
       if (p.t < startBucket) continue;
@@ -479,12 +543,27 @@ export class ArcUsdcFeed implements ChainFeed {
       if (fb && fb.vol > 0) {
         // Prorate this 15s pulse's x402 share against the bucket's flow volume.
         b.x402Volume += p.count > 0 ? (p.volume * (fb.x402Vol / fb.vol)) : 0;
+        b.resolvedVolume += p.volume * (fb.resVol / fb.vol);
       } else if (p.count > 0) {
         b.x402Volume += p.volume * (p.x402 / p.count);
+        // Proportional rather than exact: past the ring's reach all that is
+        // left of a bucket is its counts, so the resolved share of its volume
+        // is estimated the same way its x402 share already was.
+        b.resolvedVolume += p.volume * (p.resolved / p.count);
       }
     }
     const r2 = (n: number) => Math.round(n * 100) / 100;
-    return out.map((b) => ({ t: b.t, volume: r2(b.volume), count: b.count, x402Volume: r2(b.x402Volume) }));
+    // `resolvedVolume` travels with `x402Volume` because the second is only
+    // meaningful against the first: a bucket rebuilt by a backfill carries real
+    // volume and no venues at all, and a chart dividing by `volume` there draws
+    // a flat zero over history nobody inspected.
+    return out.map((b) => ({
+      t: b.t,
+      volume: r2(b.volume),
+      count: b.count,
+      x402Volume: r2(b.x402Volume),
+      resolvedVolume: r2(b.resolvedVolume),
+    }));
   }
 
   /** Snapshot for the GET /observe endpoint. */
@@ -496,15 +575,32 @@ export class ArcUsdcFeed implements ChainFeed {
     let x402Count = 0;
     let volume = 0;
     let transfers = 0;
+    let resolved = 0;
     for (const p of this.pulse) {
       if (p.t < cutoff) continue;
       transfers += p.count;
       volume += p.volume;
       x402Count += p.x402;
+      resolved += p.resolved;
     }
     const byTo = new Map<string, { address: string; volume: number; count: number; x402: number }>();
+    // Venues aggregate from the flow ring rather than from the pulse buckets,
+    // the same way `endpoints` below does: a pulse bucket carries one x402 count
+    // and no room for a per-rail breakdown, and a venue table is a ranking over
+    // the window rather than a time series. The ring holds 6000 flows against a
+    // ~2100-flow window at current Arc traffic, so the window is fully covered;
+    // a busier chain that saturates it is why `venueCoverage` reports the ring's
+    // own window total next to the split, so a viewer can see these numbers are
+    // counted over flows rather than over pulse buckets and are not expected to
+    // equal `transfers` above.
+    const venueTally = emptyTally();
+    const venueVolume: VenueTally = emptyTally();
+    const byVenue = new Map<string, { kind: VenueKind; address: string | null; volume: number; count: number }>();
+    let windowFlows = 0;
+    let attributed = 0;
     for (const f of this.flows) {
       if (f.t < cutoff) continue;
+      windowFlows++;
       let e = byTo.get(f.to);
       if (!e) {
         e = { address: f.to, volume: 0, count: 0, x402: 0 };
@@ -513,11 +609,40 @@ export class ArcUsdcFeed implements ChainFeed {
       e.volume += f.amount;
       e.count++;
       if (f.x402) e.x402++;
+      // A flow with no venue is left out of the tally rather than folded into
+      // `unknown`: `unknown` means a contract creation, which is a claim about
+      // the transaction, whereas a null venue means we never resolved it. The
+      // difference is exactly what `unattributed` below reports.
+      if (!f.venue) continue;
+      attributed++;
+      venueTally[f.venue]++;
+      venueVolume[f.venue] += f.amount;
+      const key = `${f.venue}:${f.venueAddr ?? ''}`;
+      let v = byVenue.get(key);
+      if (!v) {
+        v = { kind: f.venue, address: f.venueAddr, volume: 0, count: 0 };
+        byVenue.set(key, v);
+      }
+      v.volume += f.amount;
+      v.count++;
     }
     const endpoints = [...byTo.values()]
       .sort((a, b) => b.volume - a.volume)
       .slice(0, 10)
       .map((e) => ({ ...e, volume: Math.round(e.volume * 100) / 100 }));
+    // The rails themselves, busiest first. `x402` and `direct` share an address
+    // (the token) and so are keyed by kind as well; everything else is one row
+    // per contract, labelled from the registry when it is in there.
+    const venueRows = [...byVenue.values()]
+      .sort((a, b) => b.volume - a.volume)
+      .slice(0, 12)
+      .map((v) => ({
+        kind: v.kind,
+        label: labelVenue(this.usdc, v.kind, v.address),
+        address: v.address,
+        count: v.count,
+        volume: Math.round(v.volume * 100) / 100,
+      }));
     // Downsample the pulse series to at most ~420 points.
     const step = Math.max(1, Math.ceil(this.pulse.length / 420));
     const pulse = this.pulse.filter((_, i) => i % step === 0).map((p) => ({
@@ -525,6 +650,7 @@ export class ArcUsdcFeed implements ChainFeed {
       count: p.count,
       volume: Math.round(p.volume * 100) / 100,
       x402: p.x402,
+      resolved: p.resolved,
     }));
     const windowSeconds = Math.round(STATS_WINDOW_MS / 1000);
     return {
@@ -537,9 +663,24 @@ export class ArcUsdcFeed implements ChainFeed {
         transfers,
         volume: Math.round(volume * 100) / 100,
         x402Count,
-        x402Share: transfers > 0 ? Math.round((x402Count / transfers) * 1000) / 1000 : 0,
+        // Against the transfers whose rail was actually read, not against all of
+        // them. Both numbers are exposed because they answer different
+        // questions: `transfers` is how busy the chain was, `resolved` is how
+        // much of that this feed can speak to, and a share computed over the
+        // first would silently understate the second by however much history
+        // sits in the window. Zero when nothing was resolved, which the client
+        // renders as unknown rather than as 0%.
+        resolved,
+        x402Share: resolved > 0 ? Math.round((x402Count / resolved) * 1000) / 1000 : 0,
       },
       endpoints,
+      venues: VENUE_KINDS.map((k) => ({
+        kind: k,
+        count: venueTally[k],
+        volume: Math.round(venueVolume[k] * 100) / 100,
+      })),
+      venueRows,
+      venueCoverage: { windowFlows, attributed, unattributed: windowFlows - attributed },
       pulse,
       flows: this.flows.slice(-160).map((f) => ({
         t: f.t,
@@ -548,6 +689,7 @@ export class ArcUsdcFeed implements ChainFeed {
         from: f.from,
         to: f.to,
         amount: Math.round(f.amount * 100) / 100,
+        venue: f.venue,
         x402: f.x402,
       })),
     };
@@ -672,34 +814,42 @@ export class ArcUsdcFeed implements ChainFeed {
         return;
       }
 
-      // Relayer detection needs each tx's submitter, which only a full block
-      // carries. This used to be skipped unless the poll spanned 24 blocks or
-      // fewer — a ceiling sized for a 250ms tick loop, where a poll is four
+      // The venue needs each tx's destination and calldata, which only a full
+      // block carries. This used to be skipped unless the poll spanned 24 blocks
+      // or fewer — a ceiling sized for a 250ms tick loop, where a poll is four
       // blocks. On a runtime that polls once a minute the span is ~120 blocks
       // (Arc produces one every 500ms), so the gate never opened and every flow
-      // came back `x402: null`: an observatory that bills itself as x402
-      // reported a machine-payment share of exactly zero, permanently, and only
-      // ever showed a real one while a viewer happened to be polling fast enough
-      // to squeeze under the gate. Batch the queries instead, which keeps the
+      // came back unresolved: an observatory that bills itself as x402 reported
+      // a machine-payment share of exactly zero, permanently, and only ever
+      // showed a real one while a viewer happened to be polling fast enough to
+      // squeeze under the gate. Batch the queries instead, which keeps the
       // concurrency that ceiling was protecting.
-      const txSenders = new Map<string, string>();
+      const txVenue = new Map<string, { kind: VenueKind; addr: string | null }>();
       if (!isBackfill) {
-        const senderFrom = Math.max(from, latest - MAX_SENDER_BLOCKS + 1);
-        for (let start = senderFrom; start <= latest; start += SENDERS_BATCH) {
+        const venueFrom = Math.max(from, latest - MAX_VENUE_BLOCKS + 1);
+        for (let start = venueFrom; start <= latest; start += VENUE_BATCH) {
           const numbers: number[] = [];
-          for (let n = start; n <= Math.min(start + SENDERS_BATCH - 1, latest); n++) numbers.push(n);
+          for (let n = start; n <= Math.min(start + VENUE_BATCH - 1, latest); n++) numbers.push(n);
           try {
             const blocks = (await Promise.all(
               numbers.map((n) => this.rpc('eth_getBlockByNumber', [hex(n), true])),
             )) as { transactions?: RpcBlockTx[] }[];
             for (const b of blocks) {
               for (const t of b?.transactions ?? []) {
-                if (t?.hash && t?.from) txSenders.set(t.hash.toLowerCase(), t.from.toLowerCase());
+                if (!t?.hash) continue;
+                // The destination is null for a contract creation, and the
+                // calldata may be absent or shorter than a selector; both are
+                // passed through as-is because classifyVenue treats a missing
+                // input as "no method recognized", not as "no transaction".
+                const to = t.to ? t.to.toLowerCase() : null;
+                const sel = typeof t.input === 'string' ? t.input.slice(0, 10).toLowerCase() : null;
+                const info = classifyVenue(this.usdc, to, sel);
+                txVenue.set(t.hash.toLowerCase(), { kind: info.kind, addr: to });
               }
             }
           } catch {
-            // Senders are an enrichment, not the reading. A failed batch leaves
-            // those flows `x402: null` — unknown, exactly as backfill does —
+            // The venue is an enrichment, not the reading. A failed batch leaves
+            // those flows `venue: null` — unknown, exactly as backfill does —
             // where letting it throw would discard the temperatures and the
             // whole interval of flow with them. Batching makes a failure more
             // likely, not less: five chances instead of one.
@@ -736,6 +886,7 @@ export class ArcUsdcFeed implements ChainFeed {
       let count = 0;
       let volume = 0;
       let x402Count = 0;
+      let resolvedCount = 0;
       for (const log of logs) {
         if (!Array.isArray(log.topics) || log.topics.length < 3) continue;
         const amount = amountOf(log.data);
@@ -743,13 +894,21 @@ export class ArcUsdcFeed implements ChainFeed {
         const fromAddr = `0x${log.topics[1].slice(26).toLowerCase()}`;
         const toAddr = `0x${log.topics[2].slice(26).toLowerCase()}`;
         const block = parseInt(log.blockNumber, 16);
-        const sender = txSenders.get(String(log.transactionHash).toLowerCase());
-        const x402 = sender ? sender !== fromAddr : null;
+        const venue = txVenue.get(String(log.transactionHash).toLowerCase());
+        const kind = venue ? venue.kind : null;
+        const x402 = kind === null ? null : kind === 'x402';
         const t = isBackfill ? now - (latest - block) * BLOCK_MS : now;
-        this.flows.push({ t, block, tx: log.transactionHash, from: fromAddr, to: toAddr, amount, x402 });
+        this.flows.push({
+          t, block, tx: log.transactionHash, from: fromAddr, to: toAddr, amount,
+          venue: kind, venueAddr: venue ? venue.addr : null, x402,
+        });
         count++;
         volume += amount;
         if (x402) x402Count++;
+        // Counted off the venue rather than off `!isBackfill`: a live poll wider
+        // than MAX_VENUE_BLOCKS resolves only its newest stretch, and the rest of
+        // it is as unknown as any backfilled flow.
+        if (kind) resolvedCount++;
         if (!isBackfill && this.pendingTxs.length < this.maxPending) {
           this.pendingTxs.push({
             hash: log.transactionHash,
@@ -769,12 +928,13 @@ export class ArcUsdcFeed implements ChainFeed {
           const key = Math.floor(f.t / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
           let b = buckets.get(key);
           if (!b) {
-            b = { t: key, count: 0, volume: 0, x402: 0 };
+            b = { t: key, count: 0, volume: 0, x402: 0, resolved: 0 };
             buckets.set(key, b);
           }
           b.count++;
           b.volume += f.amount;
           if (f.x402) b.x402++;
+          if (f.venue) b.resolved++;
         }
         this.pulse = [...buckets.keys()]
           .sort((a, b) => a - b)
@@ -806,8 +966,9 @@ export class ArcUsdcFeed implements ChainFeed {
         lastBucket.count += count;
         lastBucket.volume += volume;
         lastBucket.x402 += x402Count;
+        lastBucket.resolved += resolvedCount;
       } else {
-        this.pulse.push({ t: bucketKey, count, volume, x402: x402Count });
+        this.pulse.push({ t: bucketKey, count, volume, x402: x402Count, resolved: resolvedCount });
       }
       if (this.pulse.length > this.maxPulse) this.pulse.splice(0, this.pulse.length - this.maxPulse);
 

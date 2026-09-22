@@ -174,9 +174,9 @@ export interface LedgerSnapshot {
    * themselves against. Absent when the feed has nothing worth resuming — the
    * offline one is a sinusoid and a PRNG. Without it a cold object rebuilds the
    * feed from `lastBlock = -1` on every eviction, which means a 3600-block
-   * backfill a minute: no senders resolved, so no x402 signal; a pulse history
-   * rebuilt from scratch each time; and enough backfilled flows through the ring
-   * to push out the live ones a viewer asked for.
+   * backfill a minute: no venues resolved, so every flow is unattributed; a
+   * pulse history rebuilt from scratch each time; and enough backfilled flows
+   * through the ring to push out the live ones a viewer asked for.
    */
   feedState?: FeedState;
 }
@@ -1252,7 +1252,7 @@ export function createApp(options: AppOptions = {}) {
         'POST /flare': 'pin a signal flare: {addr, x, y, label, color?}; free with a day pass, else burn 1,000 ABYS',
         'DELETE /flare': 'remove one of your own flares: {addr, index}',
         'GET /export': 'day-pass download of the observation window: ?pass=<address>&kind=csv|replay|digest',
-        'GET /observe': 'Arc USDC flow observatory: stats, endpoint ranking, pulse, recent flows (available:false off-Arc)',
+        'GET /observe': 'Arc USDC flow observatory: stats, venue breakdown (which rail each transfer settled on — x402, swap, ERC-4337, direct), endpoint ranking, pulse, recent flows (available:false off-Arc)',
         'POST /intervene': 'intervention (feed/poison/bloom/drought/pass/name/wish/mutate/ark) paid by burning ABYS on Arc; the burn receipt is the payment proof; 503 until ABYS_TOKEN_ADDRESS is set',
         'POST /tick': 'debug: advance one tick manually',
         'GET /ui': 'redirects to /',
@@ -1459,10 +1459,19 @@ export function createApp(options: AppOptions = {}) {
           headers: { 'content-type': 'application/json', 'content-disposition': 'attachment; filename="abyssal-replay.json"' },
         });
       }
-      const rows = ['t,volume,count,x402'];
-      for (const p of obs?.pulse ?? []) rows.push(`${p.t},${p.volume},${p.count},${p.x402}`);
-      rows.push('t,from,to,amount,x402');
-      for (const f of obs?.flows ?? []) rows.push(`${f.t},${f.from},${f.to},${f.amount},${f.x402 === true ? 1 : 0}`);
+      // `resolved` is exported alongside `x402` because the pair is what makes
+      // the column readable: a row reading `x402=0, resolved=0` is a row the
+      // feed never looked at, and one reading `x402=0, resolved=41` is a row it
+      // looked at and found nothing in. Dropping the second would make those
+      // indistinguishable to anyone analysing the file.
+      const rows = ['t,volume,count,x402,resolved'];
+      for (const p of obs?.pulse ?? []) rows.push(`${p.t},${p.volume},${p.count},${p.x402},${p.resolved}`);
+      rows.push('t,from,to,amount,venue,x402');
+      for (const f of obs?.flows ?? []) {
+        // Empty rather than 0 for an unresolved flow: a blank cell says the rail
+        // was never read, while a 0 would claim it was read and was not x402.
+        rows.push(`${f.t},${f.from},${f.to},${f.amount},${f.venue ?? ''},${f.x402 === null ? '' : f.x402 ? 1 : 0}`);
+      }
       return new Response(rows.join('\n'), {
         headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="abyssal-window.csv"' },
       });
