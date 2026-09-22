@@ -5,17 +5,19 @@ export {
   OUTPUT_SIZE,
   ARCHETYPES,
   ARCHETYPE_LIST,
+  GENE_TRAITS,
   archetypeOf,
   creatureName,
   randomGenome,
   cloneGenome,
   mutateGenome,
+  mutateTrait,
   forward,
   genomeFingerprint,
   personaOf,
   steerArchetype,
 } from './genome.js';
-export type { Genome, BrainOutput, Archetype, ArchetypeTraits } from './genome.js';
+export type { GeneTrait, Genome, BrainOutput, Archetype, ArchetypeTraits } from './genome.js';
 export { DEFAULT_CONFIG } from './types.js';
 export type { WorldConfig } from './types.js';
 export {
@@ -28,6 +30,13 @@ export {
   toJSON,
   fromJSON,
   WHALE_BOOM_SIZE,
+  WISH_METEOR_SIZE,
+  WISH_PELLETS,
+  LEGENDARY_GENERATION,
+  LEGENDARY_KILLS,
+  isLegendary,
+  displayName,
+  findCreature,
   isHungry,
   dominantTax,
 } from './world.js';

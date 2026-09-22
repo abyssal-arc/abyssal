@@ -11,16 +11,27 @@ import {
   toJSON,
   fromJSON,
   DEFAULT_CONFIG,
+  ARCHETYPES,
   archetypeOf,
   dominantTax,
   isHungry,
   steerArchetype,
   personaOf,
   randomGenome,
+  mutateTrait,
+  GENE_TRAITS,
+  displayName,
+  isLegendary,
+  findCreature,
+  WISH_METEOR_SIZE,
+  WISH_PELLETS,
+  LEGENDARY_GENERATION,
+  LEGENDARY_KILLS,
   type Senses,
   type WorldConfig,
   type Archetype,
   type Creature,
+  type Genome,
 } from '../src/index.js';
 import { Rng } from '../src/prng.js';
 
@@ -651,7 +662,7 @@ test('predation: a whale takes one meal per hunt cooldown, not one per tick', ()
   );
 });
 
-test('money is weather: payments and tx rain never rewrite a living genome', () => {
+test('money is weather: environmental payments and tx rain never rewrite a living genome', () => {
   const w = createWorld(5);
   for (let i = 0; i < 40; i++) tick(w, { chain: 0.6, market: 0.5 }, []);
   const before = new Map(w.creatures.map((c) => [c.id, JSON.stringify(c.genome)]));
@@ -664,10 +675,12 @@ test('money is weather: payments and tx rain never rewrite a living genome', () 
   ];
   for (let i = 0; i < 30; i++) tick(w, { chain: 0.9, market: 0.9 }, i === 0 ? rain : []);
 
-  // Survivors keep exactly the genome they were born with: money may move
-  // food around and cull the weak, but it must never edit an individual.
-  // Creatures born inside the window are skipped, mutation at birth is the
-  // only place a genome is allowed to change.
+  // Survivors keep exactly the genome they were born with: weather money may
+  // move food around and cull the weak, but it never edits an individual. The
+  // paid `mutate` action does edit one, on purpose, and is pinned by its own
+  // tests below — this rule is drawn around that exception, not across it.
+  // Creatures born inside the window are skipped: a birth rolls the blind
+  // `mutateGenome`, which is the sim's own business and nobody's purchase.
   for (const c of w.creatures) {
     const b = before.get(c.id);
     if (b === undefined) continue;
@@ -923,4 +936,300 @@ test('idsInZone wraps the torus: an edge zone sees both sides', () => {
   const ids = idsInZone(world, 0, 500, 20).sort((a, b) => a - b);
   assert.deepEqual(ids, [west.id, east.id].sort((a, b) => a - b));
   assert.deepEqual(idsInZone(world, 0, 500, 0), []);
+});
+
+/* ---------- paid interventions on one creature: name / wish / mutate / ark ---------- */
+
+const PAYER = '0x' + '77'.repeat(20);
+const PAID = { payer: PAYER, paid: '100000 ABYS' };
+const RECEIPT = '0x' + 'ab'.repeat(32);
+
+/**
+ * A genome with every output drive flat, so it reads as INSIDER and any bias an
+ * edit moves is a bias the test moved. w1 stays random: the perception edit is
+ * a gain on the sensory columns and needs something there to scale.
+ */
+function flatGenome(): Genome {
+  const g = randomGenome(new Rng(4));
+  g.w2 = g.w2.map(() => 0);
+  g.b2 = g.b2.map(() => 0);
+  return g;
+}
+
+test('a paid gene edit is deterministic, changes the genome and stays inside the clamp', () => {
+  const untouched = flatGenome();
+  for (const trait of GENE_TRAITS) {
+    for (const direction of ['boost', 'suppress'] as const) {
+      const a = flatGenome();
+      const b = flatGenome();
+      mutateTrait(a, trait, direction);
+      mutateTrait(b, trait, direction);
+      assert.deepEqual(a, b, `${trait}/${direction} must edit identically on every instance or the world stops replaying`);
+      assert.notDeepEqual(a, untouched, `${trait}/${direction} that rewrote nothing was still charged for`);
+      // Perception is the one gain on the senses; the rest are drives only.
+      if (trait === 'perception') assert.notDeepEqual(a.w1, untouched.w1);
+      else assert.deepEqual(a.w1, untouched.w1, `${trait} must leave the sensory layer alone`);
+      for (const w of [...a.w1, ...a.b1, ...a.w2, ...a.b2]) {
+        assert.ok(Math.abs(w) <= 2, `${trait} pushed a weight past the ceiling`);
+      }
+    }
+  }
+  // Buying the same edit over and over saturates rather than running away.
+  const greedy = flatGenome();
+  for (let i = 0; i < 40; i++) mutateTrait(greedy, 'aggression', 'boost');
+  assert.equal(Math.max(...greedy.w2), 2);
+  assert.equal(Math.max(...greedy.b2), 2, 'a saturated edit parks on the ceiling');
+});
+
+test('the species is read off the drives, so four of the five edits can rewrite it', () => {
+  const up = flatGenome();
+  for (let i = 0; i < 6; i++) mutateTrait(up, 'size', 'boost');
+  assert.equal(archetypeOf(up), 'WHALE', 'a hungry, slow body reads as a whale');
+  const down = flatGenome();
+  for (let i = 0; i < 6; i++) mutateTrait(down, 'size', 'suppress');
+  assert.equal(archetypeOf(down), 'ALGO', 'a lean, fast body reads as an algo');
+  // aggression and fertility move those same biases harder than size does, which
+  // is exactly why the world resyncs the body after every edit and not only
+  // after the size one.
+  const brood = flatGenome();
+  mutateTrait(brood, 'fertility', 'boost');
+  assert.equal(archetypeOf(brood), 'APE', 'a single fertility edit already redrew the species');
+  const eyes = flatGenome();
+  for (let i = 0; i < 6; i++) mutateTrait(eyes, 'perception', 'boost');
+  assert.equal(archetypeOf(eyes), 'INSIDER', 'a gain on the senses leaves the drives alone');
+});
+
+test('a paid edit resyncs the body whenever it redrew the species', () => {
+  const world = createWorld(21, NO_FOOD_NO_BIRTH);
+  const base = world.config.creatureRadius;
+  const c = world.creatures[0];
+  c.genome = flatGenome();
+  c.archetype = 'INSIDER';
+  c.radius = base * ARCHETYPES.INSIDER.radiusMult * 1.5; // grown on kills
+  c.name = creatureName('INSIDER', c.id);
+  // fertility is the edit the old `trait === 'size'` guard let through unsynced.
+  applyIntervention(world, { type: 'mutate', creatureId: c.id, trait: 'fertility', direction: 'suppress' }, PAID);
+  const next = archetypeOf(c.genome);
+  assert.notEqual(next, 'INSIDER', 'the edit redrew the drives the species is read off');
+  assert.equal(c.archetype, next, 'the body follows the gene, whichever trait moved it');
+  assert.ok(
+    Math.abs(c.radius - base * ARCHETYPES[next].radiusMult * 1.5) < 1e-9,
+    'the growth it earned carries across the rewrite as a ratio',
+  );
+  assert.equal(c.name, creatureName(next, c.id), 'an unnamed creature takes the codename of the species it became');
+  const ev = world.eventLog.filter((e) => e.type === 'mutation').slice(-1)[0];
+  assert.equal(ev.trait, 'fertility');
+  assert.equal(ev.archetype, next, 'the event carries the new species so the tank can say it out loud');
+  assert.equal(ev.payer, PAYER);
+  assert.equal(ev.paid, PAID.paid);
+});
+
+test('an edit that leaves the species alone leaves the body and the paid name alone', () => {
+  const world = createWorld(24, NO_FOOD_NO_BIRTH);
+  const c = world.creatures[0];
+  c.genome = flatGenome();
+  c.archetype = 'INSIDER';
+  c.name = creatureName('INSIDER', c.id);
+  const born = c.name;
+  const before = c.radius;
+  applyIntervention(world, { type: 'name', creatureId: c.id, name: 'Tiny' }, PAID);
+  applyIntervention(world, { type: 'mutate', creatureId: c.id, trait: 'perception', direction: 'boost' }, PAID);
+  assert.equal(c.archetype, 'INSIDER');
+  assert.equal(c.radius, before, 'no respecies, so no rescale');
+  assert.equal(c.name, born, 'and no new codename either');
+  const quiet = world.eventLog.filter((e) => e.type === 'mutation').slice(-1)[0];
+  assert.equal(quiet.archetype, undefined, 'the event only names a species when one actually changed');
+  // When the body does change, the name somebody paid for is not overwritten.
+  for (let i = 0; i < 6; i++) {
+    applyIntervention(world, { type: 'mutate', creatureId: c.id, trait: 'size', direction: 'boost' }, PAID);
+  }
+  assert.equal(c.archetype, 'WHALE');
+  assert.equal(displayName(c), 'Tiny', 'a bought name outranks the species it became');
+  assert.equal(c.name, born, 'so the codename underneath stays the one it was born with');
+});
+
+test('a paid name replaces the codename everywhere and keeps it on record', () => {
+  const world = createWorld(22, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 2);
+  const c = world.creatures[0];
+  const born = c.name;
+  const res = applyIntervention(world, { type: 'name', creatureId: c.id, name: 'Moby' }, PAID);
+  assert.equal(res.affected, 1);
+  assert.equal(c.customName, 'Moby');
+  assert.equal(c.name, born, 'the birth codename stays put: lineage and records keep referring to it');
+  assert.equal(displayName(c), 'Moby');
+  const ev = world.eventLog.filter((e) => e.type === 'naming').slice(-1)[0];
+  assert.equal(ev.name, born, 'the event tells the tank what it used to be called');
+  assert.equal(ev.message, 'Moby');
+  assert.equal(ev.creatureId, c.id);
+  assert.equal(ev.payer, PAYER);
+  assert.equal(ev.paid, PAID.paid);
+  // Starve it out: the memorial is the last place a name is spoken.
+  c.energy = 0.05;
+  for (let i = 0; i < 8 && world.creatures.length > 0; i++) tick(world, { chain: 0, market: 0 });
+  const o = world.obituaries.find((x) => x.id === c.id);
+  assert.equal(o?.name, 'Moby', 'an obituary is filed under the name the tank knew');
+});
+
+test('naming a legend is a different purchase from naming a fish', () => {
+  const world = createWorld(23, NO_FOOD_NO_BIRTH);
+  const c = world.creatures[0];
+  c.generation = LEGENDARY_GENERATION - 1;
+  c.kills = LEGENDARY_KILLS - 1;
+  assert.equal(isLegendary(c), false, 'one short on both axes is still a fish');
+  c.generation = LEGENDARY_GENERATION;
+  assert.equal(isLegendary(c), true, 'old enough to be a character');
+  c.generation = 0;
+  c.kills = LEGENDARY_KILLS;
+  assert.equal(isLegendary(c), true, 'bloody enough to be a character');
+});
+
+test('a wishing meteor falls where the dice land it, and replays identically', () => {
+  const fall = (seed: number) => {
+    const world = createWorld(seed, NO_FOOD_NO_BIRTH);
+    const res = applyIntervention(world, { type: 'wish', message: 'be kind' }, { ...PAID, tx: RECEIPT });
+    return { at: res.at, hash: res.hash, pellets: world.foods.length };
+  };
+  const a = fall(31);
+  assert.deepEqual(a, fall(31), 'the same receipt must land the same wish on every instance');
+  assert.notDeepEqual(a.at, fall(32).at, 'an unaimed wish is the dice, not a fixed spot');
+  assert.equal(a.hash, RECEIPT, 'the fall is traceable to the burn that paid for it');
+  // The whole point of decoupling the yield from the streak's size: a bought
+  // wish never lands in empty water.
+  for (const seed of [31, 32, 33, 7]) {
+    assert.equal(fall(seed).pellets, WISH_PELLETS, `seed ${seed} must leave plankton behind`);
+  }
+  const world = createWorld(31, NO_FOOD_NO_BIRTH);
+  applyIntervention(world, { type: 'wish', message: 'be kind' }, { ...PAID, tx: RECEIPT });
+  assert.ok(world.foods.every((f) => f.src === RECEIPT), 'every pellet is attributable to the wish');
+  assert.ok(
+    world.foods.every((f) => Math.abs(f.energy - world.config.foodEnergy * (0.25 + WISH_METEOR_SIZE)) < 1e-9),
+    'a light fall, priced as one',
+  );
+  const ev = world.eventLog.filter((e) => e.type === 'wish').slice(-1)[0];
+  assert.equal(ev.message, 'be kind');
+  assert.equal(ev.size, WISH_METEOR_SIZE);
+  assert.equal(ev.payer, PAYER);
+});
+
+test('an aimed wishing meteor lands where it was aimed, wrapped into the torus', () => {
+  const world = createWorld(9, NO_FOOD_NO_BIRTH);
+  const res = applyIntervention(world, { type: 'wish', message: 'hi', x: 1200, y: -30 }, PAID);
+  assert.deepEqual(res.at, { x: 200, y: 970 }, 'an aim outside the tank wraps instead of being dropped');
+  assert.equal(world.foods.length, WISH_PELLETS);
+  const far = world.foods.filter(
+    (f) => Math.hypot(Math.min(Math.abs(f.x - 200), 1000 - Math.abs(f.x - 200)), Math.min(Math.abs(f.y - 970), 1000 - Math.abs(f.y - 970))) > 40,
+  );
+  assert.equal(far.length, 0, 'the plankton lands around the message, not across the map');
+});
+
+test('an ark ticket steps out of both culls, and the cull reports who it saved', () => {
+  for (const kind of ['harvest', 'judgment'] as const) {
+    const world = createWorld(41, {
+      ...NO_FOOD_NO_BIRTH,
+      harvestInterval: kind === 'harvest' ? 1 : 100_000,
+      harvestCullRatio: 0.5,
+      judgmentInterval: kind === 'judgment' ? 1 : 100_000,
+      judgmentCullRatio: 0.5,
+    });
+    world.creatures = world.creatures.slice(0, 6);
+    // No WHALE in the tank, so nothing is eaten before the scythe swings.
+    for (const c of world.creatures) c.archetype = 'ALGO';
+    world.creatures.forEach((c, i) => { c.energy = 100 + i * 10; });
+    const holder = world.creatures[0];
+    holder.energy = 30; // bottom of the cull window, nowhere near starving
+    const bought = applyIntervention(world, { type: 'ark', creatureId: holder.id }, PAID);
+    assert.equal(bought.affected, 1);
+    assert.equal(holder.arkProtected, true);
+    assert.equal(holder.arkBy, PAYER, 'the card can name its guarantor');
+    const again = applyIntervention(world, { type: 'ark', creatureId: holder.id }, PAID);
+    assert.equal(again.affected, 0, 'a second ticket on one body buys nothing');
+    tick(world, { chain: 0.5, market: 0.5 });
+    const rec = world.culls.find((r) => r.type === kind);
+    assert.ok(rec, `the ${kind} ran`);
+    assert.equal(rec.culled.length, 3, 'the quota is taken from the next ones down, not shrunk');
+    assert.ok(rec.culled.every((v) => v.id !== holder.id), 'the scythe stepped over the ticket holder');
+    assert.deepEqual(rec.saved.map((s) => s.id), [holder.id]);
+    assert.equal(rec.saved[0].name, holder.name);
+    assert.ok(world.creatures.some((c) => c.id === holder.id), 'and it is still swimming');
+    assert.ok(
+      world.obituaries.some((o) => o.id === holder.id) === false,
+      'a saved creature is not memorialized',
+    );
+    const ev = world.eventLog.filter((e) => e.type === kind).slice(-1)[0];
+    assert.deepEqual(ev.saved?.map((s) => s.id), [holder.id], 'the viewer learns who the ark saved');
+  }
+});
+
+test('an ark ticket is a lifeboat, not immortality: hunger still kills the holder', () => {
+  const world = createWorld(46, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 1);
+  const c = world.creatures[0];
+  applyIntervention(world, { type: 'ark', creatureId: c.id }, PAID);
+  c.energy = 0.05;
+  for (let i = 0; i < 5 && world.creatures.length > 0; i++) tick(world, { chain: 0, market: 0 });
+  assert.equal(world.creatures.length, 0, 'the ark only buys immunity from the tank’s own two culls');
+  assert.equal(world.obituaries[0].cause, 'starvation');
+});
+
+test('a paid name and an ark ticket are never inherited', () => {
+  const world = createWorld(166, {
+    ...DEFAULT_CONFIG,
+    ...NO_FOOD,
+    populationFloor: 0,
+    reproduceUrgeThreshold: 0,
+    reproduceThreshold: 10,
+  });
+  world.creatures = world.creatures.slice(0, 1);
+  const parent = world.creatures[0];
+  parent.archetype = 'ALGO';
+  parent.energy = 400;
+  applyIntervention(world, { type: 'ark', creatureId: parent.id }, PAID);
+  applyIntervention(world, { type: 'name', creatureId: parent.id, name: 'Founder' }, PAID);
+  let child: Creature | null = null;
+  for (let i = 0; i < 5 && !child; i++) {
+    tick(world, { chain: 0.5, market: 0.5 });
+    child = world.creatures.find((c) => c.parentId === parent.id) ?? null;
+  }
+  assert.ok(child, 'the parent reproduced');
+  assert.equal(child.arkProtected, undefined, 'a child is born mortal whatever its parent carried');
+  assert.equal(child.customName, undefined, 'and unnamed: the name was bought for one body');
+  assert.equal(displayName(child), child.name);
+});
+
+test('paid identity survives a save, and an older snapshot loads unnamed and mortal', () => {
+  const world = createWorld(45, NO_FOOD_NO_BIRTH);
+  world.creatures = world.creatures.slice(0, 3);
+  const [a, b, plain] = world.creatures;
+  applyIntervention(world, { type: 'name', creatureId: a.id, name: 'Moby' }, PAID);
+  applyIntervention(world, { type: 'ark', creatureId: b.id }, PAID);
+  const json = toJSON(world);
+  const restored = fromJSON(json);
+  const ra = findCreature(restored, a.id)!;
+  const rb = findCreature(restored, b.id)!;
+  assert.equal(displayName(ra), 'Moby');
+  assert.equal(ra.name, a.name, 'the codename travelled with it');
+  assert.equal(rb.arkProtected, true);
+  assert.equal(rb.arkBy, PAYER);
+  assert.equal(findCreature(restored, plain.id)!.arkProtected, undefined);
+  assert.equal(findCreature(restored, 999_999), null, 'an id the tank has moved on past is null, not a ghost');
+  assert.equal(toJSON(restored), json, 'a restore is not a rewrite');
+
+  // A snapshot from before the paid layer existed: nothing invented, nothing read
+  // as bought. A stray null or an empty string must not become a ticket.
+  const legacy = JSON.parse(json) as { creatures: Record<string, unknown>[]; culls?: Record<string, unknown>[] };
+  for (const c of legacy.creatures) {
+    delete c.customName; delete c.arkProtected; delete c.arkBy;
+  }
+  legacy.creatures[0].arkProtected = null;
+  legacy.creatures[0].customName = '';
+  legacy.culls = [{ type: 'judgment', tick: 1, day: 0, culled: [], populationBefore: 2, populationAfter: 1 }];
+  const loaded = fromJSON(JSON.stringify(legacy));
+  for (const c of loaded.creatures) {
+    assert.equal(c.customName, undefined);
+    assert.equal(c.arkProtected, undefined);
+    assert.equal(c.arkBy, undefined);
+    assert.equal(displayName(c), c.name);
+  }
+  assert.deepEqual(loaded.culls[0].saved, [], 'an old cull record loads with an empty saved list');
 });

@@ -192,6 +192,96 @@ export function genomeFingerprint(g: Genome): number[] {
   return g.w1.slice(0, 4).map((v) => Math.round(v * 100) / 100);
 }
 
+/* ---------- paid gene editing ---------- */
+
+/**
+ * The five traits a visitor may buy an edit on. Each one names a real slice of
+ * the network rather than a stat bolted on afterwards, so an edited creature
+ * behaves differently for the same reason an evolved one does.
+ */
+export type GeneTrait = 'speed' | 'size' | 'aggression' | 'fertility' | 'perception';
+
+export const GENE_TRAITS: GeneTrait[] = ['speed', 'size', 'aggression', 'fertility', 'perception'];
+
+/** How far one paid edit moves a weight, and the ceiling every weight lives under. */
+const TRAIT_STEP = 0.3;
+const TRAIT_CAP = 2;
+/** Perception is a gain on the sensory columns rather than an offset on a row. */
+const PERCEPTION_BOOST = 1.3;
+const PERCEPTION_SUPPRESS = 0.7;
+/** Sensory columns the perception edit scales: food direction (x,y) + intensity. */
+const PERCEPTION_INPUTS = 3;
+
+function nudge(v: number, delta: number): number {
+  return clamp(v + delta, -TRAIT_CAP, TRAIT_CAP);
+}
+
+/** Push a weight's magnitude by `step`, keeping its sign (and so its meaning). */
+function amplify(v: number, step: number): number {
+  return clamp(v + (v < 0 ? -step : step), -TRAIT_CAP, TRAIT_CAP);
+}
+
+/**
+ * A targeted, deterministic edit of one behavioural trait, in place.
+ *
+ * Deliberately not `mutateGenome`: that is the blind point mutation every
+ * child inherits, while this is a paid scalpel on one named axis. The mapping
+ * follows the network's own semantics — output 0 steers, 1 drives speed, 2
+ * eats, 3 reproduces.
+ *
+ * Contract for the caller: the archetype is read off those same output biases,
+ * so every edit but `perception` can move the species — and `aggression` and
+ * `fertility` move it further than `size` does, because they shift a whole row
+ * of weights on top of the bias. Whoever applies an edit must therefore re-read
+ * `archetypeOf` and resync the body (radius, codename) to match; `size` is not a
+ * special case. `applyIntervention` does exactly that.
+ */
+export function mutateTrait(g: Genome, trait: GeneTrait, direction: 'boost' | 'suppress'): void {
+  const step = direction === 'boost' ? TRAIT_STEP : -TRAIT_STEP;
+  const row = (out: number): void => {
+    for (let h = 0; h < HIDDEN_SIZE; h++) {
+      const i = out * HIDDEN_SIZE + h;
+      g.w2[i] = nudge(g.w2[i], step);
+    }
+  };
+  switch (trait) {
+    case 'speed':
+      // Steering authority plus the drive output: a boosted one turns harder
+      // and commits to it, a suppressed one drifts.
+      for (let h = 0; h < HIDDEN_SIZE; h++) {
+        const i = 0 * HIDDEN_SIZE + h;
+        g.w2[i] = amplify(g.w2[i], TRAIT_STEP * (direction === 'boost' ? 1 : -1));
+      }
+      g.b2[0] = amplify(g.b2[0], TRAIT_STEP * (direction === 'boost' ? 1 : -1));
+      g.b2[1] = nudge(g.b2[1], step);
+      break;
+    case 'size':
+      // Body size is the archetype, and the archetype is the eat/move balance:
+      // boosting leans WHALE (a big, hungry body), suppressing leans ALGO.
+      g.b2[2] = nudge(g.b2[2], step);
+      g.b2[1] = nudge(g.b2[1], -step);
+      break;
+    case 'aggression':
+      row(2);
+      g.b2[2] = nudge(g.b2[2], step);
+      break;
+    case 'fertility':
+      row(3);
+      g.b2[3] = nudge(g.b2[3], step);
+      break;
+    case 'perception': {
+      const gain = direction === 'boost' ? PERCEPTION_BOOST : PERCEPTION_SUPPRESS;
+      for (let h = 0; h < HIDDEN_SIZE; h++) {
+        for (let i = 0; i < PERCEPTION_INPUTS; i++) {
+          const at = h * INPUT_SIZE + i;
+          g.w1[at] = clamp(g.w1[at] * gain, -TRAIT_CAP, TRAIT_CAP);
+        }
+      }
+      break;
+    }
+  }
+}
+
 /**
  * A three-axis personality in six bits (two per axis): appetite, restlessness
  * and fecundity, quartiled from the output biases. The card tells a story with

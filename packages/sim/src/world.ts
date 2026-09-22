@@ -6,9 +6,11 @@ import {
   creatureName,
   forward,
   mutateGenome,
+  mutateTrait,
   randomGenome,
   steerArchetype,
   type Archetype,
+  type GeneTrait,
   type Genome,
 } from './genome.js';
 import { DEFAULT_CONFIG, type WorldConfig } from './types.js';
@@ -35,6 +37,12 @@ export interface TxMeteor {
    * or the causal link between the two is invisible.
    */
   at?: { x: number; y: number };
+  /**
+   * A paid wishing meteor carries its message into the water: the tank renders
+   * the words next to the fall, so the burn leaves something readable behind
+   * instead of only plankton.
+   */
+  wish?: { message: string; addr: string };
 }
 
 /**
@@ -64,6 +72,22 @@ export interface Creature {
   maxMealUsd: number;
   /** True once the creature stood inside a whale boom. */
   boomTouched: boolean;
+  /**
+   * A name a visitor paid for. It replaces the generated codename everywhere the
+   * tank speaks — the card, the leaderboards, the kill banners, the obituaries
+   * and the lineage — which is the whole point of buying one. The codename is
+   * not thrown away: `name` keeps it as the birth record, and the payload hands
+   * it down beside the paid one as `baseName`.
+   */
+  customName?: string;
+  /**
+   * An ark ticket: harvests and judgment days pass this creature over. Paid,
+   * permanent for the life of the creature, and never inherited — a child is
+   * born mortal whatever its parent carried.
+   */
+  arkProtected?: boolean;
+  /** Who bought the ticket, so the card can name its guarantor. */
+  arkBy?: string;
   x: number;
   y: number;
   energy: number;
@@ -111,7 +135,51 @@ export type Intervention =
   | { type: 'feed'; x: number; y: number; radius: number; amount?: number }
   | { type: 'poison'; x: number; y: number; radius: number; durationTicks?: number }
   | { type: 'bloom'; durationTicks?: number }
-  | { type: 'drought'; durationTicks?: number };
+  | { type: 'drought'; durationTicks?: number }
+  | { type: 'name'; creatureId: number; name: string }
+  | { type: 'wish'; message: string; x?: number; y?: number }
+  | { type: 'mutate'; creatureId: number; trait: GeneTrait; direction: 'boost' | 'suppress' }
+  | { type: 'ark'; creatureId: number };
+
+/** A life this old, or this bloody, costs ten times the price to rename. */
+export const LEGENDARY_GENERATION = 5;
+export const LEGENDARY_KILLS = 5;
+
+/** Whether naming this creature is a legendary (tenfold) purchase. */
+export function isLegendary(c: Creature): boolean {
+  return c.generation >= LEGENDARY_GENERATION || c.kills >= LEGENDARY_KILLS;
+}
+
+/** Size of a paid wishing meteor: a streak and a handful of plankton, not a boom. */
+export const WISH_METEOR_SIZE = 0.4;
+
+/**
+ * What that streak breaks into, as a pellet count of its own.
+ *
+ * Deliberately not the chain rain's `3 * size * size`: at this size that formula
+ * yields 0.48 pellets, so three wishes in four land in empty water and the buyer
+ * gets nothing but a line of text. A bought wish always lands a visible handful.
+ *
+ * Six keeps it a keepsake rather than a grocery run. A wish costs a quarter of a
+ * feed, and a feed dropped from the route carries no amount and so scatters the
+ * default 40: this is 15% of that bounty for 25% of the price, i.e. about 1.7x
+ * the ABYS per pellet, with no feast attractor calling the tank to it besides.
+ * Food bought this way is always food bought badly.
+ */
+export const WISH_PELLETS = 6;
+
+/** How wide that handful scatters, in world units. */
+const WISH_SPREAD = 34;
+
+/**
+ * The name the tank answers to. A paid name overwrites the generated codename
+ * everywhere the creature is spoken about — kill cams, obituaries, cull lists,
+ * leaderboards — because the point of buying one is that the tank starts using
+ * it. `creature.name` keeps the birth codename for lineage and records.
+ */
+export function displayName(c: Creature): string {
+  return c.customName ?? c.name;
+}
 
 export interface TimedEffect {
   /** `boom` = a whale's own transfer landed plankton here and pulls locally. */
@@ -152,6 +220,11 @@ export interface CullRecord {
     /** Ticks lived (cull tick minus bornTick). */
     age: number;
   }[];
+  /**
+   * Ark-protected creatures that sat inside the cull's reach and walked away:
+   * the ticket is only worth its price if the tank can show it working.
+   */
+  saved: { id: number; name: string; x: number; y: number }[];
   populationBefore: number;
   populationAfter: number;
 }
@@ -177,7 +250,10 @@ export interface TickStats {
 export interface SimEvent {
   seq: number;
   tick: number;
-  type: 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor' | 'poison_kill' | 'reseed' | 'memorial';
+  type:
+    | 'predation' | 'harvest' | 'judgment' | 'intervention' | 'tx_meteor'
+    | 'poison_kill' | 'reseed' | 'memorial'
+    | 'naming' | 'wish' | 'mutation' | 'ark';
   /** World coordinates, when the event is localized. */
   x?: number;
   y?: number;
@@ -204,6 +280,13 @@ export interface SimEvent {
   /** Cull metadata: count plus each victim's last position. */
   count?: number;
   positions?: { id: number; x: number; y: number }[];
+  /** Ark saves during a cull, so the viewer can flash the survivors. */
+  saved?: { id: number; name: string; x: number; y: number }[];
+  /** Paid-identity metadata: which creature, and what was done to it. */
+  creatureId?: number;
+  message?: string;
+  trait?: GeneTrait;
+  direction?: 'boost' | 'suppress';
   /** Intervention metadata. */
   kind?: Intervention['type'] | 'backlash';
 }
@@ -548,7 +631,7 @@ function titlesFor(c: Creature, cause: string): string[] {
 function memorialize(world: World, c: Creature, cause: string): void {
   world.obituaries.unshift({
     id: c.id,
-    name: c.name,
+    name: displayName(c),
     archetype: c.archetype,
     generation: c.generation,
     bornTick: c.bornTick,
@@ -566,12 +649,20 @@ function memorialize(world: World, c: Creature, cause: string): void {
     type: 'memorial',
     x: Math.round(c.x),
     y: Math.round(c.y),
-    name: c.name,
+    name: displayName(c),
     species: c.archetype,
   });
 }
 
-/** Shared cull logic for hourly harvests and daily judgment days. */
+/**
+ * Shared cull logic for hourly harvests and daily judgment days.
+ *
+ * An ark ticket is honoured here and nowhere else: the scythe counts the
+ * weakest in order and steps over every protected body, taking its quota from
+ * the next one down instead. Starvation, poison and predation still kill a
+ * ticket holder — the ark only buys immunity from the tank's own two culls,
+ * which is what makes it a lifeboat and not immortality.
+ */
 function cullWeakest(
   world: World,
   ratio: number,
@@ -584,35 +675,49 @@ function cullWeakest(
   const cullCount = Math.max(minCull, Math.floor(pop * ratio));
   if (cullCount <= 0) return null;
   const sorted = [...world.creatures].sort((a, b) => a.energy - b.energy);
-  const doomed = sorted.slice(0, cullCount);
+  const doomed = sorted.filter((c) => c.arkProtected !== true).slice(0, cullCount);
+  if (doomed.length === 0) return null;
+  // Whoever the scythe reached for and could not take: the protected bodies
+  // inside the naive window, reported so the tank can flash them surviving.
+  const saved = sorted
+    .slice(0, cullCount)
+    .filter((c) => c.arkProtected === true)
+    .map((c) => ({
+      id: c.id,
+      name: displayName(c),
+      x: Math.round(c.x * 10) / 10,
+      y: Math.round(c.y * 10) / 10,
+    }));
   const doomedIds = new Set(doomed.map((c) => c.id));
   for (const c of doomed) memorialize(world, c, type);
   world.creatures = world.creatures.filter((c) => !doomedIds.has(c.id));
-  world.totalDied += cullCount;
+  world.totalDied += doomed.length;
   const record: CullRecord = {
     type,
     tick: world.tick,
     day: Math.floor(world.tick / cfg.ticksPerDay),
     culled: doomed.map((c) => ({
       id: c.id,
-      name: c.name,
+      name: displayName(c),
       generation: c.generation,
       energy: Math.round(c.energy * 100) / 100,
       archetype: c.archetype,
       age: world.tick - c.bornTick,
     })),
+    saved,
     populationBefore: pop,
     populationAfter: world.creatures.length,
   };
   world.culls.push(record);
   pushEvent(world, {
     type,
-    count: cullCount,
+    count: doomed.length,
     positions: doomed.map((c) => ({
       id: c.id,
       x: Math.round(c.x * 10) / 10,
       y: Math.round(c.y * 10) / 10,
     })),
+    saved,
   });
   return record;
 }
@@ -925,8 +1030,8 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
           preyId: p.id,
           predatorArchetype: c.archetype,
           preyArchetype: p.archetype,
-          predatorName: c.name,
-          preyName: p.name,
+          predatorName: displayName(c),
+          preyName: displayName(p),
         });
         break; // one meal, then it digests
       }
@@ -952,7 +1057,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
           type: 'poison_kill',
           x: Math.round(c.x * 10) / 10,
           y: Math.round(c.y * 10) / 10,
-          name: c.name,
+          name: displayName(c),
           archetype: c.archetype,
         });
         e.kills = (e.kills ?? 0) + 1;
@@ -1034,6 +1139,15 @@ export interface InterventionResult {
   affected: number;
   /** Feed only: food points dropped. */
   amount?: number;
+  /** Wish only: where the meteor came down, so the viewer can rain it in too. */
+  at?: { x: number; y: number };
+  /** Wish only: the hash the meteor fell under (the burn tx when there is one). */
+  hash?: string;
+}
+
+/** Find a live creature by id, or null once the tank has moved on without it. */
+export function findCreature(world: World, id: number): Creature | null {
+  return world.creatures.find((c) => c.id === id) ?? null;
 }
 
 function countInZone(world: World, x: number, y: number, radius: number): number {
@@ -1163,6 +1277,130 @@ export function applyIntervention(
         affected: world.creatures.length,
       };
     }
+    case 'name': {
+      const c = findCreature(world, intervention.creatureId);
+      // The handler re-checks the target after the payment clears, so this is
+      // a guard, not a path a buyer can be charged for.
+      if (!c) return { message: `name: creature #${intervention.creatureId} is gone`, affected: 0 };
+      const before = displayName(c);
+      c.customName = intervention.name;
+      world.lastEvents.push(`intervention:name:${c.id}`);
+      pushEvent(world, {
+        type: 'naming',
+        x: Math.round(c.x * 10) / 10,
+        y: Math.round(c.y * 10) / 10,
+        creatureId: c.id,
+        name: before,
+        message: intervention.name,
+        payer: meta?.payer,
+        paid: meta?.paid,
+      });
+      return { message: `Named ${before} → “${intervention.name}”`, affected: 1 };
+    }
+    case 'wish': {
+      // A wish is a small meteor with words on it: it falls where the payer
+      // aimed (or somewhere the tank picks), and always leaves a handful of
+      // plankton under the message, so it feeds the water around it instead of
+      // only decorating it. The pellet energy still tracks the meteor's size —
+      // a wish is a light fall, not a whale-sized one.
+      const size = WISH_METEOR_SIZE;
+      const aimed =
+        intervention.x !== undefined && intervention.y !== undefined
+          ? { x: intervention.x, y: intervention.y }
+          : { x: world.rng.range(0, cfg.width), y: world.rng.range(0, cfg.height) };
+      const x = wrap(aimed.x, cfg.width);
+      const y = wrap(aimed.y, cfg.height);
+      // Deterministic fallback: a tick+seq key replays identically on every
+      // instance, where a wall-clock one would not.
+      const hash = meta?.tx ?? `wish-${world.tick}-${world.nextEventSeq}`;
+      const count = WISH_PELLETS;
+      const energy = cfg.foodEnergy * (0.25 + size);
+      for (let i = 0; i < count; i++) {
+        const a = world.rng.range(0, Math.PI * 2);
+        const d = Math.sqrt(world.rng.next()) * WISH_SPREAD;
+        spawnFood(world, x + Math.cos(a) * d, y + Math.sin(a) * d, energy, hash);
+      }
+      world.lastEvents.push(`intervention:wish@${Math.round(x)},${Math.round(y)}`);
+      pushEvent(world, {
+        type: 'wish',
+        x: Math.round(x * 10) / 10,
+        y: Math.round(y * 10) / 10,
+        size,
+        hash,
+        message: intervention.message,
+        payer: meta?.payer,
+        paid: meta?.paid,
+      });
+      const affected = countInZone(world, x, y, 60);
+      return {
+        message: `wish: “${intervention.message}” fell at (${Math.round(x)}, ${Math.round(y)})`,
+        affected,
+        at: { x, y },
+        hash,
+      };
+    }
+    case 'mutate': {
+      const c = findCreature(world, intervention.creatureId);
+      if (!c) return { message: `mutate: creature #${intervention.creatureId} is gone`, affected: 0 };
+      mutateTrait(c.genome, intervention.trait, intervention.direction);
+      // The species is read off the output drives, and four of the five edits
+      // move one of them: aggression and fertility push the eat and reproduce
+      // biases harder than size does, and speed pushes the move bias. So the
+      // body follows the gene after *any* edit, not just the size one —
+      // otherwise the card, the metabolism and the creature's own children
+      // (who are born off the genome, not off the parent's label) would each
+      // hold a different answer to what this animal is. Kill growth carries
+      // across as a ratio, and a creature with no paid name takes the codename
+      // of the species it became.
+      const was = c.archetype;
+      const next = archetypeOf(c.genome);
+      if (next !== was) {
+        const grown = c.radius / (cfg.creatureRadius * ARCHETYPES[was].radiusMult);
+        c.archetype = next;
+        c.radius = cfg.creatureRadius * ARCHETYPES[next].radiusMult * grown;
+        if (!c.customName) c.name = creatureName(next, c.id);
+      }
+      world.lastEvents.push(`intervention:mutate:${c.id}:${intervention.trait}`);
+      pushEvent(world, {
+        type: 'mutation',
+        x: Math.round(c.x * 10) / 10,
+        y: Math.round(c.y * 10) / 10,
+        creatureId: c.id,
+        name: displayName(c),
+        trait: intervention.trait,
+        direction: intervention.direction,
+        // Set only when the edit actually rewrote the species, so the tank can
+        // say so out loud instead of leaving the viewer to notice a body that
+        // quietly changed shape. Sparse: most edits leave the species alone.
+        ...(next !== was ? { archetype: next } : {}),
+        payer: meta?.payer,
+        paid: meta?.paid,
+      });
+      return {
+        message: `Modified ${displayName(c)}: ${intervention.trait} ${intervention.direction}`,
+        affected: 1,
+      };
+    }
+    case 'ark': {
+      const c = findCreature(world, intervention.creatureId);
+      if (!c) return { message: `ark: creature #${intervention.creatureId} is gone`, affected: 0 };
+      if (c.arkProtected === true) {
+        return { message: `ark: ${displayName(c)} already holds a ticket`, affected: 0 };
+      }
+      c.arkProtected = true;
+      c.arkBy = meta?.payer;
+      world.lastEvents.push(`intervention:ark:${c.id}`);
+      pushEvent(world, {
+        type: 'ark',
+        x: Math.round(c.x * 10) / 10,
+        y: Math.round(c.y * 10) / 10,
+        creatureId: c.id,
+        name: displayName(c),
+        payer: meta?.payer,
+        paid: meta?.paid,
+      });
+      return { message: `Ark granted to ${displayName(c)}`, affected: 1 };
+    }
   }
 }
 
@@ -1198,8 +1436,17 @@ export function fromJSON(json: string): World {
     c.huntReadyAt ??= rest.tick + (rest.config?.huntCooldown ?? DEFAULT_CONFIG.huntCooldown);
     c.name ??= creatureName(c.archetype, c.id);
     c.parentId ??= null;
+    // Paid identity: absent means unnamed and mortal. Normalized to undefined
+    // rather than false so an old snapshot does not start carrying a field per
+    // creature forever, and a stray null cannot read as a bought ticket.
+    if (typeof c.customName !== 'string' || c.customName.length === 0) c.customName = undefined;
+    if (c.arkProtected !== true) {
+      c.arkProtected = undefined;
+      c.arkBy = undefined;
+    }
   }
   for (const cull of rest.culls ?? []) {
+    cull.saved ??= [];
     for (const victim of cull.culled) {
       victim.archetype ??= 'INSIDER';
       victim.age ??= 0;
