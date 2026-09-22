@@ -231,7 +231,7 @@ on `node:test` with `jsdom` and `@napi-rs/canvas` for a render smoke test.
 | `ARC_USDC_ADDRESS` | `0x3600…0000` | Native USDC precompile on Arc |
 | `EXPLORER_TX_URL` | `https://explorer.arc.io/tx/` | Explorer base URL for tx links |
 | `ABYS_TOKEN_ADDRESS` | unset locally; set in `wrangler.toml` `[vars]` for production | The deployed ABYS contract. Until it is set, `POST /intervene` answers 503 while the observatory still runs free |
-| `ARC_DIGEST_KEY` | unset | Signing key for the daily digest. Unset, the digest is still computed and served but never committed on chain: `/state` reports `digestChain.status: "unconfigured"` |
+| `ARC_DIGEST_KEY` | unset | Signing key for the daily digest. Unset, the digest is still computed and served but never committed on chain. `/state` reports `digestChain: null` until a day rolls inside the object, then `digestChain.status: "unconfigured"` |
 | `USED_BURNS_FILE` | `.data/used-burns.txt` | Append-only log of spent burn receipts, so a restart cannot replay an old burn |
 | `COMPRESS_LEVEL` | `6` | Brotli quality in the node adapter (6 ≈ 0.5–3 ms/payload; 11 costs ~570 ms on `/history`) |
 | `COMPRESS_MIN_BYTES` | `1024` | Responses smaller than this are sent uncompressed |
@@ -299,10 +299,26 @@ calmer pre/after-market, near-zero on weekends). See
 ## Deploy (Cloudflare Workers)
 
 The handler carries no node builtins, so the same code runs as a Worker: the
-world lives in one Durable Object (`AbyssalWorld`), a one-minute cron alarm
-keeps time flowing with zero viewers, and snapshots persist in the object's
-storage between isolates. The web client ships as Workers Static Assets; any
-path that is not a file routes into the object.
+world lives in one Durable Object (`AbyssalWorld`) and snapshots persist in the
+object's storage between isolates. The web client ships as Workers Static
+Assets; any path that is not a file routes into the object.
+
+**Time only moves when something calls into the object.** A Worker isolate
+sleeps between requests and cannot hold a 250ms interval, so the tank is driven
+by `catchUp()`, which replays the wall-clock ticks that elapsed since the last
+advance (capped at 240, one call's worth of a minute at the default tick). With
+no viewers that means no ticks at all, which is what the Cron Trigger in
+`wrangler.toml` is for. Read this part carefully if you touch it:
+
+- A Cron Trigger invokes the Worker's **`scheduled(event, env, ctx)`** handler,
+  not `fetch`. Declaring `crons` without exporting `scheduled` deploys cleanly,
+  logs a schedule, and then fires every minute into nothing.
+- A Durable Object stub exposes nothing but `fetch`, so the handler pokes the
+  object with an internal request to `/__cron`; that path advances, persists
+  unconditionally and reports how many ticks it moved.
+- `ctx.storage.setAlarm()` is the other mechanism, and this repo does not use
+  it. An `alarm()` method with nothing arming it is unreachable code, not a
+  second safety net — it was removed for exactly that reason.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -340,12 +356,31 @@ the name.
 ### One tank per deployment
 
 The ecosystem is a single world, not a per-visitor copy: on Workers it lives in
-one Durable Object, so every isolate and every visitor shares it, and a
+one Durable Object, so every isolate and every visitor shares it, and the
 one-minute cron keeps it ticking with zero viewers. The node adapter is a local
 mirror with its own world (snapshotted to `.data/world.json`), which is what you
 want for development but is a different tank from production. `/state` carries
 `instance`, a stable id per world, so a client can always tell which tank it is
 looking at.
+
+Two things in `/state` are **isolate state, not world state**, and a reader who
+assumes otherwise will misdiagnose a healthy tank. The world (tick, population,
+creatures, the day anchor) is durable and survives eviction; the chain telemetry
+around it does not. `feedStatus`, `chainTemp`, `chainDelta`, `marketTemp` and
+`blockNumber` are only ever written inside `advance()`, and a request that lands
+on a freshly booted object is served before any advance has run — `catchUp()`
+returns early because nothing has elapsed yet. Such a request reports the
+boot-time initializers: `feedStatus: "synthetic"`, both temperatures pinned at
+`0.5`, and no `blockNumber` field at all. That is *not* evidence the Arc feed is
+off; `chainFeed: "arc-usdc"` and `marketFeed: "arc-usdc-flow"` in the same
+payload say the real feeds are wired. The tell is that a cold reading never
+carries a `blockNumber`. The cron keeps the object warm, so in practice the
+window is short — but a single cold reading proves nothing either way.
+
+`digestChain` is the same kind of state and resets to `null` with the isolate.
+It is only populated when an `advance()` crosses a day boundary, so a cold
+reading says nothing about whether the digest commit is configured — check
+`ARC_DIGEST_KEY` itself, not the payload.
 
 ## API
 
@@ -528,15 +563,18 @@ rather than in a browser.
 
 Live in production: both views, all ten paid actions against the deployed ABYS
 contract, the free social layer, six languages, and the Durable Object tank
-ticking on a one-minute cron with zero viewers.
+ticking on a one-minute Cron Trigger with zero viewers.
 
 Still open:
 
 - **Trust anchor.** The daily world digest is computed, served and exported, but
-  not committed on chain: production runs without `ARC_DIGEST_KEY`, so `/state`
-  reports `digestChain.status: "unconfigured"`. Until a key is set, "the operator
-  didn't rig the simulation" rests on determinism and the published seed rather
-  than on an attestation anybody can verify independently.
+  not committed on chain: production runs without `ARC_DIGEST_KEY`, so the
+  commit path stops at `status: "unconfigured"` and never signs. Until a key is
+  set, "the operator didn't rig the simulation" rests on determinism and the
+  published seed rather than on an attestation anybody can verify
+  independently. Setting one needs more than the secret: `lastCommittedDay`
+  lives in the isolate too, so an eviction between two day boundaries would
+  commit the same day twice. That bookkeeping has to become durable first.
 - **Paid data tier.** `facilitator.ts` is complete and unused. Historical API
   access in USDC would be its first product; today the only paid data is the day
   pass, which burns ABYS.

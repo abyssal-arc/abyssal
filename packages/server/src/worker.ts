@@ -1,8 +1,14 @@
 /**
  * Cloudflare Worker entry: the whole observatory lives in one Durable Object
- * so the ecosystem keeps a single world across isolates, and a cron alarm
- * keeps time flowing while nobody is watching. Static files are served by
- * Workers Static Assets; every other path is API and routes to the object.
+ * so the ecosystem keeps a single world across isolates. Static files are
+ * served by Workers Static Assets; every other path is API and routes to the
+ * object.
+ *
+ * Time only moves when something calls into the object, so the Cron Trigger
+ * declared in wrangler.toml is what keeps the tank alive with zero viewers.
+ * Cron Triggers invoke `scheduled`, not `fetch` — without the handler below
+ * the schedule fires every minute into nothing and the world advances only
+ * while somebody happens to be watching.
  */
 import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
@@ -28,6 +34,8 @@ interface Env {
 const SNAP_KEY = 'world';
 const INSTANCE_KEY = 'instance';
 const SAVE_EVERY_MS = 30_000;
+/** Internal path the cron handler pokes; never linked, never served to a viewer. */
+const CRON_PATH = '/__cron';
 
 export class AbyssalWorld {
   private app: ReturnType<typeof createApp> | null = null;
@@ -99,24 +107,50 @@ export class AbyssalWorld {
 
   async fetch(request: Request): Promise<Response> {
     const app = await this.boot();
-    await app.catchUp();
+    const advanced = await app.catchUp();
+    // The cron poke. Saving unconditionally matters here: this may be the only
+    // call the object gets all minute, and an unvisited tank that does not
+    // persist is a tank that rewinds to wherever its last viewer left it.
+    // The guard is what keeps that from becoming a write amplifier — the path
+    // is reachable from outside, and a caller hammering it faster than the tick
+    // advances would otherwise turn every hit into a storage put. The real cron
+    // arrives once a minute with ~240 ticks owed, so it always passes.
+    if (new URL(request.url).pathname === CRON_PATH) {
+      if (advanced > 0) {
+        this.lastSave = 0;
+        await this.persist(app);
+      }
+      return new Response(
+        JSON.stringify({ ok: true, advanced, tick: app.world.tick }),
+        { headers: { 'content-type': 'application/json' } },
+      );
+    }
     const response = await app.fetch(request);
     await this.persist(app);
     return response;
   }
+}
 
-  /** One cron per minute keeps the ecosystem alive with no viewers. */
-  async alarm(): Promise<void> {
-    const app = await this.boot();
-    await app.catchUp(240);
-    this.lastSave = 0;
-    await this.persist(app);
-  }
+interface ScheduledCtx {
+  waitUntil(promise: Promise<unknown>): void;
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const id = env.WORLD.idFromName('abyssal');
     return env.WORLD.get(id).fetch(request);
+  },
+
+  /**
+   * One cron per minute keeps the ecosystem alive with no viewers. A Durable
+   * Object stub exposes nothing but `fetch`, so the poke is an internal
+   * request rather than a method call, and `waitUntil` keeps that subrequest
+   * alive past this handler's return instead of racing the invocation teardown.
+   */
+  async scheduled(_event: unknown, env: Env, ctx: ScheduledCtx): Promise<void> {
+    const id = env.WORLD.idFromName('abyssal');
+    ctx.waitUntil(
+      env.WORLD.get(id).fetch(new Request(`https://abyssal.internal${CRON_PATH}`)),
+    );
   },
 };
