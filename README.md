@@ -409,6 +409,22 @@ wired to Arc (`chainFeed: "arc-usdc"` in the same payload) is no longer
 ambiguous: no poll has landed yet, and if it stays that way the cron is not
 running, because the cron is the only caller that waits for one.
 
+One more reading that looks like a fault and is not. `chainTemp` and
+`marketTemp` are rank percentiles, and a rank taken against an empty window is
+`0.5` by construction — so a feed that has just landed its first poll reports
+`feedStatus: "live"` next to temperatures of exactly `0.5`. It takes a second
+reading on the same object before either can move, and the meters are isolate
+state, so an eviction buys another minute or two of neutral.
+
+Once the object holds they do move — and not monotonically, since a rank
+percentile tracks the flow rather than climbing it. Production readings taken in
+the minutes after this shipped spanned `chainTemp` 0.34–0.76 and `marketTemp`
+0.43–0.72, with `/observe` reporting ~1500 transfers and between $214k and
+$222k of USDC volume across its five-minute window. The neutral-then-moving
+sequence is easy to catch for yourself: one later check returned `feed=live`
+with a block number and both temperatures at exactly `0.5`, and twelve seconds
+after that returned `0.35` and `0.65`.
+
 `digestChain` is the same kind of state and resets to `null` with the isolate.
 It is only populated when an `advance()` crosses a day boundary, so a cold
 reading says nothing about whether the digest commit is configured — check
