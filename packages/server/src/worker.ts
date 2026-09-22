@@ -9,6 +9,11 @@
  * Cron Triggers invoke `scheduled`, not `fetch` — without the handler below
  * the schedule fires every minute into nothing and the world advances only
  * while somebody happens to be watching.
+ *
+ * The same is true of the chain feed, and for a second reason: `sample()` starts
+ * its RPC poll without awaiting it, and an invocation ends when its response is
+ * sent, so an un-awaited poll is cancelled before it can finish. The cron is the
+ * one caller with nobody waiting on it, which makes it the feed's heartbeat.
  */
 import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
@@ -17,6 +22,12 @@ import { toJSON } from '@abyssal/sim';
 interface DoStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put(key: string, value: unknown): Promise<void>;
+}
+
+interface DoCtx {
+  storage: DoStorage;
+  /** Keeps a promise alive past the response, instead of it being cancelled. */
+  waitUntil(promise: Promise<unknown>): void;
 }
 
 interface DoBinding {
@@ -45,7 +56,7 @@ export class AbyssalWorld {
   private ledgerState: LedgerLoad | null = null;
 
   // Durable Objects receive their bindings through the constructor, not fetch.
-  constructor(private ctx: { storage: DoStorage }, private env: Env) {
+  constructor(private ctx: DoCtx, private env: Env) {
     // Receipts and passes live in this object's storage, so an isolate restart
     // cannot replay a burn or drop a day pass.
     setBurnLedger({
@@ -107,6 +118,18 @@ export class AbyssalWorld {
 
   async fetch(request: Request): Promise<Response> {
     const app = await this.boot();
+    const isCron = new URL(request.url).pathname === CRON_PATH;
+    if (isCron) {
+      // Block until the chain poll completes. This is the one caller with nobody
+      // waiting on it, and it is the difference between a feed that warms up and
+      // one that is cancelled mid-backfill on every single request and therefore
+      // reports its initializer temperatures forever.
+      await app.warmFeed();
+    } else {
+      // A viewer must not wait on the RPC, but the poll its request kicked off
+      // must not be cancelled along with the response either.
+      this.ctx.waitUntil(app.warmFeed());
+    }
     const advanced = await app.catchUp();
     // The cron poke. Saving unconditionally matters here: this may be the only
     // call the object gets all minute, and an unvisited tank that does not
@@ -115,7 +138,7 @@ export class AbyssalWorld {
     // is reachable from outside, and a caller hammering it faster than the tick
     // advances would otherwise turn every hit into a storage put. The real cron
     // arrives once a minute with ~240 ticks owed, so it always passes.
-    if (new URL(request.url).pathname === CRON_PATH) {
+    if (isCron) {
       if (advanced > 0) {
         this.lastSave = 0;
         await this.persist(app);

@@ -1245,3 +1245,192 @@ test('a clock from the future is ignored instead of pinning the tank', async () 
   assert.equal(await app.catchUp(), 0);
   assert.equal(app.world.tick, 0);
 });
+
+/* ---------- the chain feed's heartbeat in a runtime with no interval ---------- */
+
+/**
+ * A JSON-RPC stub answering the three calls a poll makes: the head, the log
+ * chunks, and the blocks that carry tx senders. `transfersPerChunk` fills each
+ * `eth_getLogs` range with 1 USDC transfers, which is enough to give the flow
+ * ring and the pulse series something to hold. `calls` counts polls so a test can
+ * tell one round of RPC from two, and `delayMs` makes a poll slow enough to
+ * outlast the feed's own throttle — without it a local stub answers in under a
+ * millisecond and the throttle can never be observed expiring.
+ */
+function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0) {
+  const from = '0x' + 'cd'.repeat(20);
+  const to = '0x' + 'ef'.repeat(20);
+  const topic = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
+  const calls = { heads: 0 };
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    const call = JSON.parse(body || '{}') as { method?: string; params?: Record<string, string>[] };
+    // Counted on arrival, before the delay: a redundant poll is dispatched
+    // asynchronously, and counting it only when answered would let an assertion
+    // run before the extra request had shown up.
+    if (call.method === 'eth_blockNumber') calls.heads++;
+    if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+    const p = call.params?.[0] ?? {};
+    let result: unknown = { transactions: [] };
+    if (call.method === 'eth_blockNumber') {
+      result = `0x${head.toString(16)}`;
+    } else if (call.method === 'eth_getLogs') {
+      const start = parseInt(p.fromBlock, 16);
+      result = Array.from({ length: transfersPerChunk }, (_, i) => ({
+        address: ARC_USDC,
+        topics: [TRANSFER_TOPIC, topic(from), topic(to)],
+        data: `0x${(1_000_000).toString(16).padStart(64, '0')}`,
+        blockNumber: `0x${(start + i).toString(16)}`,
+        transactionHash: `0x${(start * 100 + i).toString(16).padStart(64, '0')}`,
+      }));
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+  });
+  return { server, calls };
+}
+
+test("a feed that has not landed a poll cannot claim 'live'", async () => {
+  // `sample()` starts its poll without awaiting it, which is right for a 250ms
+  // tick loop and fatal in a Worker: the invocation ends when the response is
+  // sent, the un-awaited backfill is cancelled, and the next request rebuilds
+  // the feed from `lastBlock = -1`. Production ran like that for long enough to
+  // have a tank permanently pinned at 0.5 with zero transfers observed — while
+  // /state reported `feedStatus: "live"` and /observe reported `available: true`,
+  // because both only ever checked whether Arc was *configured*.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server: rpc } = chainRpcStub(HEAD, 2, 60);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  try {
+    // A throttle far shorter than one poll, so the interval is guaranteed to have
+    // expired by the time the poll returns — which is exactly the moment a
+    // throttle measured from the request would let a second, redundant poll out.
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, {
+      backfillBlocks: 8,
+      pollEveryMs: 20,
+    });
+    const app = createApp({ seed: 1, chainFeed: feed, store: memStore().store });
+    const read = async () =>
+      (await (await app.fetch(new Request('http://localhost/state'))).json()) as {
+        feedStatus: string;
+        blockNumber?: number;
+        chainTemp: number;
+      };
+    const poke = () => app.fetch(new Request('http://localhost/tick', { method: 'POST' }));
+
+    await poke();
+    const cold = await read();
+    assert.equal(cold.feedStatus, 'synthetic', 'configured is not the same as working');
+    assert.equal(cold.blockNumber, undefined);
+    assert.equal(cold.chainTemp, 0.5, 'and the tank is being fed the initializer');
+
+    // The heartbeat: the one caller with nobody waiting on it can afford to
+    // block until the backfill finishes, which is what lets it complete at all.
+    await app.warmFeed();
+
+    await poke();
+    const warm = await read();
+    assert.equal(warm.blockNumber, HEAD, 'the poll it waited for actually landed');
+    assert.equal(warm.feedStatus, 'live');
+    // Still 0.5, and correctly so: the temperature is a rank percentile, and the
+    // first reading into an empty window is the neutral rank by construction.
+    // What warming buys is the *next* reading being able to move.
+    assert.equal(warm.chainTemp, 0.5);
+
+    const observe = (await
+      (await app.fetch(new Request('http://localhost/observe'))).json()) as {
+      available: boolean;
+      lastBlock: number;
+      stats: { transfers: number; volume: number };
+      pulse: unknown[];
+    };
+    assert.equal(observe.available, true);
+    assert.equal(observe.lastBlock, HEAD);
+    assert.ok(observe.stats.transfers > 0, 'a warm feed has actually seen transfers');
+    assert.ok(observe.pulse.length > 0, 'and has a pulse series to chart');
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the heartbeat polls once, not twice, for the same minute of chain', async () => {
+  // `warmFeed()` exists so the cron can block until a poll lands. If the poll
+  // throttle were measured from when the request *started*, the advance that
+  // follows a multi-second backfill would find the interval already elapsed and
+  // kick off a second poll for data the feed is already holding — doubling the
+  // RPC load and putting two pulse buckets on one minute. So the throttle resets
+  // on completion. This walks the cron's exact order on a cold feed; the stub
+  // delays every call so a poll genuinely outlasts the throttle, which an
+  // instant local stub never does.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const { server: rpc, calls } = chainRpcStub(8192, 2, 60);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, {
+      backfillBlocks: 8,
+      pollEveryMs: 20, // far shorter than one poll, so the interval always expires
+    });
+    const app = createApp({ seed: 1, chainFeed: feed, store: memStore().store });
+    await app.warmFeed();
+    assert.equal(calls.heads, 1, 'a cold heartbeat polls once');
+    await app.fetch(new Request('http://localhost/tick', { method: 'POST' }));
+    // A poll the advance should not have started is dispatched but not yet
+    // answered when the response returns, so give it room to arrive before
+    // counting. Longer than the stub's delay, so this is not a race.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(
+      calls.heads,
+      1,
+      'and the advance that follows must not re-poll for data it already has',
+    );
+  } finally {
+    rpc.close();
+  }
+});
+
+test("catchUp deals the interval's meteors across the replay, not into one tick", async () => {
+  // `advance()` samples the chain once and drains one tick's worth of meteors,
+  // but the ticks catchUp replays cover a whole interval of real chain time.
+  // Handing the replay nothing starved the one food source that carries
+  // provenance: at cron cadence that is 6 meteors a minute against the ~13
+  // transfers a second a live Arc poll actually yields, so on the deployed tank
+  // nothing ever rained.
+  let askedFor = 0;
+  const BATCH = 60;
+  const rain: ChainFeed = {
+    name: 'test-rain',
+    sample: async () => ({ temp: 0.5, delta: 0, blockNumber: 1 }),
+    recentTxs: (max = 6) => {
+      askedFor = Math.max(askedFor, max);
+      return Array.from({ length: Math.min(max, BATCH) }, (_, i) => ({
+        // Distinct hashes, so the pellets each one spawns can be counted.
+        hash: `0x${(i + 1).toString(16).padStart(64, '0')}`,
+        size: 1, // 3 * size^2 = 3 pellets each
+        usd: 1,
+      }));
+    },
+  };
+  const m = memStore();
+  m.seedClock(Date.now() - 5_000); // ~20 ticks owed
+  const app = createApp({
+    seed: 1,
+    store: m.store,
+    chainFeed: rain,
+    marketFeed: offlineFeeds.marketFeed,
+  });
+  const advanced = await app.catchUp();
+  assert.ok(advanced >= 20, `expected ~20 ticks owed, got ${advanced}`);
+  assert.equal(askedFor, 6 * (advanced - 1), 'the replay budgets the whole interval');
+
+  // The boundary that matters: one tick's drain is 6, so more than six distinct
+  // source hashes can only mean the meteors reached the replayed ticks too.
+  const distinct = new Set(app.world.foods.filter((f) => f.src).map((f) => f.src));
+  assert.ok(
+    distinct.size > 6,
+    `only ${distinct.size} distinct transfer hashes fed the tank; the replay was starved`,
+  );
+});

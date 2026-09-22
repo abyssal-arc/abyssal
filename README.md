@@ -207,7 +207,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (106 total)
+npm test           # sim + server + web tests (109 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -329,6 +329,22 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   before it measures, and the stored clock is only ever allowed to move the
   local one backwards, so skew between isolates cannot pin the world. `api.test.ts`
   pins all three halves.
+- **The chain feed has the same problem one level down.** `sample()` starts its
+  RPC poll without awaiting it — correct for a 250ms tick loop, which must never
+  block on the network, and fatal here, because the invocation ends when its
+  response is sent and a poll nobody is awaiting gets cancelled mid-backfill.
+  Every request then rebuilt the feed from `lastBlock = -1`, no poll ever
+  finished, and the tank ran permanently on its initializer temperatures with
+  nothing ever raining. So the cron handler calls `warmFeed()` first, which
+  awaits the poll: it is the one caller with nobody waiting on it, which makes it
+  the feed's heartbeat. Viewer requests register the same promise with
+  `ctx.waitUntil` so theirs survives the response too.
+- **One poll per call, but a whole interval of ticks.** `advance()` samples the
+  chain once and drains one tick's worth of meteors (6), while `catchUp()` may
+  replay 240 ticks and used to hand every one of them an empty sky. The replay
+  now drains `6 × (ticks − 1)` and deals them out six a tick — the density the
+  250ms loop produces — so the minute's transfers all land instead of only the
+  first six.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -381,11 +397,17 @@ around it does not. `feedStatus`, `chainTemp`, `chainDelta`, `marketTemp` and
 on a freshly booted object is served before any advance has run — `catchUp()`
 returns early because nothing has elapsed yet. Such a request reports the
 boot-time initializers: `feedStatus: "synthetic"`, both temperatures pinned at
-`0.5`, and no `blockNumber` field at all. That is *not* evidence the Arc feed is
-off; `chainFeed: "arc-usdc"` and `marketFeed: "arc-usdc-flow"` in the same
-payload say the real feeds are wired. The tell is that a cold reading never
-carries a `blockNumber`. The cron keeps the object warm, so in practice the
-window is short — but a single cold reading proves nothing either way.
+`0.5`, and no `blockNumber` field at all.
+
+`feedStatus` and `blockNumber` now agree by construction, and that is a repair
+rather than a convenience. `"live"` used to mean *Arc is configured*, which is
+why a tank whose feed had never once completed a poll — temperatures pinned at
+`0.5` forever, `/observe` cheerfully reporting `available: true` next to
+`transfers: 0` — looked perfectly healthy from the outside. `"live"` now means a
+poll has actually landed. So `feedStatus: "synthetic"` on a deployment that *is*
+wired to Arc (`chainFeed: "arc-usdc"` in the same payload) is no longer
+ambiguous: no poll has landed yet, and if it stays that way the cron is not
+running, because the cron is the only caller that waits for one.
 
 `digestChain` is the same kind of state and resets to `null` with the isolate.
 It is only populated when an `advance()` crosses a day boundary, so a cold
@@ -554,12 +576,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-106 tests on `node:test`, no test framework dependency:
+109 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 44 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()` |
+| `@abyssal/server` | 47 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, the chain feed's heartbeat against a stubbed JSON-RPC |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs

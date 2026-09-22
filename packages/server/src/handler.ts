@@ -26,7 +26,7 @@ import {
   type World,
 } from '@abyssal/sim';
 import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
-import { SyntheticFeed, type ChainFeed } from './chain.js';
+import { SyntheticFeed, type ChainFeed, type ChainTx } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
   ABYS_PRICES,
@@ -377,44 +377,34 @@ export function createApp(options: AppOptions = {}) {
     wish?: { message: string; addr: string };
   }[] = [];
 
-  async function advance(): Promise<void> {
-    const useLive = arcFeed !== null;
-    const [c, m] = await Promise.all([chainFeed.sample(), marketFeed.sample()]);
-    const failures = arcFeed ? arcFeed.consecutiveFailures : 0;
-    let sample = c;
-    let txs;
-    if (useLive && failures >= 5) {
-      // RPC is down: degrade to the synthetic feed until it recovers.
-      feedStatus = 'degraded';
-      sample = await fallbackFeed.sample();
-      txs = fallbackFeed.recentTxs();
-    } else {
-      feedStatus = useLive ? 'live' : 'synthetic';
-      txs = chainFeed.recentTxs();
+  /**
+   * Reroute a resident whale's own transfer to the whale instead of to its hash
+   * coordinate, so the money it moves feeds the water it is swimming through and
+   * the tank converges on it. Mutates the batch and must run before `tickWorld`,
+   * which reads `tx.at` as the landing site.
+   */
+  function markWhales(txs: ChainTx[]): void {
+    if (!arcFeed) return;
+    const whales = arcFeed.whaleIndex();
+    if (whales.size === 0) return;
+    const now = Date.now();
+    for (const tx of txs) {
+      if (!tx.meta) continue;
+      const w = whales.get(tx.meta.to) ?? whales.get(tx.meta.from);
+      if (!w) continue;
+      const at = whalePosition(w.lane, now, world.config.width, world.config.height);
+      if (!at) continue;
+      tx.at = at;
+      tx.whale = { address: w.address, rank: w.rank, volume: w.volume };
     }
-    chainTemp = sample.temp;
-    chainDelta = sample.delta;
-    marketTemp = m.temp;
-    blockNumber = sample.blockNumber;
-    // A resident whale's own transfer rains at the whale instead of at its
-    // hash coordinate, so the money it moves feeds the water it is swimming
-    // through and the tank converges on it.
-    if (arcFeed) {
-      const whales = arcFeed.whaleIndex();
-      if (whales.size > 0) {
-        const now = Date.now();
-        for (const tx of txs) {
-          if (!tx.meta) continue;
-          const w = whales.get(tx.meta.to) ?? whales.get(tx.meta.from);
-          if (!w) continue;
-          const at = whalePosition(w.lane, now, world.config.width, world.config.height);
-          if (!at) continue;
-          tx.at = at;
-          tx.whale = { address: w.address, rank: w.rank, volume: w.volume };
-        }
-      }
-    }
-    tickWorld(world, { chain: sample.temp, market: m.temp }, txs);
+  }
+
+  /**
+   * Record a tick's meteors for the viewer (the render buffer keeps the newest
+   * 12) and for the daily report (the day's biggest fall). Runs after
+   * `tickWorld`, which is what settles where a whale transfer actually landed.
+   */
+  function noteMeteors(txs: ChainTx[]): void {
     for (const tx of txs) {
       const { x, y } = tx.at ?? txLanding(tx.hash, world.config.width, world.config.height);
       txRain.push({
@@ -435,6 +425,36 @@ export function createApp(options: AppOptions = {}) {
     for (const t of txs) {
       if (t.size > dayMaxFall.size) dayMaxFall = { day, size: t.size, hash: t.hash };
     }
+  }
+
+  async function advance(): Promise<void> {
+    const useLive = arcFeed !== null;
+    const [c, m] = await Promise.all([chainFeed.sample(), marketFeed.sample()]);
+    const failures = arcFeed ? arcFeed.consecutiveFailures : 0;
+    let sample = c;
+    let txs: ChainTx[];
+    if (useLive && failures >= 5) {
+      // RPC is down: degrade to the synthetic feed until it recovers.
+      feedStatus = 'degraded';
+      sample = await fallbackFeed.sample();
+      txs = fallbackFeed.recentTxs();
+    } else {
+      txs = chainFeed.recentTxs();
+      // 'live' means a poll has actually landed, not merely that Arc is
+      // configured. `sample()` never blocks, so a feed whose first backfill has
+      // not finished hands back its initializers and no block number — and
+      // calling that 'live' is exactly what let a tank permanently pinned at 0.5
+      // look healthy from the outside. Until a poll completes, the temperatures
+      // being fed to the sim *are* the synthetic ones, so that is what it says.
+      feedStatus = useLive && sample.blockNumber !== undefined ? 'live' : 'synthetic';
+    }
+    chainTemp = sample.temp;
+    chainDelta = sample.delta;
+    marketTemp = m.temp;
+    blockNumber = sample.blockNumber;
+    markWhales(txs);
+    tickWorld(world, { chain: sample.temp, market: m.temp }, txs);
+    noteMeteors(txs);
     scoreReports();
 
     // Social shelves advance with the world: burnt-out flares drop off and the
@@ -444,6 +464,7 @@ export function createApp(options: AppOptions = {}) {
     updateFossils();
 
     // Day Digest on-chain commit: detect day boundary and submit.
+    const day = Math.floor(world.tick / world.config.ticksPerDay);
     if (day > 0 && day !== lastCommittedDay) {
       // A new day started — commit the *previous* day's digest.
       const prevDay = day - 1;
@@ -1852,8 +1873,20 @@ export function createApp(options: AppOptions = {}) {
       const elapsed = Math.min(maxTicks, Math.floor((Date.now() - lastAdvanceAt) / 250));
       if (elapsed <= 0) return 0;
       await advance();
-      for (let i = 1; i < elapsed; i++) {
-        tickWorld(world, { chain: chainTemp, market: marketTemp }, []);
+      // `advance()` sampled the chain once and drained a single tick's worth of
+      // meteors, but the replay below covers a whole interval of real chain
+      // time. Replaying it with nothing falling would starve the one food source
+      // that carries provenance, and dumping the interval's entire fall into the
+      // first tick would blow straight past the 260-pellet ceiling and waste
+      // most of it. So drain the interval's budget here — 6 a tick, the density
+      // the 250ms loop produces — and deal it out across the replay, which is
+      // the spread that loop would have made in real time.
+      const backlog = chainFeed.recentTxs(6 * (elapsed - 1));
+      markWhales(backlog);
+      for (let i = 1, at = 0; i < elapsed; i++, at += 6) {
+        const chunk = at < backlog.length ? backlog.slice(at, at + 6) : [];
+        tickWorld(world, { chain: chainTemp, market: marketTemp }, chunk);
+        if (chunk.length > 0) noteMeteors(chunk);
       }
       // Persist the clock alongside the world. This write lands before the
       // caller's world snapshot, so a crash in between leaves the tank short a
@@ -1861,6 +1894,18 @@ export function createApp(options: AppOptions = {}) {
       // direction, since a replay would run culls and predations twice.
       saveStore();
       return elapsed;
+    },
+    /**
+     * Let the chain feed finish the poll `advance()` started but deliberately
+     * did not await. Meaningful only on a runtime that tears the isolate down
+     * between requests: there an un-awaited backfill is cancelled before it
+     * completes, the feed is rebuilt cold on the next request, and the tank runs
+     * forever on initializer temperatures with no transfer ever raining. The
+     * cron handler calls this because it has nobody waiting on it, which makes
+     * it the feed's heartbeat.
+     */
+    async warmFeed(): Promise<void> {
+      await chainFeed.settle?.();
     },
     start(ms = 250): void {
       if (timer) return;

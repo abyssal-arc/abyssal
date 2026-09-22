@@ -49,6 +49,13 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 /** Arc produces a block roughly every 500ms. */
 const BLOCK_MS = 500;
 const LOG_CHUNK_BLOCKS = 400;
+/**
+ * Per-call RPC ceiling. Without one, a hung `eth_getLogs` leaves `inflight` set
+ * forever, and since `kick()` returns the promise already in flight instead of
+ * starting a new one, the feed would never poll again for the life of the
+ * object — a wedged feed that still reports its last temperature as current.
+ */
+const RPC_TIMEOUT_MS = 10_000;
 /** Pulse chart + window stats aggregate into fixed 15s time buckets. */
 const PULSE_BUCKET_MS = 15_000;
 /** Stats / endpoint ranking / address drawer all share this observation window. */
@@ -241,6 +248,7 @@ export interface ArcFeedOptions {
   backfillBlocks?: number;
   maxFlows?: number;
   maxPulse?: number;
+  maxPending?: number;
 }
 
 export class ArcUsdcFeed implements ChainFeed {
@@ -253,6 +261,13 @@ export class ArcUsdcFeed implements ChainFeed {
   private readonly backfillBlocks: number;
   private readonly maxFlows: number;
   private readonly maxPulse: number;
+  /**
+   * Ceiling on undrained meteors. A 250ms tick loop drains 6 every tick and
+   * never gets near this; a runtime that polls once a minute accumulates a
+   * whole minute of Arc flow between drains and would silently drop most of it
+   * at the old hard-coded 160.
+   */
+  private readonly maxPending: number;
 
   private lastBlock = -1;
   private lastPollAt = 0;
@@ -277,6 +292,7 @@ export class ArcUsdcFeed implements ChainFeed {
     this.backfillBlocks = opts.backfillBlocks ?? 3600;
     this.maxFlows = opts.maxFlows ?? 6000;
     this.maxPulse = opts.maxPulse ?? 5760; // 24h of 15s buckets, for /history/pulse
+    this.maxPending = opts.maxPending ?? 2000;
   }
 
   /** Market-feed view: turbulence of the USDC flow (0..1). */
@@ -285,12 +301,7 @@ export class ArcUsdcFeed implements ChainFeed {
   }
 
   async sample(): Promise<ChainSample> {
-    const now = Date.now();
-    if (!this.inflight && now - this.lastPollAt >= this.pollEveryMs) {
-      this.inflight = this.poll(now).finally(() => {
-        this.inflight = null;
-      });
-    }
+    this.kick(Date.now());
     // Never block the tick loop on the RPC: while a poll is in flight, serve
     // the last computed temperature (stale-while-revalidate). Awaiting here
     // bunches ticks into a burst the moment the poll resolves, which the
@@ -301,14 +312,45 @@ export class ArcUsdcFeed implements ChainFeed {
     return { temp, delta, blockNumber: this.lastBlock >= 0 ? this.lastBlock : undefined };
   }
 
-  /** Drain up to 6 meteors per tick so a 2s poll burst rains smoothly. */
-  recentTxs(): ChainTx[] {
-    if (this.pendingTxs.length <= 6) {
+  /**
+   * Wait for the poll in flight, starting one if none is due.
+   *
+   * `sample()` deliberately does not await, which is right for a tick loop that
+   * runs every 250ms and wrong for a Worker isolate: there the response ends the
+   * invocation, and a poll nobody is awaiting is cancelled mid-backfill, so the
+   * feed is rebuilt from `lastBlock = -1` on the next request and never once
+   * completes. The tank then runs forever on the initializer temperatures and
+   * no transfer ever rains. This is the one place with nobody waiting on it —
+   * the cron handler calls it once a minute and the poll finishes inside the
+   * invocation instead of being cut off.
+   */
+  async settle(): Promise<void> {
+    const p = this.kick(Date.now());
+    if (p) await p;
+  }
+
+  /** Start a poll if one is due; returns the promise in flight, or null. */
+  private kick(now: number): Promise<void> | null {
+    if (this.inflight) return this.inflight;
+    if (now - this.lastPollAt < this.pollEveryMs) return null;
+    this.inflight = this.poll(now).finally(() => {
+      this.inflight = null;
+    });
+    return this.inflight;
+  }
+
+  /**
+   * Drain observed meteors. The default of 6 suits a 250ms tick loop, which
+   * spreads a 2s poll's burst smoothly; `catchUp()` passes 6 per replayed tick
+   * so a runtime that polls once a minute still rains the whole minute.
+   */
+  recentTxs(max = 6): ChainTx[] {
+    if (this.pendingTxs.length <= max) {
       const txs = this.pendingTxs;
       this.pendingTxs = [];
       return txs;
     }
-    return this.pendingTxs.splice(0, 6);
+    return this.pendingTxs.splice(0, max);
   }
 
   /**
@@ -558,19 +600,29 @@ export class ArcUsdcFeed implements ChainFeed {
         }
       }
 
-      const logs: RpcLog[] = [];
+      // The chunks go out together rather than one after another. A cold feed
+      // has to backfill `backfillBlocks` of history before it can say anything
+      // at all, and at 400 blocks a chunk, 30 minutes of Arc is nine sequential
+      // round-trips — comfortably longer than the isolate that started them
+      // stays alive, which is how a feed ends up never completing a single poll.
+      const ranges: [number, number][] = [];
       for (let start = from; start <= latest; start += LOG_CHUNK_BLOCKS) {
-        const end = Math.min(start + LOG_CHUNK_BLOCKS - 1, latest);
-        const chunk = (await this.rpc('eth_getLogs', [
-          {
-            address: this.usdc,
-            topics: [TRANSFER_TOPIC],
-            fromBlock: hex(start),
-            toBlock: hex(end),
-          },
-        ])) as RpcLog[];
-        logs.push(...chunk);
+        ranges.push([start, Math.min(start + LOG_CHUNK_BLOCKS - 1, latest)]);
       }
+      const chunks = (await Promise.all(
+        ranges.map(([s, e]) =>
+          this.rpc('eth_getLogs', [
+            {
+              address: this.usdc,
+              topics: [TRANSFER_TOPIC],
+              fromBlock: hex(s),
+              toBlock: hex(e),
+            },
+          ]),
+        ),
+      )) as RpcLog[][];
+      // Promise.all preserves order, so the flows stay block-ascending.
+      const logs: RpcLog[] = chunks.flat();
       this.consecutiveFailures = 0;
       this.lastBlock = latest;
 
@@ -591,7 +643,7 @@ export class ArcUsdcFeed implements ChainFeed {
         count++;
         volume += amount;
         if (x402) x402Count++;
-        if (!isBackfill && this.pendingTxs.length < 160) {
+        if (!isBackfill && this.pendingTxs.length < this.maxPending) {
           this.pendingTxs.push({
             hash: log.transactionHash,
             size: sizeOf(amount),
@@ -621,7 +673,24 @@ export class ArcUsdcFeed implements ChainFeed {
           .sort((a, b) => a - b)
           .map((k) => buckets.get(k)!)
           .slice(-this.maxPulse);
-        return; // the meters start ranking from the first live polls
+        // Seed the meters from the newest bucket instead of skipping them. The
+        // backfill as a whole is 30 minutes of chain in one score, and feeding
+        // that in would pin the rank at the bottom of its own window for as long
+        // as it stayed there — but a single 15s bucket is the same shape as a
+        // live poll's, so it is comparable. Without this the feed needs two
+        // completed polls before it can report anything but its initializer,
+        // which on a runtime that affords one poll a minute is two minutes of
+        // dead readings after every eviction.
+        const seed = this.pulse[this.pulse.length - 1];
+        if (seed) {
+          this.chainTemp = this.level.read(Math.log1p(seed.count) + Math.log1p(seed.volume));
+          this.prevVolume = seed.volume;
+          // No previous volume to swing against, so turbulence starts at the
+          // neutral rank; reading it still fills the window, which is what lets
+          // the first live poll move it.
+          this.marketTemp = this.turbulence.read(0);
+        }
+        return; // the meters rank live polls from here on
       }
 
       const bucketKey = Math.floor(now / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
@@ -644,6 +713,13 @@ export class ArcUsdcFeed implements ChainFeed {
       this.marketTemp = this.turbulence.read(swing);
     } catch {
       this.consecutiveFailures++;
+    } finally {
+      // Throttle from completion, not from the request. A cold backfill can take
+      // seconds, and a caller that awaited it — the cron heartbeat — would
+      // otherwise find the interval already elapsed and immediately kick off a
+      // second poll for data it is already holding, doubling the RPC load and
+      // putting two pulse buckets on the same minute.
+      this.lastPollAt = Date.now();
     }
   }
 
@@ -652,6 +728,7 @@ export class ArcUsdcFeed implements ChainFeed {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(RPC_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`RPC HTTP ${res.status}`);
     const json = (await res.json()) as { result?: unknown; error?: { message?: string } };

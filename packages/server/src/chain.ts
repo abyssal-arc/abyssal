@@ -31,8 +31,19 @@ export interface ChainTx {
 export interface ChainFeed {
   readonly name: string;
   sample(): Promise<ChainSample>;
-  /** Transactions observed since the last call. */
-  recentTxs(): ChainTx[];
+  /**
+   * Transactions observed since the last call. `max` bounds the drain; the
+   * default suits a tick loop that calls once per tick, and a runtime that can
+   * only afford one call a minute passes a larger one so a whole interval's
+   * worth of meteors comes back instead of the first tick's.
+   */
+  recentTxs(max?: number): ChainTx[];
+  /**
+   * Wait for the poll `sample()` started but deliberately did not await. Only
+   * runtimes that tear the isolate down between requests need this — see
+   * `ArcUsdcFeed.settle`.
+   */
+  settle?(): Promise<void>;
 }
 
 function clamp01(v: number): number {
@@ -86,9 +97,16 @@ export class SyntheticFeed implements ChainFeed {
     return { temp, delta };
   }
 
-  recentTxs(): ChainTx[] {
-    const txs = this.pendingTxs;
-    this.pendingTxs = [];
-    return txs;
+  recentTxs(max = 6): ChainTx[] {
+    // The cap never binds under a 250ms loop (each sample queues 2-5), so this
+    // only matters to a caller that polls once a minute and asks for the whole
+    // interval at once — it keeps `recentTxs(n)` meaning the same thing for both
+    // feeds instead of silently draining everything here.
+    if (this.pendingTxs.length <= max) {
+      const txs = this.pendingTxs;
+      this.pendingTxs = [];
+      return txs;
+    }
+    return this.pendingTxs.splice(0, max);
   }
 }
