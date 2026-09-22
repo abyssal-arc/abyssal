@@ -22,7 +22,10 @@ new_sqlite_classes = ["AbyssalWorld"]
 crons = ["* * * * *"]
 
 # Custom domain: Cloudflare issues the Universal SSL certificate for the zone
-# automatically once the domain is active on the account.
+# automatically once the domain is active on the account. www is the canonical
+# host the site is published at; the apex stays bound so a bare-domain link does
+# not dead-end, and both serve this same tank. The client calls the API by
+# relative path, so each host is same-origin with itself and needs no allowlist.
 routes = [
   { pattern = "abyssal-arc.com", custom_domain = true },
   { pattern = "www.abyssal-arc.com", custom_domain = true },

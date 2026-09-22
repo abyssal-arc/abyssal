@@ -1,7 +1,7 @@
 # ABYSSAL
 
 
-**Site: [abyssal-arc.com](https://abyssal-arc.com)** · token **ABYS**
+**Site: [www.abyssal-arc.com](https://www.abyssal-arc.com)** · token **ABYS**
 
 A 24/7 observatory for machine payments on **Arc** (Circle's L1, mainnet
 chainId **5042**, gas token **USDC**, native x402), with a living ecosystem
@@ -28,7 +28,9 @@ Two views over one data source:
   matching whale or creature.
 
 Plus an intervention panel paid by **burning ABYS**: the burn receipt is the
-payment, and nobody custodies anything.
+payment, and nobody custodies anything. Nine things are for sale — four kinds of
+weather, a day pass, and four that reach one animal: its name, its genome, a
+meteor carrying your words, and a ticket out of the cull.
 
 > Everything in this repository is original work.
 
@@ -212,10 +214,13 @@ npx wrangler secret put ABYS_TOKEN_ADDRESS   # the deployed token contract
 npx wrangler deploy                # assets + worker + DO migration
 ```
 
-Bind `abyssal-arc.com` by adding it as a Cloudflare zone (NS switch at the
-registrar) and then Workers → Custom domains, or a `routes` entry in
-`wrangler.toml`. Cloudflare issues a free Universal SSL certificate for the
-zone automatically and the custom domain terminates on it; there is no
+Bind `www.abyssal-arc.com` — the canonical host the site is published at — by
+adding `abyssal-arc.com` as a Cloudflare zone (NS switch at the registrar) and
+then Workers → Custom domains, or a `routes` entry in `wrangler.toml`. Both the
+apex and `www` are bound and both serve the same tank; the web client calls the
+API by relative path, so each host is same-origin with itself and no CORS
+allowlist is involved. Cloudflare issues a free Universal SSL certificate for
+the zone automatically and the custom domain terminates on it; there is no
 certificate management anywhere in this repo.
 
 ### One tank per deployment
@@ -245,21 +250,47 @@ tank it is looking at.
 | GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
 | GET | `/who?addr=0x…` | One address in the tank: burns, badges, day pass, board rank, its own battle reports |
 | GET | `/export?pass=0x…&kind=` | Day-pass download of the observation window: `csv`, `replay` or `digest` |
-| POST | `/intervene` | intervention gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
+| POST | `/intervene` | one of nine interventions gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | debug only: disabled unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
 | GET | `/ui` | Redirects to `/` |
 
 ## Interventions: burn-to-pay
 
-Four interventions (`packages/server/src/payments.ts`):
+Nine interventions, priced in `packages/server/src/payments.ts`:
 
 | Intervention | ABYS (burned) | Effect |
 | --- | --- | --- |
+| `pass` | 5,000 | Day pass: gates `GET /export` until the day rolls |
+| `wish` | 25,000 | A meteor crosses the tank carrying up to 60 characters and the payer's address, and breaks into 6 plankton pellets where it lands |
+| `name` | 50,000 | Naming rights on one creature — ×10 for a legend |
+| `ark` | 75,000 | One creature steps out of both culls: harvest and judgment |
 | `feed` | 100,000 | Drop food in a target area |
+| `mutate` | 100,000 | Push one of five traits on one creature up or down |
 | `poison` | 150,000 | Drain energy inside a target area (1600 ticks ≈ 6.7 min) |
 | `bloom` | 200,000 | Global food spawn ×2 (2400 ticks = 10 min) |
 | `drought` | 200,000 | Global food spawn halted (2400 ticks = 10 min) |
+
+Four of these buy weather, four buy something that happens to one animal, and
+`pass` buys a data download.
+
+**Naming a legend costs ten times the base** — 500,000 ABYS — where a legend is
+whatever `isLegendary` in the sim says is one: generation 5 or older, or 5 kills.
+The 402 quotes the multiplied price before the wallet ever opens, and `GET
+/state` hands the client both the price list and those thresholds, so the card
+and the charge cannot disagree and neither can drift from the sim.
+
+A paid **name** replaces the generated codename everywhere the tank speaks — the
+card, the leaderboards, the kill banners, the obituary, the lineage — while the
+birth codename stays on record beside it as `baseName`. A paid **edit** moves one
+of `speed`, `size`, `aggression`, `fertility` or `perception`; because the
+species is read off those same output drives, an edit can rewrite what the animal
+*is*, and the body follows the gene: radius rescales, an unnamed creature takes
+the codename of the species it became, and its children are born as whatever the
+genome now says rather than what the parent was labelled. An **ark ticket**
+exempts its holder from the predator harvest and the daily judgment, and the cull
+report names who it saved — but it is a lifeboat, not immortality: a holder with
+an empty belly still starves. Neither a name nor a ticket is inherited.
 
 `POST /intervene` is paid by destruction. The 402 response carries one `exact`
 offer naming the ABYS contract and an amount in base units; the wallet sends a
@@ -278,12 +309,18 @@ answers **503 token not deployed** and the panel says so.
 future USDC-denominated product such as the paid data tier. Interventions do
 not use it.
 
-Money enters this simulation only as weather. A paid intervention changes the
-environment (food, drains, spawn rates) and a chain transfer becomes plankton
-at a landing site; no code path writes a payment, a price or a settlement
-outcome into an individual creature's genome or brain, and the sim never pays
-anybody back. There is no agent-to-agent transfer, no prediction market and no
-reward stream: ABYS is only the unit for buying environment perturbations. `sim.test.ts` pins the environment-only half of that boundary.
+Money enters this simulation as weather, and — since the four per-animal
+actions — as surgery. What has not changed is that a payment never writes its
+own *outcome* into the world: no code path stores a price, a settlement or a
+balance in a creature's genome or brain. A paid edit is applied by `mutateTrait`,
+a deliberate aimed change kept apart from the blind `mutateGenome` every birth
+rolls, and the genome it leaves behind carries no trace of what the edit cost or
+who bought it. The sim never pays anybody back. There is no agent-to-agent
+transfer, no prediction market and no reward stream: ABYS is only the unit for
+buying perturbations, whether those land on the water or on one animal.
+`sim.test.ts` pins both halves — `money is weather` for the environmental
+actions, and the gene-edit tests for the one paid path that does reach an
+individual.
 
 Either way, an unpaid request gets **HTTP 402** with a body like:
 
