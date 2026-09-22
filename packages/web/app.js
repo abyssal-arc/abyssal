@@ -56,11 +56,20 @@ let DPR = DPR_NATIVE;
  */
 const clock = () => Date.now();
 
+/**
+ * Escape a string before it reaches innerHTML. The server strips markup out of
+ * paid names and wishes, but the tank also renders strings that never went
+ * through it (creature codenames, addresses), so the client shuts that door on
+ * its own instead of trusting the upstream filter.
+ */
+const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (m) => ESCAPES[m]);
+
 /** Buffered snapshot: raw payload + per-creature derived data in byId. */
 const snapBuffer = [];
 let latestSnap = null;        // foods, tints, dimensions come from here
 let state = null;
-let targeting = null;         // 'feed' | 'poison' | null
+let targeting = null;         // 'feed' | 'poison' | 'name' | 'mutate' | 'ark' | null
 let aimPos = null;            // cursor in world coords, for the targeting reticle
 let selectedId = null;
 let lastStats = null;
@@ -725,6 +734,23 @@ const CROWN_SPRITE = (() => {
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   g.fillText('👑', 16, 17);
+  return c;
+})();
+
+/** Shield marker for a creature holding a paid ark ticket (cyan glow-backed). */
+const SHIELD_SPRITE = (() => {
+  const c = document.createElement('canvas');
+  c.width = c.height = 32;
+  const g = c.getContext('2d');
+  const glow = g.createRadialGradient(16, 16, 1, 16, 16, 16);
+  glow.addColorStop(0, 'rgba(111, 214, 255, 0.5)');
+  glow.addColorStop(1, 'rgba(111, 214, 255, 0)');
+  g.fillStyle = glow;
+  g.fillRect(0, 0, 32, 32);
+  g.font = '16px sans-serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText('🛡', 16, 17);
   return c;
 })();
 
@@ -2733,11 +2759,27 @@ function render() {
           }
         }
       }
-      // Crown over the current top predator.
-      if (c.id === crownId) {
-        wctx.setTransform(DPR, 0, 0, DPR, px * DPR, (py - SPRITE_BODY * base * sy / sx - 26) * DPR);
+      // Crown over the current top predator; a paid ark ticket wears its shield
+      // on the same shelf, nudged aside when one creature holds both.
+      const overhead = SPRITE_BODY * base * sy / sx;
+      if (c.id === crownId || c.ark) {
+        wctx.setTransform(DPR, 0, 0, DPR, px * DPR, (py - overhead - 26) * DPR);
         wctx.globalAlpha = 0.95;
-        wctx.drawImage(CROWN_SPRITE, -16, -16);
+        if (c.id === crownId) wctx.drawImage(CROWN_SPRITE, -16, -16);
+        if (c.ark) wctx.drawImage(SHIELD_SPRITE, c.id === crownId ? 6 : -16, -16);
+        wctx.globalAlpha = 1;
+      }
+      // A paid name floats above everything else on that creature. It is cheap
+      // enough to leave always on: only a life somebody burned ABYS for has one,
+      // and paying 50 000 ABYS to have it invisible at tank zoom would be a lie.
+      if (c.baseName) {
+        wctx.setTransform(DPR, 0, 0, DPR, px * DPR, (py - overhead - 46) * DPR);
+        wctx.globalAlpha = 0.7;
+        wctx.fillStyle = '#ffd166';
+        wctx.font = '8px ui-monospace, SFMono-Regular, Menlo, monospace';
+        wctx.textAlign = 'center';
+        wctx.textBaseline = 'alphabetic';
+        wctx.fillText(c.name, 0, 0);
         wctx.globalAlpha = 1;
       }
     }
@@ -2830,6 +2872,29 @@ function render() {
       wctx.setTransform(DPR * s, 0, 0, DPR * s, px * DPR, py * DPR);
       wctx.drawImage(METEOR_SPRITE, -16, -46);
       wctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      if (e.wish) {
+        // A wishing meteor carries its words down with it: the message and the
+        // short address that paid for them, riding just above the tail so the
+        // tank reads the burn as speech and not as weather. Truncated because
+        // sixty characters at this size would span the whole screen.
+        const fade = Math.max(0, Math.min(1, 1.4 - k));
+        const words = e.wish.message.length > 34
+          ? `${e.wish.message.slice(0, 34)}…`
+          : e.wish.message;
+        wctx.textAlign = 'center';
+        wctx.textBaseline = 'alphabetic';
+        wctx.globalAlpha = fade;
+        wctx.fillStyle = '#ffc98a';
+        wctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        wctx.fillText(`“${words}”`, px, py - 34 * s);
+        if (e.wish.addr) {
+          wctx.globalAlpha = fade * 0.65;
+          wctx.fillStyle = '#9fb4d8';
+          wctx.font = '8px ui-monospace, SFMono-Regular, Menlo, monospace';
+          wctx.fillText(shortAddr(e.wish.addr), px, py - 22 * s);
+        }
+        wctx.globalAlpha = 1;
+      }
       if (k > 0.92 && !e.impacted) {
         e.impacted = true;
         const sd = e.seed;
@@ -3175,13 +3240,18 @@ function renderObituaries(culls) {
           const days = ((v.age ?? 0) / ticksPerDay).toFixed(1);
           const color = ARCHETYPE_COLORS[v.archetype] ?? '#888';
           const label = v.name ?? `#${v.id}`;
-          return `<div class="obit"><i class="odot" style="background:${color}"></i>${label} <span class="obit-sub">${t('obitLived', { gen: v.generation, days })}</span></div>`;
+          return `<div class="obit"><i class="odot" style="background:${color}"></i>${esc(label)} <span class="obit-sub">${t('obitLived', { gen: v.generation, days })}</span></div>`;
         })
+        .join('');
+      // The ones the cull reached for and could not take: an ark ticket shows
+      // up in the ledger next to the deaths it prevented, not only as a flash.
+      const savedRows = (j.saved ?? [])
+        .map((s) => `<div class="obit saved"><i class="odot" style="background:#7ee2a8"></i>🛡 ${esc(s.name ?? `#${s.id}`)} <span class="obit-sub">${esc(t('arkSaveFlash'))}</span></div>`)
         .join('');
       const note = j.type === 'judgment'
         ? `<div class="obit-note">${t('obitJudgmentNote')}</div>`
         : '';
-      return `<div class="obit-group ${j.type}"><div class="obit-title">${title}</div>${note}${rows}</div>`;
+      return `<div class="obit-group ${j.type}"><div class="obit-title">${title}</div>${note}${savedRows}${rows}</div>`;
     })
     .join('');
 }
@@ -3217,6 +3287,7 @@ function handleTxRain(txRain) {
       pushEffect({
         kind: 'meteor', x: tx.x, y: tx.y, size: tx.size, dur: 700, impacted: false, seed,
         hue: fed ? PALETTE_HUES[owner.lane.seed % HUE_BUCKETS] : null,
+        wish: tx.wish ?? null,
       });
       meteorsThisBatch++;
     }
@@ -3247,7 +3318,8 @@ function renderRainList(txRain) {
     div.className = 'tx';
     const meta = tx.meta;
     div.innerHTML = `<span>${tx.hash.slice(0, 8)}…${tx.hash.slice(-4)}</span>` +
-      (meta ? `<span class="amt">${meta.amount >= 1000 ? fmtUsd(meta.amount) : `${meta.amount.toFixed(2)}$`}</span>` : '') +
+      (tx.wish ? `<span class="wish">🌠 ${esc(tx.wish.message)}</span>`
+        : meta ? `<span class="amt">${meta.amount >= 1000 ? fmtUsd(meta.amount) : `${meta.amount.toFixed(2)}$`}</span>` : '') +
       `<span class="sizebar" style="width:${4 + Math.round(tx.size * 30)}px"></span>` +
       (meta?.x402 ? '<span class="x4">x402</span>' : '') +
       (tx.simulated ? '<span class="sim">sim</span>' : '');
@@ -3456,6 +3528,19 @@ function handleEvents(events, bootstrap = false) {
           spawnBurst(p.x, p.y, [DOTS.gray, DOTS.purple], 5, 800, 1.2, sd + i);
         });
         pushEventLine(e.type, t(e.type === 'harvest' ? 'evtHarvest' : 'evtJudgment', { count: e.count }));
+        // Somebody paid to keep these out of the cull: light them green instead
+        // of grey and say so, or the ticket buys nothing the tank can see.
+        const savedBy = (e.saved ?? []).slice(0, 6);
+        for (let i = 0; i < savedBy.length; i++) {
+          const s = savedBy[i];
+          spawnRing(s.x, s.y, 34, 'rgba(126, 226, 168, 0.95)', 900);
+          spawnBurst(s.x, s.y, [DOTS.green, DOTS.white], 6, 620, 1.6, sd + 100 + i);
+          spawnFloatText(s.x, s.y - 20, t('arkSaveFlash'), '#7ee2a8');
+          pushEventLine('ark', t(
+            e.type === 'harvest' ? 'evtArkSaveHarvest' : 'evtArkSaveJudgment',
+            { name: s.name ?? `#${s.id}` },
+          ));
+        }
         break;
       }
       case 'intervention':
@@ -3482,6 +3567,77 @@ function handleEvents(events, bootstrap = false) {
           }));
         }
         break;
+      /* The four paid actions aimed at one life. Each gets its own colour in
+         the ticker and its own mark on the water, so spending on a creature
+         never reads as another weather event. */
+      case 'naming': {
+        spawnRing(e.x, e.y, 32, 'rgba(255, 209, 102, 0.9)', 800);
+        spawnBurst(e.x, e.y, [DOTS.white], 8, 620, 1.8, sd);
+        spawnFloatText(e.x, e.y - 22, `“${e.message ?? ''}”`, '#ffd166');
+        pushEventLine('naming', t('evtNaming', { old: e.name ?? '?', name: e.message ?? '?' }));
+        if (e.payer) {
+          pushEventLine('naming', t('evtInterventionBy', {
+            who: shortAddr(e.payer), amount: e.paid ?? '',
+          }));
+        }
+        break;
+      }
+      case 'wish': {
+        // The fall itself arrives on the txRain channel, which is what draws
+        // the meteor and its words; only the ticker line is ours here.
+        pushEventLine('wish', t('evtWish', {
+          who: e.payer ? shortAddr(e.payer) : '?',
+          message: e.message ?? '',
+          x: Math.round(e.x ?? 0),
+          y: Math.round(e.y ?? 0),
+        }));
+        if (e.payer && e.paid) {
+          pushEventLine('wish', t('evtInterventionBy', {
+            who: shortAddr(e.payer), amount: e.paid,
+          }));
+        }
+        break;
+      }
+      case 'mutation': {
+        // The white flash the buyer paid for: one ring, one burst, the trait
+        // name rising off the body.
+        spawnRing(e.x, e.y, 28, 'rgba(255, 255, 255, 0.95)', 460);
+        spawnBurst(e.x, e.y, [DOTS.white, DOTS.purple], 10, 560, 2.4, sd);
+        const traitLabel = e.trait ? t(`trait_${e.trait}`) : '';
+        if (traitLabel) spawnFloatText(e.x, e.y - 20, traitLabel, '#b48cff');
+        pushEventLine('mutation', t('evtMutation', {
+          name: e.name ?? '?',
+          trait: traitLabel,
+          direction: t(e.direction === 'suppress' ? 'dirSuppress' : 'dirBoost'),
+        }));
+        // The sim only sets this when the edit redrew the drives a species is
+        // read off, so the body changed shape too. Say it: a viewer who blinked
+        // would otherwise see a whale where a fish was and have no reason why.
+        if (e.archetype) {
+          spawnFloatText(e.x, e.y - 36, e.archetype, '#9fd8ff');
+          pushEventLine('mutation', t('evtMutateBecame', {
+            name: e.name ?? '?', species: e.archetype,
+          }));
+        }
+        if (e.payer) {
+          pushEventLine('mutation', t('evtInterventionBy', {
+            who: shortAddr(e.payer), amount: e.paid ?? '',
+          }));
+        }
+        break;
+      }
+      case 'ark': {
+        spawnRing(e.x, e.y, 40, 'rgba(126, 226, 168, 0.9)', 1000);
+        spawnBurst(e.x, e.y, [DOTS.green, DOTS.white], 10, 700, 1.8, sd);
+        spawnFloatText(e.x, e.y - 20, '🛡', '#7ee2a8');
+        pushEventLine('ark', t('ivArkSuccess', { name: e.name ?? '?' }));
+        if (e.payer) {
+          pushEventLine('ark', t('evtInterventionBy', {
+            who: shortAddr(e.payer), amount: e.paid ?? '',
+          }));
+        }
+        break;
+      }
     }
   }
 }
@@ -3587,7 +3743,13 @@ function payReasonText(reason) {
   return key ? t(key) : reason;
 }
 
-async function intervene(body) {
+/**
+ * Run one paid intervention end to end: ask for the price, burn it, retry while
+ * the receipt is still missing from the RPC, then say what it bought.
+ * `okToast` lets a caller replace the generic receipt line with copy that
+ * carries what the buyer actually typed (a name, a wish, a trait).
+ */
+async function intervene(body, okToast) {
   try {
     const send = (headers) => fetch('/intervene', {
       method: 'POST',
@@ -3632,10 +3794,18 @@ async function intervene(body) {
     if (data === null) data = await res.json();
     if (res.status === 402) {
       toast(t('payFailed', { reason: payReasonText(data.reason ?? data.error) }), true);
+    } else if (res.status === 409) {
+      // The server refused to take the money's worth: the target died or was
+      // already ark'd while the burn was being verified. The receipt is still
+      // spendable, so say that out loud instead of reporting a failure.
+      toast(data.refunded ? t('ivTargetGone') : t('failed', { error: data.error ?? res.status }), true);
+      if (selectedId != null) setTimeout(refreshSelectedCard, 120);
     } else if (!res.ok) {
       toast(t('failed', { error: data.error ?? res.status }), true);
     } else if (data.settlement?.tx) {
-      toast(t('paidApplied', { receipt: data.receipt, tx: `${data.settlement.tx.slice(0, 10)}…` }));
+      toast(okToast
+        ? okToast(data)
+        : t('paidApplied', { receipt: data.receipt, tx: `${data.settlement.tx.slice(0, 10)}…` }));
     } else if (body.type === 'feed') {
       toast(t('ivFeedResult', { amount: data.amount ?? '?', count: data.affected ?? 0 }));
     } else if (body.type === 'poison') {
@@ -3644,35 +3814,264 @@ async function intervene(body) {
       toast(t('applied', { receipt: data.receipt }));
     }
     // A paid action can mint a badge: refresh the standing right away.
-    if (res.ok) resolveMe().then(fetchMe);
+    if (res.ok) {
+      resolveMe().then(fetchMe);
+      // The card is only rebuilt on a language change or a new pick, so a
+      // purchase that renamed or sheltered the selected creature has to be
+      // pulled in by hand once the next snapshot has landed.
+      if (body.creatureId != null) setTimeout(refreshSelectedCard, POLL_MS + 200);
+    }
   } catch (err) {
     toast(t('requestFailed', { error: err }), true);
   }
+}
+
+/** Re-render the card for the selected creature from the freshest snapshot. */
+function refreshSelectedCard() {
+  if (selectedId == null || !latestSnap) return;
+  const c = latestSnap.byId.get(selectedId);
+  renderCard(c ?? null);
+}
+
+/* ---------- the paid actions aimed at one creature ---------- */
+
+/** Types that need a living body picked out of the tank before they pay. */
+const TARGETED_IV = ['name', 'mutate', 'ark'];
+/** Fallback until the first state poll hands down the server's own list. */
+const GENE_TRAITS_FALLBACK = ['speed', 'size', 'aggression', 'fertility', 'perception'];
+
+const ivModal = document.getElementById('iv-modal');
+const ivModalTitle = document.getElementById('iv-modal-title');
+const ivModalBody = document.getElementById('iv-modal-body');
+const ivModalPrice = document.getElementById('iv-modal-price');
+const ivModalOk = document.getElementById('iv-modal-ok');
+/** Runs on confirm; true means it dispatched a payment and may close. */
+let ivModalSubmit = null;
+
+/** List price in whole ABYS, or null before the first state poll has landed. */
+function priceOf(type) {
+  return state?.prices?.[type] ?? null;
+}
+
+/**
+ * The same predicate the server charges by: past generation five, or five
+ * kills, and the creature is a legend — naming one costs ten times the base.
+ * The thresholds arrive in the state payload so the card can never quote a
+ * number the 402 is about to contradict.
+ */
+function legendaryOf(c) {
+  if (!c) return false;
+  if (c.legendary === true) return true;
+  return (c.generation ?? 0) >= (state?.legendary?.generation ?? 5)
+    || (c.kills ?? 0) >= (state?.legendary?.kills ?? 5);
+}
+
+function closeIvModal() {
+  ivModal.hidden = true;
+  ivModalSubmit = null;
+  ivModalBody.innerHTML = '';
+}
+
+/** The text field shared by the name and the wish dialogs, with a live counter. */
+function ivTextField(max, value = '') {
+  return '<label class="iv-field">' +
+    `<input id="iv-text" type="text" maxlength="${max}" autocomplete="off" spellcheck="false" value="${esc(value)}">` +
+    `<span class="iv-count" id="iv-count">0/${max}</span>` +
+    '</label>';
+}
+
+/**
+ * One dialog, four shapes: a field for the name and the wish, a trait picker
+ * for the genome edit, a plain confirmation for the ark ticket. Everything the
+ * buyer types stays client-side until confirm, so a cancelled dialog is free.
+ */
+function openIvModal(type, creature) {
+  const who = creature?.name ?? '';
+  let title = '';
+  let html = '';
+  let legendary = false;
+  let submit = null;
+  let maxLen = 0;
+
+  if (type === 'wish') {
+    maxLen = 60;
+    title = t('ivWishPrompt');
+    html = ivTextField(maxLen) + `<div class="iv-sub">${esc(t('ivWishNote'))}</div>`;
+    submit = () => {
+      const message = ivModalBody.querySelector('#iv-text').value.trim();
+      if (!message) return false;
+      intervene({ type: 'wish', message }, () => t('ivWishSuccess', { message }));
+      return true;
+    };
+  } else if (type === 'name') {
+    maxLen = 24;
+    legendary = legendaryOf(creature);
+    title = t('ivNamePrompt', { name: who });
+    html = ivTextField(maxLen, creature.baseName ? who : '') +
+      `<div class="iv-sub">${esc(t('ivNameNote'))}</div>` +
+      (legendary
+        ? `<div class="iv-warn">${esc(t('ivNameLegendary', {
+            name: who,
+            gen: creature.generation ?? 0,
+            kills: creature.kills ?? 0,
+            price: state?.legendaryNamePrice ?? '?',
+            base: priceOf('name') ?? '?',
+          }))}</div>`
+        : '');
+    submit = () => {
+      const name = ivModalBody.querySelector('#iv-text').value.trim();
+      if (!name) return false;
+      intervene(
+        { type: 'name', creatureId: creature.id, name },
+        () => t('ivNameSuccess', { name }),
+      );
+      return true;
+    };
+  } else if (type === 'mutate') {
+    const traits = state?.geneTraits?.length ? state.geneTraits : GENE_TRAITS_FALLBACK;
+    title = t('ivMutatePrompt', { name: who });
+    html = `<div class="iv-sub">${esc(t('ivMutateTrait'))}</div><div class="trait-list">` +
+      traits.map((tr, i) => '<label class="trait-opt">' +
+        `<input type="radio" name="iv-trait" value="${esc(tr)}"${i === 0 ? ' checked' : ''}>` +
+        `<span>${esc(t(`trait_${tr}`))}</span></label>`).join('') +
+      '</div><div class="seg" id="iv-dir" data-dir="boost">' +
+      `<label class="trait-opt"><input type="radio" name="iv-dir" value="boost" checked><span>${esc(t('ivMutateBoost'))}</span></label>` +
+      `<label class="trait-opt"><input type="radio" name="iv-dir" value="suppress"><span>${esc(t('ivMutateSuppress'))}</span></label>` +
+      `</div><div class="iv-sub">${esc(t('ivMutateNote'))}</div>`;
+    submit = () => {
+      const trait = ivModalBody.querySelector('input[name="iv-trait"]:checked')?.value;
+      const direction = ivModalBody.querySelector('input[name="iv-dir"]:checked')?.value;
+      if (!trait || !direction) return false;
+      intervene(
+        { type: 'mutate', creatureId: creature.id, trait, direction },
+        () => t('ivMutateSuccess', {
+          name: who,
+          trait: t(`trait_${trait}`),
+          direction: t(direction === 'suppress' ? 'dirSuppress' : 'dirBoost'),
+        }),
+      );
+      return true;
+    };
+  } else if (type === 'ark') {
+    if (creature.ark) {
+      toast(t('ivArkHeld'), true);
+      return;
+    }
+    title = t('ivArkPrompt', { name: who });
+    html = `<div class="iv-target">🛡 ${esc(who)}${creature.archetype ? ` · ${esc(creature.archetype)}` : ''}</div>` +
+      `<div class="iv-sub">${esc(t('ivArkNote'))}</div>`;
+    submit = () => {
+      intervene({ type: 'ark', creatureId: creature.id }, () => t('ivArkSuccess', { name: who }));
+      return true;
+    };
+  } else {
+    return;
+  }
+
+  ivModalTitle.textContent = title;
+  ivModalBody.innerHTML = html;
+  const abys = legendary ? (state?.legendaryNamePrice ?? '?') : (priceOf(type) ?? '?');
+  ivModalPrice.textContent = `${abys} ABYS · ${t('burnLabel')}`;
+  ivModalSubmit = submit;
+  ivModal.hidden = false;
+
+  // The boost/suppress segment recolours itself as you switch sides, so the
+  // colour of the choice and the colour of the mutation flash agree.
+  const seg = ivModalBody.querySelector('#iv-dir');
+  if (seg) {
+    for (const r of seg.querySelectorAll('input[name="iv-dir"]')) {
+      r.addEventListener('change', () => { seg.dataset.dir = r.value; });
+    }
+  }
+  const field = ivModalBody.querySelector('#iv-text');
+  if (field) {
+    const counter = ivModalBody.querySelector('#iv-count');
+    const sync = () => {
+      counter.textContent = `${field.value.length}/${maxLen}`;
+      counter.classList.toggle('over', field.value.length >= maxLen);
+    };
+    field.addEventListener('input', sync);
+    sync();
+    field.focus();
+    field.select();
+  } else {
+    ivModalOk.focus();
+  }
+}
+
+ivModalOk.addEventListener('click', () => {
+  if (ivModalSubmit && ivModalSubmit() === true) closeIvModal();
+  else ivModalBody.querySelector('#iv-text')?.focus();
+});
+document.getElementById('iv-modal-cancel').addEventListener('click', closeIvModal);
+document.getElementById('iv-modal-x').addEventListener('click', closeIvModal);
+// Only a press that starts on the backdrop closes it: a drag that happens to
+// end outside the dialog must not throw away what somebody typed.
+ivModal.addEventListener('mousedown', (ev) => {
+  if (ev.target === ivModal) closeIvModal();
+});
+ivModalBody.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter' || ev.target?.id !== 'iv-text') return;
+  ev.preventDefault();
+  ivModalOk.click();
+});
+
+function disarmIv() {
+  targeting = null;
+  document.body.classList.remove('targeting');
+  document.querySelectorAll('button.iv').forEach((b) => b.classList.remove('armed'));
+  document.getElementById('target-hint').hidden = true;
+  document.getElementById('pick-hint').hidden = true;
+}
+
+function armIv(type, btn) {
+  targeting = type;
+  document.body.classList.add('targeting');
+  btn.classList.add('armed');
+  document.getElementById(TARGETED_IV.includes(type) ? 'pick-hint' : 'target-hint').hidden = false;
 }
 
 document.querySelectorAll('button.iv').forEach((btn) => {
   btn.addEventListener('click', () => {
     const type = btn.dataset.type;
     if (type === 'bloom' || type === 'drought') {
+      disarmIv();
       intervene({ type });
       return;
     }
+    if (type === 'wish') {
+      // Nothing to aim at: the sim picks the landing, that is part of the buy.
+      disarmIv();
+      openIvModal('wish', null);
+      return;
+    }
+    if (TARGETED_IV.includes(type)) {
+      const picked = selectedId != null ? latestSnap?.byId.get(selectedId) : null;
+      if (picked) {
+        // Something is already selected, so spend on that instead of sending
+        // the viewer back into the water to find the same creature again.
+        disarmIv();
+        openIvModal(type, picked);
+        return;
+      }
+      if (targeting === type) { disarmIv(); return; }
+      disarmIv();
+      armIv(type, btn);
+      return;
+    }
     // feed / poison: arm targeting mode, next canvas click picks the area.
-    targeting = targeting === type ? null : type;
-    document.body.classList.toggle('targeting', targeting != null);
-    document.querySelectorAll('button.iv').forEach((b) => b.classList.remove('armed'));
-    if (targeting) btn.classList.add('armed');
-    document.getElementById('target-hint').hidden = !targeting;
+    if (targeting === type) { disarmIv(); return; }
+    disarmIv();
+    armIv(type, btn);
   });
 });
 
-// Esc disarms targeting (the welcome card and hint both advertise it).
+// Esc closes an open dialog first, then disarms targeting (the welcome card and
+// both hints advertise it).
 window.addEventListener('keydown', (ev) => {
-  if (ev.key !== 'Escape' || !targeting) return;
-  targeting = null;
-  document.body.classList.remove('targeting');
-  document.querySelectorAll('button.iv').forEach((b) => b.classList.remove('armed'));
-  document.getElementById('target-hint').hidden = true;
+  if (ev.key !== 'Escape') return;
+  if (!ivModal.hidden) { closeIvModal(); return; }
+  if (targeting) disarmIv();
 });
 
 function canvasToWorld(ev) {
@@ -3690,11 +4089,24 @@ worldCanvas.addEventListener('click', (ev) => {
   if (!latestSnap) return;
   const pos = canvasToWorld(ev);
   if (targeting) {
+    if (TARGETED_IV.includes(targeting)) {
+      // A creature action has to land on a body: open water buys nothing here,
+      // so say what is missing and stay armed rather than disarming on a miss.
+      const picked = creatureHitAt(ev);
+      const c = picked && latestSnap.byId.get(picked.id);
+      if (!c) {
+        toast(t('ivNeedTarget'), true);
+        return;
+      }
+      const type = targeting;
+      disarmIv();
+      selectedId = c.id;
+      renderCard(c);
+      openIvModal(type, c);
+      return;
+    }
     intervene({ type: targeting, x: Math.round(pos.x), y: Math.round(pos.y), radius: 80 });
-    targeting = null;
-    document.body.classList.remove('targeting');
-    document.querySelectorAll('button.iv').forEach((b) => b.classList.remove('armed'));
-    document.getElementById('target-hint').hidden = true;
+    disarmIv();
     return;
   }
   // Picking follows paint order, sim creatures on top of the resident chain
@@ -3752,8 +4164,9 @@ worldCanvas.addEventListener('mousemove', (ev) => {
   const hit = creatureHitAt(ev);
   const c = hit && latestSnap.byId.get(hit.id);
   if (c) {
-    showTip(ev, `<b>${c.name ?? `${t('creature')} #${c.id}`}</b> · ${c.archetype}<br>` +
-      `${t('energy')} ${c.energy.toFixed(0)} · ${t('generation')} G${c.generation}`);
+    showTip(ev, `<b>${esc(c.name ?? `${t('creature')} #${c.id}`)}</b>${c.ark ? ' 🛡' : ''} · ${esc(c.archetype)}<br>` +
+      `${t('energy')} ${c.energy.toFixed(0)} · ${t('generation')} G${c.generation}` +
+      (c.baseName ? `<br><span class="tip-base">${esc(c.baseName)}</span>` : ''));
     return;
   }
   const wh = whaleHitAt(ev);
@@ -3835,9 +4248,20 @@ function renderCard(c) {
       `${t('mealMeteor', { usd: c.mealUsd ? fmtUsd(c.mealUsd) : '?' })} · ${shortAddr(c.mealTx)}</a>`
     : c.maxMeal > 0 ? t('mealPlain', { e: c.maxMeal.toFixed(1) }) : t('mealNone');
   el.hidden = false;
+  // A paid name replaces the species codename in the payload, and the codename
+  // rides along as baseName — so its presence is the marker that says "somebody
+  // bought this a name", and the two are shown side by side.
+  const named = !!c.baseName;
+  const titleHtml = named
+    ? `<span class="cname">${esc(c.name)}</span> <span class="cbase">${esc(c.baseName)}</span>`
+    : `<span class="cid">${esc(c.name ?? `${t('creature')} #${c.id}`)}</span>`;
+  const tags =
+    (c.ark ? `<span class="card-tag ark" title="${esc(t('ivArkProtected', { who: c.arkBy ? shortAddr(c.arkBy) : '?' }))}">🛡 ${esc(t('ivArk'))}</span>` : '') +
+    (legendaryOf(c) ? `<span class="card-tag legend">★</span>` : '');
   el.innerHTML = `
     <div><span class="dot" style="background:hsl(${hue},${Math.round(c.sat * 100)}%,${Math.round(c.light * 100)}%)"></span>
-    <span class="cid">${c.name ?? `${t('creature')} #${c.id}`}</span> · ${c.archetype}</div>
+    ${titleHtml} · ${esc(c.archetype)}${tags}</div>
+    ${c.ark ? `<div class="card-ark">🛡 ${esc(t('ivArkProtected', { who: c.arkBy ? shortAddr(c.arkBy) : '?' }))}</div>` : ''}
     ${line('storyState', `${t(cond)}${t('condPct', { pct: Math.round(ratio * 100) })}`)}
     ${line('storyPersona', personaWords(c.persona ?? 21))}
     ${line('storyRecord', kills === 0 ? t('tierNone') : `${t(killTier(kills))}${t('killsLine', { n: kills })}`)}
@@ -3848,6 +4272,11 @@ function renderCard(c) {
     <div class="card-actions">
       <button id="watch-btn" class="dock-btn">${watched.has(c.id) ? t('unwatch') : t('watch')}</button>
       <button id="adv-btn" class="dock-btn mini">${cardAdvanced ? t('advancedHide') : t('advanced')}</button>
+    </div>
+    <div class="card-actions">
+      <button id="card-name-btn" class="dock-btn mini">${t('ivName')}</button>
+      <button id="card-mutate-btn" class="dock-btn mini">${t('ivMutate')}</button>
+      ${c.ark ? '' : `<button id="card-ark-btn" class="dock-btn mini">${t('ivArk')}</button>`}
     </div>
     <div id="card-adv" ${cardAdvanced ? '' : 'hidden'}>
       ${line('energy', `${c.energy.toFixed(1)} / ${maxEnergy}`)}
@@ -3866,6 +4295,12 @@ function renderCard(c) {
     cardAdvanced = !cardAdvanced;
     renderCard(c);
   };
+  // The three paid actions live on the card too, so picking a creature in the
+  // water is one click from spending on it — no hunting through the panel.
+  el.querySelector('#card-name-btn').onclick = () => openIvModal('name', c);
+  el.querySelector('#card-mutate-btn').onclick = () => openIvModal('mutate', c);
+  const arkBtn = el.querySelector('#card-ark-btn');
+  if (arkBtn) arkBtn.onclick = () => openIvModal('ark', c);
 }
 
 /* ---------- daily propositions, burners, replay, export ---------- */

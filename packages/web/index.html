@@ -172,8 +172,14 @@
       <button class="iv" data-type="poison"><span data-i18n="poison">Poison</span> <span class="price">150000 ABYS</span></button>
       <button class="iv" data-type="bloom"><span data-i18n="bloom">Bloom</span> <span class="price">200000 ABYS</span></button>
       <button class="iv" data-type="drought"><span data-i18n="drought">Drought</span> <span class="price">200000 ABYS</span></button>
-      <button class="iv" data-type="pass"><span data-i18n="passLabel">Day pass</span> <span class="price">20000 ABYS</span></button>
+      <button class="iv" data-type="pass"><span data-i18n="passLabel">Day pass</span> <span class="price">5000 ABYS</span></button>
+      <p class="iv-group" data-i18n="ivGroupOne">On one creature</p>
+      <button class="iv" data-type="name"><span data-i18n="ivName">Name it</span> <span class="price">50000 ABYS</span></button>
+      <button class="iv" data-type="mutate"><span data-i18n="ivMutate">Edit genome</span> <span class="price">100000 ABYS</span></button>
+      <button class="iv" data-type="ark"><span data-i18n="ivArk">Ark ticket</span> <span class="price">75000 ABYS</span></button>
+      <button class="iv" data-type="wish"><span data-i18n="ivWish">Wishing meteor</span> <span class="price">25000 ABYS</span></button>
       <p class="hint" id="target-hint" data-i18n="targetHint" hidden>Click the canvas to pick a target area; click the button again to cancel.</p>
+      <p class="hint" id="pick-hint" data-i18n="pickHint" hidden>Click the creature you want to spend this on; click the button again to cancel.</p>
       <div id="toast" hidden></div>
       <div id="creature-card" hidden></div>
       <div class="sub-head" data-collapse="events-wrap">
@@ -257,6 +263,22 @@
       <p data-i18n="welcomeL3"></p>
       <p data-i18n="welcomeL4"></p>
       <button id="enter" class="cta" data-i18n="enterTank">Enter the tank</button>
+    </div>
+  </div>
+
+  <!-- Paid interventions that need words or choices: one dialog, four shapes. -->
+  <div id="iv-modal" class="modal-back" hidden>
+    <div class="modal glass" role="dialog" aria-modal="true" aria-labelledby="iv-modal-title">
+      <div class="modal-head">
+        <span id="iv-modal-title" class="section-title"></span>
+        <button id="iv-modal-x" class="modal-x" aria-label="close">×</button>
+      </div>
+      <div id="iv-modal-body" class="modal-body"></div>
+      <div class="modal-foot">
+        <span id="iv-modal-price" class="modal-price"></span>
+        <button id="iv-modal-cancel" class="dock-btn mini" data-i18n="ivCancel">Cancel</button>
+        <button id="iv-modal-ok" class="cta mini" data-i18n="ivConfirm">Burn &amp; apply</button>
+      </div>
     </div>
   </div>
 
