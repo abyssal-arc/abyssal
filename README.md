@@ -207,7 +207,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (109 total)
+npm test           # sim + server + web tests (110 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -345,6 +345,18 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   now drains `6 × (ticks − 1)` and deals them out six a tick — the density the
   250ms loop produces — so the minute's transfers all land instead of only the
   first six.
+- **A tick-loop constant hiding in the data itself.** Telling a relayed transfer
+  from a plain one — the x402 signal this observatory is named after — needs the
+  submitting tx, which means full blocks, and those were only fetched when a poll
+  spanned 24 blocks or fewer. That ceiling fits the default 2s poll interval with
+  room to spare and nothing slower: Arc produces a block every 500ms (measured on
+  mainnet, 0.500–0.510 s/block over the last 600), so a cron-spaced poll spans
+  ~120 and the gate never opened. Every flow came back `x402: null` and the
+  machine-payment share read as exactly zero — intermittently, which is worse
+  than never, because a viewer polling fast enough did fit under the gate.
+  Senders now come in batches of 24 out to `MAX_SENDER_BLOCKS`, trading
+  round-trips for the same concurrency, and a failed batch leaves those flows
+  unknown rather than costing the whole poll.
 
 ```bash
 npx wrangler login                           # once, browser OAuth
@@ -592,12 +604,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-109 tests on `node:test`, no test framework dependency:
+110 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 47 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, the chain feed's heartbeat against a stubbed JSON-RPC |
+| `@abyssal/server` | 48 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, the chain feed's heartbeat and its x402 sender resolution against a stubbed JSON-RPC |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs

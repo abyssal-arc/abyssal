@@ -1249,46 +1249,63 @@ test('a clock from the future is ignored instead of pinning the tank', async () 
 /* ---------- the chain feed's heartbeat in a runtime with no interval ---------- */
 
 /**
- * A JSON-RPC stub answering the three calls a poll makes: the head, the log
- * chunks, and the blocks that carry tx senders. `transfersPerChunk` fills each
- * `eth_getLogs` range with 1 USDC transfers, which is enough to give the flow
- * ring and the pulse series something to hold. `calls` counts polls so a test can
- * tell one round of RPC from two, and `delayMs` makes a poll slow enough to
- * outlast the feed's own throttle — without it a local stub answers in under a
- * millisecond and the throttle can never be observed expiring.
+ * A JSON-RPC stub answering the calls a poll makes: the head, the log chunks,
+ * and the full blocks that carry tx senders. `transfersPerChunk` fills each
+ * `eth_getLogs` range with that many USDC transfers, enough to give the flow
+ * ring and the pulse series something to hold. Every block reports its transfer
+ * as submitted by a relayer rather than by the payer, which is the x402 signal,
+ * so a poll that resolves senders at all is observable in `stats.x402Count`.
+ * `calls` counts polls and block fetches so a test can tell one round of RPC
+ * from two, `setHead` moves the chain forward between polls to widen a span,
+ * and `delayMs` makes a poll slow enough to outlast the feed's own throttle —
+ * without it a local stub answers in under a millisecond and the throttle can
+ * never be observed expiring.
  */
 function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0) {
   const from = '0x' + 'cd'.repeat(20);
   const to = '0x' + 'ef'.repeat(20);
+  /** Submits the transfer on the payer's behalf: `tx.from != transfer.from`. */
+  const relayer = '0x' + 'ab'.repeat(20);
   const topic = (a: string) => `0x${a.slice(2).padStart(64, '0')}`;
-  const calls = { heads: 0 };
+  /**
+   * Keyed by the block that carries it, so `eth_getLogs` and
+   * `eth_getBlockByNumber` agree on which hash belongs to which block and a
+   * sender lookup can actually hit.
+   */
+  const txHash = (n: number) => `0x${(n * 100).toString(16).padStart(64, '0')}`;
+  const calls = { heads: 0, blocks: 0 };
+  let currentHead = head;
   const server = createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
-    const call = JSON.parse(body || '{}') as { method?: string; params?: Record<string, string>[] };
+    const call = JSON.parse(body || '{}') as { method?: string; params?: unknown[] };
     // Counted on arrival, before the delay: a redundant poll is dispatched
     // asynchronously, and counting it only when answered would let an assertion
     // run before the extra request had shown up.
     if (call.method === 'eth_blockNumber') calls.heads++;
+    if (call.method === 'eth_getBlockByNumber') calls.blocks++;
     if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
-    const p = call.params?.[0] ?? {};
     let result: unknown = { transactions: [] };
     if (call.method === 'eth_blockNumber') {
-      result = `0x${head.toString(16)}`;
+      result = `0x${currentHead.toString(16)}`;
+    } else if (call.method === 'eth_getBlockByNumber') {
+      const n = parseInt(call.params?.[0] as string, 16);
+      result = { number: call.params?.[0], transactions: [{ hash: txHash(n), from: relayer }] };
     } else if (call.method === 'eth_getLogs') {
+      const p = (call.params?.[0] ?? {}) as Record<string, string>;
       const start = parseInt(p.fromBlock, 16);
       result = Array.from({ length: transfersPerChunk }, (_, i) => ({
         address: ARC_USDC,
         topics: [TRANSFER_TOPIC, topic(from), topic(to)],
         data: `0x${(1_000_000).toString(16).padStart(64, '0')}`,
         blockNumber: `0x${(start + i).toString(16)}`,
-        transactionHash: `0x${(start * 100 + i).toString(16).padStart(64, '0')}`,
+        transactionHash: txHash(start + i),
       }));
     }
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
   });
-  return { server, calls };
+  return { server, calls, setHead: (n: number) => { currentHead = n; } };
 }
 
 test("a feed that has not landed a poll cannot claim 'live'", async () => {
@@ -1433,4 +1450,66 @@ test("catchUp deals the interval's meteors across the replay, not into one tick"
     distinct.size > 6,
     `only ${distinct.size} distinct transfer hashes fed the tank; the replay was starved`,
   );
+});
+
+test('a poll wider than the old 24-block gate still resolves x402', async () => {
+  // Sender resolution used to be skipped unless a poll spanned 24 blocks or
+  // fewer. That ceiling was sized for a 250ms tick loop, where a poll is four
+  // blocks; a runtime that polls once a minute spans ~120, because Arc produces
+  // a block every 500ms (measured against mainnet, not assumed). So the gate
+  // never opened, every flow came back `x402: null`, and the machine-payment
+  // share this observatory is named after read as exactly zero in production —
+  // while a viewer polling fast enough to squeeze under the gate saw real ones,
+  // which made it look intermittent rather than broken.
+  //
+  // Nothing caught it because the stub answered `eth_getBlockByNumber` from the
+  // default branch with an empty tx list, so senders were unresolvable in tests
+  // too: same zero, different reason, equally silent.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const { server: rpc, calls, setHead } = chainRpcStub(4096, 2);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, {
+      backfillBlocks: 32,
+      // No throttle at all, rather than a short one. `poll()` stamps
+      // `lastPollAt` when it *finishes*, so any small throttle leaves the second
+      // poll gated on how long the assertions in between happened to take, and
+      // the test passes or fails on machine speed alone.
+      pollEveryMs: 0,
+    });
+    // The first poll is the backfill, which resolves no senders by design: it
+    // covers 30 minutes of history and full blocks are not affordable there.
+    await feed.settle();
+    assert.equal(calls.blocks, 0, 'a backfill does not fetch full blocks');
+    assert.equal(
+      feed.observePayload().stats.x402Count,
+      0,
+      'backfilled flows are unknown, which is not the same as unrelayed',
+    );
+
+    // Move the head a cron interval's worth of blocks, so the next poll spans
+    // 118 — five times the gate that used to suppress it.
+    setHead(4096 + 118);
+    await feed.settle();
+
+    const obs = feed.observePayload();
+    assert.equal(
+      calls.blocks,
+      118,
+      'the whole span was queried for senders, in batches of 24',
+    );
+    assert.equal(obs.stats.x402Count, 2, 'both transfers in the wide span resolved as relayed');
+    assert.ok(
+      obs.stats.x402Share > 0,
+      `the share the UI shows is still pinned at zero (got ${obs.stats.x402Share})`,
+    );
+    assert.deepEqual(
+      obs.flows.slice(-2).map((f) => f.x402),
+      [true, true],
+      'and the per-flow mark survives a wide poll, which is what the tx drawer reads',
+    );
+  } finally {
+    rpc.close();
+  }
 });

@@ -19,8 +19,10 @@
  *    turbulence is relative to recent turbulence.
  *  - x402 heuristic: EIP-3009 authorized transfers are submitted by a
  *    facilitator/relayer, so `tx.from != transfer.from` marks a relayed
- *    (x402-style, gasless-for-payer) settlement. Only resolvable for live
- *    polls (needs full blocks); backfilled flows carry `x402: null`.
+ *    (x402-style, gasless-for-payer) settlement. Resolving it needs the full
+ *    block, so it is attempted only on live ranges and only back to
+ *    `MAX_SENDER_BLOCKS`. A flow carrying `x402: null` means unknown — not
+ *    resolved — which is what backfill and an over-long catch-up produce.
  *
  * Polling is time-gated (default every 2s ≈ 4 blocks) and de-duplicated via
  * an in-flight promise, so being sampled twice per tick (chain + market
@@ -49,6 +51,19 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 /** Arc produces a block roughly every 500ms. */
 const BLOCK_MS = 500;
 const LOG_CHUNK_BLOCKS = 400;
+/**
+ * Blocks per batch when resolving tx senders for x402 detection. Keeps the
+ * per-request concurrency the old 24-block gate allowed, and pays for a wider
+ * span in round-trips rather than in simultaneous connections.
+ */
+const SENDERS_BATCH = 24;
+/**
+ * How far back one poll resolves senders. A minute of Arc is ~120 blocks, so
+ * this covers a poll that is recovering from a stall with room to spare; past
+ * it the feed is replaying history nobody will inspect, and reporting those
+ * flows as unknown beats spending ten serial batches on them.
+ */
+const MAX_SENDER_BLOCKS = 240;
 /**
  * Per-call RPC ceiling. Without one, a hung `eth_getLogs` leaves `inflight` set
  * forever, and since `kick()` returns the promise already in flight instead of
@@ -584,18 +599,37 @@ export class ArcUsdcFeed implements ChainFeed {
         return;
       }
 
-      // Relayer detection needs tx senders; only affordable for live ranges.
+      // Relayer detection needs each tx's submitter, which only a full block
+      // carries. This used to be skipped unless the poll spanned 24 blocks or
+      // fewer — a ceiling sized for a 250ms tick loop, where a poll is four
+      // blocks. On a runtime that polls once a minute the span is ~120 blocks
+      // (Arc produces one every 500ms), so the gate never opened and every flow
+      // came back `x402: null`: an observatory that bills itself as x402
+      // reported a machine-payment share of exactly zero, permanently, and only
+      // ever showed a real one while a viewer happened to be polling fast enough
+      // to squeeze under the gate. Batch the queries instead, which keeps the
+      // concurrency that ceiling was protecting.
       const txSenders = new Map<string, string>();
-      const span = latest - from + 1;
-      if (!isBackfill && span <= 24) {
-        const numbers: number[] = [];
-        for (let n = from; n <= latest; n++) numbers.push(n);
-        const blocks = (await Promise.all(
-          numbers.map((n) => this.rpc('eth_getBlockByNumber', [hex(n), true])),
-        )) as { transactions?: RpcBlockTx[] }[];
-        for (const b of blocks) {
-          for (const t of b?.transactions ?? []) {
-            if (t?.hash && t?.from) txSenders.set(t.hash.toLowerCase(), t.from.toLowerCase());
+      if (!isBackfill) {
+        const senderFrom = Math.max(from, latest - MAX_SENDER_BLOCKS + 1);
+        for (let start = senderFrom; start <= latest; start += SENDERS_BATCH) {
+          const numbers: number[] = [];
+          for (let n = start; n <= Math.min(start + SENDERS_BATCH - 1, latest); n++) numbers.push(n);
+          try {
+            const blocks = (await Promise.all(
+              numbers.map((n) => this.rpc('eth_getBlockByNumber', [hex(n), true])),
+            )) as { transactions?: RpcBlockTx[] }[];
+            for (const b of blocks) {
+              for (const t of b?.transactions ?? []) {
+                if (t?.hash && t?.from) txSenders.set(t.hash.toLowerCase(), t.from.toLowerCase());
+              }
+            }
+          } catch {
+            // Senders are an enrichment, not the reading. A failed batch leaves
+            // those flows `x402: null` — unknown, exactly as backfill does —
+            // where letting it throw would discard the temperatures and the
+            // whole interval of flow with them. Batching makes a failure more
+            // likely, not less: five chances instead of one.
           }
         }
       }
