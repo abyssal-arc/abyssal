@@ -630,11 +630,19 @@ export class ArcUsdcFeed implements ChainFeed {
       .sort((a, b) => b.volume - a.volume)
       .slice(0, 10)
       .map((e) => ({ ...e, volume: Math.round(e.volume * 100) / 100 }));
-    // The rails themselves, busiest first. `x402` and `direct` share an address
-    // (the token) and so are keyed by kind as well; everything else is one row
-    // per contract, labelled from the registry when it is in there.
+    // The rails themselves, busiest first — and busiest means most *used*, not
+    // most *moved*. Sorting by volume lets a single transaction own the panel:
+    // one atomic arbitrage once came through at $8.15M against a window total of
+    // $8.17M, which ranked it above the Uniswap router, the ERC-4337 EntryPoint
+    // and every aggregator combined, and left the other eleven rows with a
+    // zero-width bar beside them. A rail's usage is how often the ecosystem
+    // reaches for it; the money is still on the row, where a one-off that large
+    // reads as the outlier it is instead of as the headline. `x402` and `direct`
+    // share an address (the token) and so are keyed by kind as well; everything
+    // else is one row per contract, labelled from the registry when it is in
+    // there.
     const venueRows = [...byVenue.values()]
-      .sort((a, b) => b.volume - a.volume)
+      .sort((a, b) => b.count - a.count || b.volume - a.volume)
       .slice(0, 12)
       .map((v) => ({
         kind: v.kind,

@@ -208,7 +208,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (119 total)
+npm test           # sim + server + web tests (121 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -399,14 +399,29 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   `venue.ts` now classifies every flow onto a rail — `x402`, `swap`, `aa`,
   `direct`, `contract`, `unknown` — from the contract called and the method
   called, against a registry read off mainnet (Universal Router, ERC-4337
-  EntryPoint v0.7, the V3 SwapRouter, two V4-style proxies, a DAG aggregator) with
-  a selector fallback for routers too new to be catalogued. Three refusals are
-  load-bearing. ERC-4337 bundles are **not** counted as x402 even though one
+  EntryPoint v0.7, the V3 SwapRouter, two V4-style proxies, a DAG aggregator, and
+  two multicall aggregators admitted on their receipts rather than on their method
+  names) with a selector fallback for routers too new to be catalogued.
+  Three refusals are load-bearing. ERC-4337 bundles are **not** counted as x402
+  even though one
   could be carrying an authorization, because telling that apart needs internal
   traces the feed does not fetch — which makes the reported share a floor rather
   than an estimate. `multicall` is **not** counted as a swap, because its real
   action lives in calldata nobody decodes. And an uncatalogued venue is labelled
   with its bare address rather than a plausible name.
+  Those two aggregators are the refusal and the registry working together rather
+  than against each other: `multicall((address,bool,uint256,bytes)[],…)` still
+  classifies an unknown contract as a bare `contract`, and these two are `swap`
+  only because their receipts were fetched and showed USDC leaving in the same
+  transaction as seven unrelated ERC-20s — TEN, Payrail, VORT, Foci, ArcKit,
+  Minara AI, Duke of Arc — from thirteen distinct callers, with nothing held in
+  between. Evidence about a specific contract, never a rule about a method name.
+  The panel is also ordered by how often a rail was reached rather than by what it
+  moved. Volume ranking handed the top row to a single atomic arbitrage — $8.15M
+  against a window total of $8.17M — above the Uniswap router, the ERC-4337
+  EntryPoint and every aggregator combined, and left the other eleven rows drawing
+  a bar of zero width beside it: one bot, presented as the state of the ecosystem.
+  The amount is still on the row, next to the `×1` that says how it got there.
   The last piece is the denominator. A backfill reads no transaction bodies, so
   its flows are unattributed; folding them into the share's denominator would
   halve a one-percent reading and make a gap in coverage look like a collapse.
@@ -670,12 +685,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-119 tests on `node:test`, no test framework dependency:
+121 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 57 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address, and that a backfilled window reports no share rather than a share of zero |
+| `@abyssal/server` | 59 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
 | `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs

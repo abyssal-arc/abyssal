@@ -117,6 +117,26 @@ const VENUES: Record<string, VenueInfo> = {
   '0x53dea4f7783c1de84cecc5c989bc37a557154827': { kind: 'swap', label: 'swap router (V4-style proxy)' },
   '0x40fe100d34b6a552d49ad8cc252795ccead48277': { kind: 'swap', label: 'swap router (V4-style proxy)' },
   '0x4e3bcce28caf98a143fd8bd9e4875ccab3e7bbe0': { kind: 'swap', label: 'DAG swap aggregator' },
+  // Both of these were `contract` rows until their receipts were read. Each one
+  // moved USDC alongside several unrelated ERC-20s inside a single transaction —
+  // TEN, Payrail, VORT, Foci, ArcKit, Minara AI and Duke of Arc through the
+  // first, Duke of Arc and RUNUP through the second — which is what exchanging
+  // value looks like, and neither holds a balance between calls. The first is
+  // reached by 13 distinct callers and once received straight from an ERC-4337
+  // account; the second exposes `permit2TransferAndMulticall` and emitted a
+  // Uniswap V3 `Swap`. Their `multicall` selectors are still not in SEL_SWAP:
+  // these two are swaps because of what came out of them, not because of the
+  // name of the method that went in.
+  '0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f': { kind: 'swap', label: 'swap aggregator (multicall router)' },
+  '0xccc88a9d1b4ed6b0eaba998850414b24f1c315be': { kind: 'swap', label: 'swap aggregator (Permit2 multicall)' },
+  // 1.5 KB exposing `initiator()`, `reenter(...)` and `reenterHash()`: a batch
+  // executor that hands control back to whoever started it. Left as `contract`
+  // rather than given a rail of its own, because the interface says how it runs
+  // and not what it was run for. It matters enough to name anyway — a single
+  // transaction through it once accounted for 99.8% of a whole window's volume,
+  // and an unnamed address at the top of a leaderboard invites a reader to
+  // mistake one bot's arbitrage for the state of the ecosystem.
+  '0x855dbe13c409df75caf6a985cf6993a4d0319feb': { kind: 'contract', label: 'atomic batch executor' },
 };
 
 /**

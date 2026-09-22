@@ -1253,9 +1253,18 @@ test('a clock from the future is ignored instead of pinning the tank', async () 
 /**
  * Overrides the transaction body the stub serves, so a test can put a flow on a
  * rail other than x402. `to: null` models a contract creation, which has no
- * destination to classify.
+ * destination to classify, and `amount` overrides the size of the transfer that
+ * block's log reports.
  */
-type StubTx = { to?: string | null; input?: string };
+type StubTx = { to?: string | null; input?: string; amount?: number };
+
+/**
+ * Either one body for the whole window, or a function of the block number so a
+ * single poll can land flows on more than one rail. The second form is what lets
+ * a test compare venues against each other rather than only against a fixed
+ * expectation.
+ */
+type StubTxAt = StubTx | ((block: number) => StubTx | null | undefined);
 
 /**
  * A JSON-RPC stub answering the calls a poll makes: the head, the log chunks,
@@ -1272,9 +1281,13 @@ type StubTx = { to?: string | null; input?: string };
  * without it a local stub answers in under a millisecond and the throttle can
  * never be observed expiring.
  */
-function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?: StubTx) {
+function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?: StubTxAt) {
   const from = '0x' + 'cd'.repeat(20);
   const to = '0x' + 'ef'.repeat(20);
+  const txAt = (n: number): StubTx => {
+    const b = typeof tx === 'function' ? tx(n) : tx;
+    return b ?? {};
+  };
   /**
    * Submits the transfer on the payer's behalf, which is what a facilitator does
    * for an EIP-3009 authorization. The venue no longer depends on noticing that:
@@ -1311,25 +1324,33 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?:
       result = `0x${currentHead.toString(16)}`;
     } else if (call.method === 'eth_getBlockByNumber') {
       const n = parseInt(call.params?.[0] as string, 16);
+      const b = txAt(n);
       result = {
         number: call.params?.[0],
         transactions: [{
           hash: txHash(n),
           from: relayer,
-          to: tx && 'to' in tx ? tx.to : ARC_USDC,
-          input: tx?.input ?? X402_INPUT,
+          to: 'to' in b ? b.to : ARC_USDC,
+          input: b.input ?? X402_INPUT,
         }],
       };
     } else if (call.method === 'eth_getLogs') {
       const p = (call.params?.[0] ?? {}) as Record<string, string>;
       const start = parseInt(p.fromBlock, 16);
-      result = Array.from({ length: transfersPerChunk }, (_, i) => ({
-        address: ARC_USDC,
-        topics: [TRANSFER_TOPIC, topic(from), topic(to)],
-        data: `0x${(1_000_000).toString(16).padStart(64, '0')}`,
-        blockNumber: `0x${(start + i).toString(16)}`,
-        transactionHash: txHash(start + i),
-      }));
+      result = Array.from({ length: transfersPerChunk }, (_, i) => {
+        // The amount is per block for the same reason the body is: ranking two
+        // venues against each other needs one to carry more value and the other
+        // to carry more transfers, and a stub that fixes the value can only ever
+        // produce the two in the same order.
+        const amt = txAt(start + i).amount ?? 1_000_000;
+        return {
+          address: ARC_USDC,
+          topics: [TRANSFER_TOPIC, topic(from), topic(to)],
+          data: `0x${amt.toString(16).padStart(64, '0')}`,
+          blockNumber: `0x${(start + i).toString(16)}`,
+          transactionHash: txHash(start + i),
+        };
+      });
     }
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
@@ -1684,6 +1705,13 @@ const SEL_EXACT_INPUT_SINGLE = '0x04e45aaf';
 const SEL_TRANSFER = '0xa9059cbb';
 const SEL_APPROVE = '0x095ea7b3';
 const SEL_MULTICALL = '0x5ae401dc';
+// Read off mainnet on 2026-09-22 by fetching receipts for transactions addressed
+// to each one: USDC moved alongside seven unrelated ERC-20s in a single call,
+// from 13 distinct callers, holding no balance in between.
+const AGGREGATOR = '0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f';
+const SEL_AGG_MULTICALL = '0xcd6e13f7';   // multicall((address,bool,uint256,bytes)[],address,address,bytes)
+// 1.5 KB exposing `initiator()`, `reenter(...)` and `reenterHash()`.
+const EXECUTOR = '0x855dbe13c409df75caf6a985cf6993a4d0319feb';
 const pad = (sel: string) => sel + '00'.repeat(32);
 
 /**
@@ -1695,11 +1723,16 @@ const pad = (sel: string) => sel + '00'.repeat(32);
  * no venues, leaving these tests nothing to assert about. Four blocks behind
  * the head is well inside MAX_LIVE_SPAN, so the poll this triggers is a live
  * one and every flow it lands is resolved.
+ *
+ * `perChunk` is how many transfers each `eth_getLogs` answer carries, at blocks
+ * `from`, `from+1`, … A poll seeded four blocks back spans exactly four, and the
+ * whole span is one chunk — `LOG_CHUNK_BLOCKS` is 400 — so this is also how many
+ * flows a test gets, and how many distinct blocks it can vary the body across.
  */
-async function pollLive(tx?: StubTx) {
+async function pollLive(tx?: StubTxAt, perChunk = 2) {
   const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
   const HEAD = 8192;
-  const { server: rpc } = chainRpcStub(HEAD, 2, 0, tx);
+  const { server: rpc } = chainRpcStub(HEAD, perChunk, 0, tx);
   await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
   const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
   const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
@@ -1827,4 +1860,53 @@ test('the rail is decided by the contract and the method, and never by a guess',
   // Address case and a missing selector must not change the answer.
   assert.equal(classifyVenue(ARC_USDC, ROUTER.toUpperCase(), undefined).kind, 'swap');
   assert.equal(classifyVenue(ARC_USDC, ARC_USDC.toUpperCase(), '0xE3EE160E').kind, 'x402');
+});
+
+test('a venue catalogued from its receipts is a swap even though its method is multicall', async () => {
+  const { classifyVenue } = await import('../src/venue.js');
+  // The two halves of that sentence have to hold at once. The selector on its own
+  // still proves nothing — `multicall` is a wrapper whose real action sits in
+  // calldata nobody decodes — so an uncatalogued contract using it stays a bare
+  // address. What makes this one a swap is that its receipts were read: USDC left
+  // it in the same transaction as seven unrelated ERC-20s. Naming it is a claim
+  // about evidence, and the pair of assertions is what keeps it from silently
+  // becoming a claim about method names.
+  assert.equal(classifyVenue(ARC_USDC, AGGREGATOR, SEL_AGG_MULTICALL).kind, 'swap');
+  assert.equal(classifyVenue(ARC_USDC, UNCATALOGUED, SEL_AGG_MULTICALL).kind, 'contract');
+  // An executor is named for what its interface does and promoted no further: it
+  // batches calls and hands control back to whoever started them, and nothing
+  // on-chain says what it was batching.
+  assert.equal(classifyVenue(ARC_USDC, EXECUTOR, SEL_AGG_MULTICALL).kind, 'contract');
+  const label = classifyVenue(ARC_USDC, EXECUTOR, SEL_AGG_MULTICALL).label;
+  assert.notEqual(label, EXECUTOR, 'a catalogued contract is named rather than shown as its own address');
+});
+
+test('the leaderboard ranks a rail by how often it is used, not by what one caller moved', async () => {
+  // Production supplied the counterexample: a single atomic arbitrage through an
+  // uncatalogued executor came in at $8.15M against a window total of $8.17M.
+  // Ordered by volume it outranked the Uniswap router, the ERC-4337 EntryPoint
+  // and every aggregator combined, and the other eleven rows drew a bar of zero
+  // width beside it — the panel named one bot as the state of the ecosystem.
+  // Every fourth block carries the large single transfer, the rest carry the
+  // small repeated ones. Four transfers fill the four-block span the seeded poll
+  // covers, which is what makes the counts differ rather than tie.
+  const obs = await pollLive(
+    (b) =>
+      b % 4 === 0
+        ? { to: UNCATALOGUED, input: pad(SEL_AGG_MULTICALL), amount: 500_000_000 }
+        : { to: ROUTER, input: pad(SEL_ROUTER_EXECUTE), amount: 1_000_000 },
+    4,
+  );
+  const busy = obs.venueRows.find((r) => r.address === ROUTER);
+  const whale = obs.venueRows.find((r) => r.address === UNCATALOGUED);
+  assert.ok(busy && whale, 'both venues landed in the window');
+  // The premise of the test: the outlier really does carry more money, so an
+  // ordering by volume would really do put it first.
+  assert.ok(whale.volume > busy.volume, `the one-off carries more value ($${whale.volume} vs $${busy.volume})`);
+  assert.ok(busy.count > whale.count, `the rail is reached more often (${busy.count} vs ${whale.count})`);
+  assert.equal(obs.venueRows[0]?.address, ROUTER, 'the busiest rail leads even though it moved less');
+  assert.ok(
+    obs.venueRows.every((r) => r.count > 0),
+    'every row names a count, which is the figure the rows are ordered by and the one that makes a large amount beside ×1 readable as a single event',
+  );
 });

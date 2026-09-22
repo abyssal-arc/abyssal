@@ -1441,7 +1441,10 @@ function renderObsVenues() {
   const rows = obsData.venueRows ?? [];
   const cov = obsData.venueCoverage ?? null;
   const kinds = (obsData.venues ?? []).filter((v) => v.count > 0);
-  const max = Math.max(...rows.map((r) => r.volume), 1);
+  // The bar tracks the count, which is what the rows are ordered by. Tracking the
+  // volume instead let one atomic arbitrage — $8.15M of an $8.17M window — take
+  // the full width and flatten the other eleven rows to nothing.
+  const max = Math.max(...rows.map((r) => r.count), 1);
   // A catalogued venue arrives with a name; an uncatalogued one is only an
   // address, and a full 42-character address would break the row.
   const nameOf = (r) =>
@@ -1464,8 +1467,13 @@ function renderObsVenues() {
         return (
           `<div class="ep${i < 3 ? ' top' : ''}"${clickable ? ` data-vaddr="${esc(clickable)}"` : ''}>` +
           `<span class="rank">${i + 1}</span>` +
-          `<span class="mid"><span class="addr">${nameOf(r)}</span>` +
-          `<span class="volbar v-${r.kind}" style="width:${Math.round((r.volume / max) * 100)}%"></span></span>` +
+          `<span class="mid"><span class="vhead"><span class="addr">${nameOf(r)}</span>` +
+          // Beside the name rather than in the chips: the chips total a rail
+          // across every contract on it, and this is how often this one contract
+          // was reached. It is also what makes a row reading `$8,150,000` next to
+          // `×1` legible as a single event.
+          `<b class="vcount">×${r.count.toLocaleString()}</b></span>` +
+          `<span class="volbar v-${r.kind}" style="width:${Math.round((r.count / max) * 100)}%"></span></span>` +
           `<span class="right"><span class="amt">${fmtUsd(r.volume)}</span>` +
           `<span class="vtag v-${r.kind}">${esc(t(`venue_${r.kind}`))}</span></span>` +
           `</div>`
