@@ -97,16 +97,25 @@ test('402 advertises the ABYS burn offer on Arc mainnet', async () => {
 
 test('402 amounts follow the ABYS price list in base units', async () => {
   const app = createApp({ seed: 1 });
-  for (const [type, base] of [
-    ['feed', '100000000000000000000000'],
-    ['poison', '150000000000000000000000'],
-    ['bloom', '200000000000000000000000'],
-    ['drought', '200000000000000000000000'],
+  const id = app.world.creatures[0].id;
+  // Whole tokens as the price list states them; the quote must be that number
+  // scaled by the token's own decimals(), which the stub answers as 18.
+  const units = (whole: number): string => (BigInt(whole) * 10n ** 18n).toString();
+  for (const [type, whole, body] of [
+    ['feed', 100_000, { type: 'feed', x: 10, y: 10 }],
+    ['poison', 150_000, { type: 'poison', x: 10, y: 10 }],
+    ['bloom', 200_000, { type: 'bloom' }],
+    ['drought', 200_000, { type: 'drought' }],
+    ['pass', 5_000, { type: 'pass' }],
+    ['name', 50_000, { type: 'name', creatureId: id, name: 'Moby' }],
+    ['wish', 25_000, { type: 'wish', message: 'be kind' }],
+    ['mutate', 100_000, { type: 'mutate', creatureId: id, trait: 'speed', direction: 'boost' }],
+    ['ark', 75_000, { type: 'ark', creatureId: id }],
   ] as const) {
-    const res = await app.fetch(post('/intervene', { type, x: 10, y: 10 }));
+    const res = await app.fetch(post('/intervene', body));
     assert.equal(res.status, 402);
-    const body = (await res.json()) as { accepts: { amount: string }[] };
-    assert.equal(body.accepts[0].amount, base, `${type} should cost ${base} base units`);
+    const quoted = (await res.json()) as { accepts: { amount: string }[] };
+    assert.equal(quoted.accepts[0].amount, units(whole), `${type} should cost ${whole} ABYS`);
   }
 });
 
@@ -618,15 +627,15 @@ test('FlowMeter calibrates by rank: bounded, median-centred, outlier-proof', asy
 test('/intervene accepts same-origin https posts and rejects foreign pages', async () => {
   const app = createApp({ seed: 1 });
   const same = await app.fetch(
-    new Request('https://abyssal-arc.com/intervene', {
+    new Request('https://www.abyssal-arc.com/intervene', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', origin: 'https://abyssal-arc.com' },
+      headers: { 'content-type': 'application/json', origin: 'https://www.abyssal-arc.com' },
       body: JSON.stringify({ type: 'feed', x: 100, y: 100 }),
     }),
   );
   assert.notEqual(same.status, 403, 'same-origin https must not trip the gate');
   const foreign = await app.fetch(
-    new Request('https://abyssal-arc.com/intervene', {
+    new Request('https://www.abyssal-arc.com/intervene', {
       method: 'POST',
       headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
       body: JSON.stringify({ type: 'feed', x: 100, y: 100 }),
@@ -911,4 +920,260 @@ test('a store row from before profiles existed loads as a full one', async () =>
   assert.equal(who.burned, 250_000);
   assert.equal(who.burns, 1);
   assert.ok(who.badges.includes('firstBurn'));
+});
+
+/* ---------- the paid actions aimed at one creature: name / wish / mutate / ark ---------- */
+
+/** Who the shared receipt stub burns from, and so who every paid action is attributed to. */
+const STUB_PAYER = '0x' + 'ab'.repeat(20);
+
+/** A Transfer log to the burn sink for `whole` ABYS at 18 decimals. */
+function burnLog(whole: bigint) {
+  return {
+    address: process.env.ABYS_TOKEN_ADDRESS,
+    topics: [TRANSFER_TOPIC, `0x${'ab'.repeat(20).padStart(64, '0')}`, BURN_SINK],
+    data: '0x' + (whole * 10n ** 18n).toString(16),
+  };
+}
+
+test('state hands the client the price list, the legend line and the editable traits', async () => {
+  const app = createApp({ seed: 1 });
+  const s = (await (await app.fetch(new Request('http://localhost/state'))).json()) as {
+    prices: Record<string, string>;
+    legendaryNamePrice: string;
+    legendary: { generation: number; kills: number };
+    geneTraits: string[];
+  };
+  assert.deepEqual(
+    [s.prices.name, s.prices.wish, s.prices.mutate, s.prices.ark],
+    ['50000', '25000', '100000', '75000'],
+  );
+  assert.equal(s.legendaryNamePrice, '500000', 'ten times the base, quoted by the server so the card cannot disagree with the 402');
+  assert.deepEqual(s.legendary, { generation: 5, kills: 5 });
+  assert.deepEqual(s.geneTraits, ['speed', 'size', 'aggression', 'fertility', 'perception']);
+});
+
+test('a targeted action validates its whole request before any money moves', async () => {
+  const app = createApp({ seed: 1 });
+  const id = app.world.creatures[0].id;
+  const hash = '0x' + 'e5'.repeat(32);
+  for (const body of [
+    { type: 'name', creatureId: 999_999, name: 'Ghost' },
+    { type: 'name', creatureId: 1.5, name: 'Moby' },
+    { type: 'name', creatureId: id, name: '' },
+    { type: 'name', creatureId: id, name: '   ' },
+    { type: 'name', creatureId: id, name: 'x'.repeat(25) },
+    { type: 'name', creatureId: id, name: 42 },
+    { type: 'mutate', creatureId: id, trait: 'wings', direction: 'boost' },
+    { type: 'mutate', creatureId: id, trait: 'speed', direction: 'sideways' },
+    { type: 'mutate', creatureId: id, trait: 'speed' },
+    { type: 'mutate', creatureId: -1, trait: 'speed', direction: 'boost' },
+    { type: 'ark', creatureId: 999_999 },
+    { type: 'ark' },
+    { type: 'wish', message: '' },
+    { type: 'wish', message: 'x'.repeat(61) },
+    { type: 'wish', message: 7 },
+    { type: 'wish', message: 'hi', x: -1, y: 5 },
+    { type: 'wish', message: 'hi', x: 5, y: 99_999 },
+    { type: 'wish', message: 'hi', x: 5 },
+  ]) {
+    const res = await app.fetch(post('/intervene', body, { 'x-payment-tx': hash }));
+    assert.equal(res.status, 400, `${JSON.stringify(body)} must be refused before the burn is looked at`);
+  }
+  // Proof the receipt survived every rejection: it still buys something.
+  const good = await app.fetch(post('/intervene', { type: 'wish', message: 'be kind' }, { 'x-payment-tx': hash }));
+  assert.equal(good.status, 200, 'a rejected request must not consume the burn');
+});
+
+test('paid words are stripped of markup before they enter the world', async () => {
+  const app = createApp({ seed: 1 });
+  const id = app.world.creatures[0].id;
+  const res = await app.fetch(post(
+    '/intervene',
+    { type: 'name', creatureId: id, name: '<img src=x onerror=alert(1)>Moby' },
+    { 'x-payment-tx': '0x' + 'e6'.repeat(32) },
+  ));
+  assert.equal(res.status, 200);
+  const c = app.world.creatures.find((x) => x.id === id)!;
+  // Stripped rather than escaped: the same string is dropped into innerHTML, a
+  // canvas fillText and a CSV export, so nothing downstream has to remember.
+  assert.equal(c.customName, 'Moby');
+  assert.ok(!/[<>]/.test(c.customName ?? ''), 'no angle bracket survives into the world');
+  // A name that was only markup sanitizes to nothing, and so is refused.
+  const empty = await app.fetch(post(
+    '/intervene',
+    { type: 'wish', message: '<b></b>' },
+    { 'x-payment-tx': '0x' + 'ec'.repeat(32) },
+  ));
+  assert.equal(empty.status, 400);
+});
+
+test('naming a legend is quoted at ten times the base, and a base receipt will not buy it', async () => {
+  const app = createApp({ seed: 1 });
+  const legend = app.world.creatures[0];
+  legend.generation = 9;
+  const quote = await app.fetch(post('/intervene', { type: 'name', creatureId: legend.id, name: 'Legend' }));
+  assert.equal(quote.status, 402);
+  const asked = (await quote.json()) as {
+    accepts: { amount: string }[]; price: string; legendary: boolean;
+  };
+  assert.equal(asked.accepts[0].amount, (500_000n * 10n ** 18n).toString());
+  assert.equal(asked.price, '500000 ABYS');
+  assert.equal(asked.legendary, true, 'the wallet is told why the number is what it is');
+  // The shared stub burns 100,000, so it cannot reach a legend's price.
+  const short = await app.fetch(post(
+    '/intervene',
+    { type: 'name', creatureId: legend.id, name: 'Legend' },
+    { 'x-payment-tx': '0x' + 'f1'.repeat(32) },
+  ));
+  assert.equal(short.status, 402);
+  assert.equal((await short.json() as { reason: string }).reason, 'no burn of the asked amount in this transaction');
+  // A fish beside it is base-priced, so the two are never confused.
+  const fish = app.world.creatures.find((c) => c.generation < 5 && c.kills < 5)!;
+  const cheap = await app.fetch(post(
+    '/intervene',
+    { type: 'name', creatureId: fish.id, name: 'Tiny' },
+    { 'x-payment-tx': '0x' + 'f2'.repeat(32) },
+  ));
+  assert.equal(cheap.status, 200, 'the same receipt is enough for a fish');
+  const sold = (await cheap.json()) as { legendary: boolean; price: string; receipt: string };
+  assert.equal(sold.legendary, false);
+  assert.equal(sold.price, '50000 ABYS');
+  assert.match(sold.receipt, /Tiny/);
+});
+
+test('a second ark ticket on one body is refused before it is charged for', async () => {
+  const app = createApp({ seed: 1 });
+  const id = app.world.creatures[0].id;
+  const first = await app.fetch(post('/intervene', { type: 'ark', creatureId: id }, { 'x-payment-tx': '0x' + 'e7'.repeat(32) }));
+  assert.equal(first.status, 200);
+  const bought = (await first.json()) as { ok: boolean; price: string; affected: number };
+  assert.equal(bought.price, '75000 ABYS');
+  assert.equal(bought.affected, 1);
+  const hash = '0x' + 'e8'.repeat(32);
+  // The cheap path: the body is already spoken for, so this is caught while the
+  // request is still being validated and no burn is ever looked at.
+  const second = await app.fetch(post('/intervene', { type: 'ark', creatureId: id }, { 'x-payment-tx': hash }));
+  assert.equal(second.status, 400, 'selling a second ticket to one body must not even reach the payment');
+  assert.match((await second.json() as { error: string }).error, /already holds an ark ticket/);
+  const reused = await app.fetch(post('/intervene', { type: 'feed', x: 500, y: 500 }, { 'x-payment-tx': hash }));
+  assert.equal(reused.status, 200, 'a rejected sale must leave the burn untouched');
+});
+
+test('an ark ticket bought by somebody else mid-verification refunds the loser', async () => {
+  // The race the pre-payment check cannot see: two wallets aim at one body, and
+  // the other receipt clears first. The loser must not be charged for a ticket
+  // that no longer exists.
+  type Tank = ReturnType<typeof createApp>['world'];
+  let tank: Tank | null = null;
+  let target = 0;
+  const srv = rpcStub((_method, data) => {
+    if (data === '0x313ce567') return DEC18;
+    const c = tank?.creatures.find((x) => x.id === target);
+    if (c) {
+      c.arkProtected = true;
+      c.arkBy = '0x' + 'cc'.repeat(20);
+    }
+    return { status: '0x1', blockNumber: '0x80', logs: [burnLog(100_000n)] };
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const app = createApp({ seed: 1, rpc: url });
+    tank = app.world;
+    target = app.world.creatures[0].id;
+    const hash = '0x' + 'ed'.repeat(32);
+    const res = await app.fetch(post('/intervene', { type: 'ark', creatureId: target }, { 'x-payment-tx': hash }));
+    assert.equal(res.status, 409, 'the body was spoken for while the receipt was in flight');
+    const body = (await res.json()) as { refunded: boolean; tx: string };
+    assert.equal(body.refunded, true);
+    assert.equal(body.tx, hash);
+    // The refund is the whole point: that same burn is still the payer's to
+    // spend, and it still buys a ticket — just on a body nobody has spoken for.
+    const elsewhere = app.world.creatures[1].id;
+    const retry = await app.fetch(post('/intervene', { type: 'ark', creatureId: elsewhere }, { 'x-payment-tx': hash }));
+    assert.equal(retry.status, 200, 'a refunded receipt must still be spendable');
+    assert.equal(
+      app.world.creatures.find((c) => c.id === elsewhere)?.arkProtected,
+      true,
+      'and spend it on something real, not into thin air',
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+test('a subject that dies mid-verification refunds the receipt instead of buying nothing', async () => {
+  // The tank keeps ticking while a receipt is being checked against the chain.
+  // Kill the subject from inside that round trip, which is exactly when it would
+  // really happen, and assert the payer is not left holding a spent burn.
+  let tank: { creatures: { id: number }[] } | null = null;
+  let victim = 0;
+  const srv = rpcStub((_method, data) => {
+    if (data === '0x313ce567') return DEC18;
+    if (tank) tank.creatures = tank.creatures.filter((c) => c.id !== victim);
+    return { status: '0x1', blockNumber: '0x80', logs: [burnLog(100_000n)] };
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const app = createApp({ seed: 1, rpc: url });
+    tank = app.world;
+    victim = app.world.creatures[0].id;
+    const hash = '0x' + 'ea'.repeat(32);
+    const res = await app.fetch(post('/intervene', { type: 'ark', creatureId: victim }, { 'x-payment-tx': hash }));
+    assert.equal(res.status, 409, 'a sale with nothing to sell must be refused, not settled');
+    const body = (await res.json()) as { refunded: boolean; tx: string };
+    assert.equal(body.refunded, true);
+    assert.equal(body.tx, hash);
+    // Aim the same burn at somebody still swimming.
+    const survivor = app.world.creatures[0].id;
+    const retry = await app.fetch(post('/intervene', { type: 'ark', creatureId: survivor }, { 'x-payment-tx': hash }));
+    assert.equal(retry.status, 200, 'the receipt was never consumed by the refused sale');
+  } finally {
+    srv.close();
+  }
+});
+
+test('a paid wish joins the meteor rain with its words and the address that paid', async () => {
+  const app = createApp({ seed: 1 });
+  const res = await app.fetch(post('/intervene', { type: 'wish', message: 'be kind' }, { 'x-payment-tx': '0x' + 'eb'.repeat(32) }));
+  assert.equal(res.status, 200);
+  const sold = (await res.json()) as { at: { x: number; y: number } | null; price: string };
+  assert.equal(sold.price, '25000 ABYS');
+  assert.ok(sold.at, 'the receipt says where it fell');
+  const snap = (await (await app.fetch(new Request('http://localhost/snapshot'))).json()) as {
+    txRain: { hash: string; size: number; x: number; y: number; wish?: { message: string; addr: string } }[];
+  };
+  const drop = snap.txRain.find((m) => m.wish);
+  assert.ok(drop, 'the wish rides the rain every viewer is already rendering');
+  assert.equal(drop!.wish!.message, 'be kind');
+  assert.equal(drop!.wish!.addr, STUB_PAYER, 'the words stay linked to the wallet that paid for them');
+  assert.deepEqual({ x: drop!.x, y: drop!.y }, sold.at, 'the rain falls where the receipt said it did');
+});
+
+test('the render payload carries paid identity, and only for those who have any', async () => {
+  const app = createApp({ seed: 1 });
+  const [a, b] = app.world.creatures;
+  const bornA = a.name;
+  applyIntervention(app.world, { type: 'name', creatureId: a.id, name: 'Moby' });
+  applyIntervention(app.world, { type: 'ark', creatureId: b.id }, { payer: STUB_PAYER });
+  const w = (await (await app.fetch(new Request('http://localhost/world'))).json()) as {
+    creatures: {
+      id: number; name: string; baseName?: string;
+      ark?: boolean; arkBy?: string | null; legendary?: boolean;
+    }[];
+  };
+  const ra = w.creatures.find((c) => c.id === a.id)!;
+  assert.equal(ra.name, 'Moby', 'the tank speaks the paid name');
+  assert.equal(ra.baseName, bornA, 'and hands down the codename it replaced');
+  assert.equal(ra.ark, undefined);
+  const rb = w.creatures.find((c) => c.id === b.id)!;
+  assert.equal(rb.ark, true);
+  assert.equal(rb.arkBy, STUB_PAYER);
+  assert.equal(rb.baseName, undefined);
+  const plain = w.creatures.find((c) => c.id !== a.id && c.id !== b.id)!;
+  assert.equal(plain.baseName, undefined, 'an unmodified tank pays nothing for the extra fields');
+  assert.equal(plain.ark, undefined);
+  assert.equal(plain.legendary, undefined);
 });

@@ -4,7 +4,7 @@
  * keeps time flowing while nobody is watching. Static files are served by
  * Workers Static Assets; every other path is API and routes to the object.
  */
-import { createApp, type WorldStore } from './handler.js';
+import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
 import { toJSON } from '@abyssal/sim';
 
@@ -34,7 +34,7 @@ export class AbyssalWorld {
   private lastSave = 0;
 
   private receipts: string[] | null = null;
-  private ledgerState: { passes: [string, number][]; burners: [string, { total: number; last: number }][] } | null = null;
+  private ledgerState: LedgerLoad | null = null;
 
   // Durable Objects receive their bindings through the constructor, not fetch.
   constructor(private ctx: { storage: DoStorage }, private env: Env) {
@@ -55,7 +55,7 @@ export class AbyssalWorld {
     if (this.receipts === null) {
       this.receipts = (await this.ctx.storage.get<string[]>('receipts')) ?? [];
       this.ledgerState =
-        (await this.ctx.storage.get<{ passes: [string, number][]; burners: [string, { total: number; last: number }][] }>('ledger')) ??
+        (await this.ctx.storage.get<LedgerLoad>('ledger')) ??
         { passes: [], burners: [] };
     }
     return { receipts: this.receipts, ledger: this.ledgerState! };

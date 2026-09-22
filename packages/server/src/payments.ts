@@ -15,7 +15,9 @@
  * environment after the imports are evaluated.
  */
 
-export type InterventionType = 'feed' | 'poison' | 'bloom' | 'drought' | 'pass';
+export type InterventionType =
+  | 'feed' | 'poison' | 'bloom' | 'drought' | 'pass'
+  | 'name' | 'wish' | 'mutate' | 'ark';
 
 /** The one network this build targets. */
 export const NETWORK = 'arc';
@@ -65,7 +67,24 @@ export const ABYS_PRICES: Record<InterventionType, string> = {
   bloom: '200000',
   drought: '200000',
   pass: '5000',
+  name: '50000',
+  wish: '25000',
+  mutate: '100000',
+  ark: '75000',
 };
+
+/**
+ * Naming a legend — a creature old or bloody enough to have become a character
+ * — costs ten times the base price. The sim owns the threshold (isLegendary);
+ * this is only what that verdict is worth, derived from the base price so the
+ * two can never drift apart.
+ */
+export const ABYS_PRICE_LEGENDARY_NAME = String(Number(ABYS_PRICES.name) * 10);
+
+/** The whole-token price of one action, legendary naming included. */
+export function priceWhole(type: InterventionType, legendary = false): string {
+  return type === 'name' && legendary ? ABYS_PRICE_LEGENDARY_NAME : ABYS_PRICES[type];
+}
 
 /** Null until the operator deploys ABYS and exports ABYS_TOKEN_ADDRESS. */
 export function tokenAddress(): string | null {
@@ -125,6 +144,7 @@ export async function burnOffer(
   rpcUrl: string,
   type: InterventionType,
   override?: string | null,
+  whole?: string,
 ): Promise<BurnOffer | null> {
   const meta = await tokenMeta(rpcUrl, override);
   if (!meta) return null;
@@ -134,7 +154,7 @@ export async function burnOffer(
     network: NETWORK_ID,
     chainId: CHAIN_ID,
     asset: meta.address,
-    amount: String(BigInt(ABYS_PRICES[type]) * 10n ** BigInt(meta.decimals)),
+    amount: String(BigInt(whole ?? ABYS_PRICES[type]) * 10n ** BigInt(meta.decimals)),
   };
 }
 
