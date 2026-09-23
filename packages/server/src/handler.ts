@@ -677,6 +677,20 @@ export function createApp(options: AppOptions = {}) {
    * shared edge freshness costs nothing visually (the client interpolates) and
    * cuts origin load by the number of concurrent viewers.
    */
+  /**
+   * Every JSON answer this app gives leaves through here, which is why the
+   * caching policy is stated rather than omitted.
+   *
+   * `cacheSec > 0` is the free, deliberately-stale-able stream: `/observe` and
+   * friends publish `s-maxage` and let the edge serve one copy to many readers.
+   * `cacheSec === 0` used to mean "say nothing", which left the answer to the
+   * zone's configuration — and on a deployment where some routes do ask for
+   * edge caching, silence is not a guarantee. It is now `no-store`, which no
+   * cache may ignore. The paid route is the reason this is not left as a
+   * nicety: a cached 200 there is a paid answer delivered to a buyer who never
+   * paid, and the header is the only place the difference between this response
+   * and `/observe`'s could be recorded.
+   */
   function json(data: unknown, status = 200, cacheSec = 0): Response {
     const headers: Record<string, string> = {
       'content-type': 'application/json; charset=utf-8',
@@ -684,6 +698,8 @@ export function createApp(options: AppOptions = {}) {
     };
     if (cacheSec > 0) {
       headers['cache-control'] = 'public, s-maxage=' + cacheSec + ', stale-while-revalidate=' + cacheSec * 3;
+    } else {
+      headers['cache-control'] = 'no-store';
     }
     return new Response(JSON.stringify(data), { status, headers });
   }

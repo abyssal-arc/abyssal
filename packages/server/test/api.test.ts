@@ -4057,6 +4057,8 @@ test('a paid call settles first and answers with the depth the free stream withh
     const header = await payHeader(cfg, requirement, buyer, `0x${'11'.repeat(32)}`);
     const res = await app.fetch(get('/data/flows', { 'x-payment': header }));
     assert.equal(res.status, 200, `a settled payment must be answered, got ${JSON.stringify(await res.clone().json())}`);
+    assert.equal(res.headers.get('cache-control'), 'no-store',
+      'an answer somebody paid for may not be served to the next reader for free');
     const body = (await res.json()) as {
       retained: number; matched: number; truncated: boolean;
       oldest: { t: number; block: number } | null; newest: { t: number; block: number } | null;
@@ -4096,6 +4098,40 @@ test('a paid call settles first and answers with the depth the free stream withh
     assert.equal(after.data.sales, 1);
     assert.equal(after.data.spentPayments, 1, 'the nonce that bought this is remembered as spent');
     assert.deepEqual(after.signals?.counts, {}, 'a sale is not a failure');
+  } finally {
+    await close();
+  }
+});
+
+test('the refusal a buyer sees before paying is uncacheable too', async () => {
+  // The 402 carries the offer: which chain, which asset, what amount, to whom.
+  // A cached copy of it would outlive the seller key that produced it, so a
+  // buyer could be told to send money to an arrangement that has since closed.
+  const { app, close } = await dataTierApp({});
+  try {
+    const quote = await app.fetch(get('/data/flows'));
+    assert.equal(quote.status, 402);
+    assert.equal(quote.headers.get('cache-control'), 'no-store');
+    const bad = await app.fetch(get('/data/flows?addr=nothex'));
+    assert.equal(bad.status, 400);
+    assert.equal(bad.headers.get('cache-control'), 'no-store', 'a refusal is not a caching hint either');
+  } finally {
+    await close();
+  }
+});
+
+test('making the paid answer uncacheable did not take the free stream with it', async () => {
+  // The two policies differ on purpose: the flow stream is public, stale-by-3-
+  // seconds and worth serving from the edge, while a paid answer is not.
+  // Asserting only the first half would let a change that puts `no-store` on
+  // every response pass as a fix.
+  const { app, close } = await dataTierApp({});
+  try {
+    const observed = await app.fetch(get('/observe'));
+    assert.equal(observed.status, 200);
+    const policy = observed.headers.get('cache-control') ?? '';
+    assert.match(policy, /public, s-maxage=\d+, stale-while-revalidate=\d+/);
+    assert.doesNotMatch(policy, /no-store/, '/observe is the route that asked to be cached');
   } finally {
     await close();
   }
