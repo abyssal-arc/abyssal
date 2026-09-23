@@ -150,6 +150,39 @@ export interface UsdcFlow {
   x402: boolean | null;
 }
 
+/** How much of the ring one paid answer may carry. */
+export const FlowQueryLimits = { DEFAULT: 500, MAX: 2000 } as const;
+
+export interface FlowQuery {
+  /** Checked as an exact lowercased address; either side of a transfer matches. */
+  addr?: string | null;
+  /** `unknown` covers both readings of the name: never resolved, and resolved as unrecognised. */
+  venue?: VenueKind | null;
+  blockFrom?: number | null;
+  blockTo?: number | null;
+  /** Wall-clock ms, for a range a caller thinks in. */
+  from?: number | null;
+  to?: number | null;
+  limit?: number;
+}
+
+export interface FlowQueryResult {
+  available: true;
+  /** Rows in the ring, matched or not — the ceiling on what this feed can say. */
+  retained: number;
+  oldest: { t: number; block: number } | null;
+  newest: { t: number; block: number } | null;
+  matched: number;
+  truncated: boolean;
+  query: { addr: string | null; venue: VenueKind | null; blockFrom: number | null; blockTo: number | null; limit: number };
+  flows: {
+    t: number; block: number; tx: string; from: string; to: string;
+    /** Whole USDC to the token's own six decimals, and the exact integer below. */
+    amount: number; amountUnits: number;
+    venue: VenueKind | null; venueAddr: string | null; x402: boolean | null;
+  }[];
+}
+
 interface PulseSample {
   t: number;
   count: number;
@@ -566,6 +599,67 @@ export class ArcUsdcFeed implements ChainFeed {
       return txs;
     }
     return this.pendingTxs.splice(0, max);
+  }
+
+  /**
+   * The paid read of the same ring `/observe` shows 160 of: every retained
+   * transfer, filterable by address, venue and block or time range.
+   *
+   * `retained` is reported alongside the rows because it is the honest ceiling
+   * on the answer. The ring is in-memory (see `exportState`, which deliberately
+   * leaves `flows` out of what persists), so on a runtime that evicts its object
+   * this is "everything this feed has seen since it woke", and a buyer is
+   * entitled to see that number rather than to infer it from a short list.
+   */
+  queryFlows(q: FlowQuery = {}): FlowQueryResult {
+    const addr = q.addr ? String(q.addr).toLowerCase() : null;
+    const rows: UsdcFlow[] = [];
+    let matched = 0;
+    for (const f of this.flows) {
+      if (addr && f.from !== addr && f.to !== addr) continue;
+      if (q.venue && !(q.venue === 'unknown' ? f.venue === null || f.venue === 'unknown' : f.venue === q.venue)) continue;
+      if (q.blockFrom !== null && q.blockFrom !== undefined && f.block < q.blockFrom) continue;
+      if (q.blockTo !== null && q.blockTo !== undefined && f.block > q.blockTo) continue;
+      if (q.from !== null && q.from !== undefined && f.t < q.from) continue;
+      if (q.to !== null && q.to !== undefined && f.t > q.to) continue;
+      matched++;
+      rows.push(f);
+    }
+    const limit = q.limit && q.limit > 0 ? q.limit : FlowQueryLimits.DEFAULT;
+    // Newest last, like the ring itself and the free stream: what a caller wants
+    // when a filter matches more than one response can hold is the recent end.
+    const page = matched > limit ? rows.slice(-limit) : rows;
+    const row = (f: UsdcFlow) => ({
+      t: f.t,
+      block: f.block,
+      tx: f.tx,
+      from: f.from,
+      to: f.to,
+      // The free stream rounds to cents (`whalesPayload`, `/observe`) because a
+      // display bar never needs more. A paid answer is a different thing: this
+      // route sells for 0.001 USDC, and every one of those sales lands back in
+      // this ring as a flow, so rounding it the same way would hand a buyer a
+      // ledger where the purchases read as zero. `amount` goes out at the full
+      // six decimals of the token and `amountUnits` is the exact integer the log
+      // line carried — micro-USDC fits a double up to 9e9 of the thing.
+      amount: Math.round(f.amount * 1e6) / 1e6,
+      amountUnits: Math.round(f.amount * 1e6),
+      venue: f.venue,
+      venueAddr: f.venueAddr,
+      x402: f.x402,
+    });
+    return {
+      available: true,
+      retained: this.flows.length,
+      oldest: this.flows.length ? { t: this.flows[0].t, block: this.flows[0].block } : null,
+      newest: this.flows.length
+        ? { t: this.flows[this.flows.length - 1].t, block: this.flows[this.flows.length - 1].block }
+        : null,
+      matched,
+      truncated: matched > page.length,
+      query: { addr, venue: q.venue ?? null, blockFrom: q.blockFrom ?? null, blockTo: q.blockTo ?? null, limit },
+      flows: page.map(row),
+    };
   }
 
   /**

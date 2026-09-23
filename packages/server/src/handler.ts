@@ -49,6 +49,13 @@ import {
   verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
+import {
+  buildFacilitatorConfig, exactRequirement, readPayment, settleFromRequest,
+  ARC_MAINNET_CHAIN_ID, DATA_PRICE_USDC,
+  type FacilitatorConfig,
+} from './facilitator.js';
+import { FlowQueryLimits, type FlowQuery } from './arc.js';
+import { VENUE_KINDS, type VenueKind } from './venue.js';
 import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -292,6 +299,18 @@ export interface AppOptions {
    */
   digestKey?: string;
   /**
+   * USDC seller key for the data tier (`GET /data/flows`). The Worker passes the
+   * `SELLER_PRIVATE_KEY` binding; with neither the route reports itself not for
+   * sale, which is the same honesty rule as `digestKey()`.
+   */
+  sellerKey?: string;
+  /** `1` settles on the keyless Arc testnet trial instead of mainnet. */
+  x402Testnet?: string;
+  /** Where the money goes; defaults to the address `sellerKey` controls. */
+  sellerPayTo?: string;
+  /** Circle's facilitator unless a test points this at a stub. */
+  facilitatorUrl?: string;
+  /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
    * the same handler runs inside a Cloudflare Worker where static assets come
@@ -337,6 +356,51 @@ function sanitizeText(raw: unknown, max: number): string | null {
     .trim();
   if (clean.length === 0 || clean.length > max) return null;
   return clean;
+}
+
+/**
+ * The `GET /data/flows` query, parsed and validated.
+ *
+ * Exported because the part worth testing is the refusal: on a route that
+ * charges before it answers, a malformed filter that quietly degrades into "no
+ * filter" is a buyer paying for a different query than they asked for. So every
+ * parameter here either parses or makes the request fail, and nothing is
+ * defaulted out of silence — except `limit`, which has a documented default.
+ */
+export function flowQueryFromUrl(url: URL): { query: FlowQuery } | { error: string } {
+  const sp = url.searchParams;
+  const errors: string[] = [];
+  const query: FlowQuery = {};
+  const uint = (name: string): number | null => {
+    const raw = sp.get(name);
+    if (raw === null || raw === '') return null;
+    if (!/^\d+$/.test(raw)) {
+      errors.push(`${name} must be a non-negative integer`);
+      return null;
+    }
+    return Number(raw);
+  };
+  const addr = sp.get('addr');
+  if (addr !== null) {
+    if (/^0x[0-9a-fA-F]{40}$/.test(addr)) query.addr = addr;
+    else errors.push('addr must be 0x followed by 40 hex characters');
+  }
+  const venue = sp.get('venue');
+  if (venue !== null) {
+    if ((VENUE_KINDS as readonly string[]).includes(venue)) query.venue = venue as VenueKind;
+    else errors.push(`venue must be one of ${VENUE_KINDS.join(', ')}`);
+  }
+  query.blockFrom = uint('blockFrom');
+  query.blockTo = uint('blockTo');
+  query.from = uint('from');
+  query.to = uint('to');
+  const limit = uint('limit');
+  query.limit = limit === null || limit === 0 ? FlowQueryLimits.DEFAULT : Math.min(limit, FlowQueryLimits.MAX);
+  if (query.blockFrom !== null && query.blockTo !== null && query.blockFrom > query.blockTo) {
+    errors.push('blockFrom is after blockTo');
+  }
+  if (query.from !== null && query.to !== null && query.from > query.to) errors.push('from is after to');
+  return errors.length ? { error: errors.join('; ') } : { query };
 }
 
 /** A creature id from a request body: a positive integer, or null. */
@@ -765,6 +829,7 @@ export function createApp(options: AppOptions = {}) {
   async function healthPayload() {
     const view = options.health?.view() ?? null;
     const problem = view ? healthProblem(view) : null;
+    const tier = dataTier();
     // Derived rather than counted: this describes the record as it stands now,
     // so it cannot "happen" a number of times the way a failed write does. It is
     // also the only digest condition that is reportable without an attempt — a
@@ -793,6 +858,21 @@ export function createApp(options: AppOptions = {}) {
         // existed the only way to tell them apart was to wait for a day to close.
         signer: digestSigner(),
       } : null,
+      // The data tier, as a state rather than a hope. `forSale` is the answer to
+      // "did the seller key reach the object?", which is the same question
+      // `digest.signer` answers for the anchor and for the same reason: a secret
+      // that never arrived is indistinguishable from one that was never set.
+      // `arcFeed` belongs in this block because a tier that is armed with nothing
+      // to sell would be the worst of both — quoting a price for an empty list.
+      data: {
+        forSale: tier !== null,
+        priceUsdc: DATA_PRICE_USDC,
+        network: tier?.network ?? `eip155:${ARC_MAINNET_CHAIN_ID}`,
+        payTo: tier?.payTo ?? null,
+        arcFeed: arcFeed !== null,
+        sales: dataSales,
+        spentPayments: settledNonces.size,
+      },
       world: {
         tick: world.tick,
         day: Math.floor(world.tick / world.config.ticksPerDay),
@@ -890,6 +970,52 @@ export function createApp(options: AppOptions = {}) {
   function digestSigner(): `0x${string}` | null {
     const pk = digestKey();
     return pk ? privateKeyToAccount(pk).address : null;
+  }
+
+  /**
+   * The data tier's seller identity, or null when nothing is for sale. Same
+   * binding-first arrangement as `digestKey()`, and the same consequence when it
+   * is missing: the route says so rather than quoting a price and then failing
+   * every payment against it.
+   */
+  function dataTier(): FacilitatorConfig | null {
+    return buildFacilitatorConfig({
+      sellerKey: options.sellerKey ?? readEnv('SELLER_PRIVATE_KEY'),
+      testnet: options.x402Testnet ?? readEnv('X402_TESTNET'),
+      payTo: options.sellerPayTo ?? readEnv('SELLER_PAY_TO'),
+      baseUrl: options.facilitatorUrl ?? readEnv('FACILITATOR_URL'),
+    });
+  }
+
+  /**
+   * Authorization nonces this isolate has already settled.
+   *
+   * The durable guarantee is on chain — a `transferWithAuthorization` nonce is
+   * single-use in the token contract, so a replayed envelope cannot move money
+   * twice. What that does not rule out is a facilitator that answers a repeat
+   * submission with the original success, which is a reasonable thing for a
+   * payment API to do and would hand out the data a second time for one
+   * payment. This set is the cheap refusal of that case, bounded so a long-lived
+   * object cannot grow it without limit; it is deliberately not the guard, and
+   * nothing here is persisted, because a ring of spent nonces in the snapshot
+   * would compete for the same 2 MiB value the receipts already nearly fill.
+   */
+  const settledNonces = new Set<string>();
+  const SETTLED_MAX = 500;
+  /** Sales settled by this isolate, for the paid response and `/health`. */
+  let dataSales = 0;
+
+  /** Remember one settled payment, dropping the oldest when the ring is full. */
+  function noteSettled(nonce: string): void {
+    // Casing carries no information in a 32-byte hex nonce, and the burn
+    // receipts learned what that costs when one side of a comparison normalized
+    // and the other did not. Stored in one shape, looked up in the same one.
+    const key = nonce.toLowerCase();
+    settledNonces.add(key);
+    if (settledNonces.size > SETTLED_MAX) {
+      const oldest = settledNonces.values().next().value as string;
+      settledNonces.delete(oldest);
+    }
   }
 
   /**
@@ -1480,6 +1606,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
+        'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the retained Arc USDC flow ring in depth and filtered — ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; 503 until the SELLER_PRIVATE_KEY binding is set`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
@@ -1510,7 +1637,7 @@ export function createApp(options: AppOptions = {}) {
         headers: {
           'access-control-allow-origin': '*',
           'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
-          'access-control-allow-headers': 'content-type,x-payment-tx',
+          'access-control-allow-headers': 'content-type,x-payment,x-payment-tx',
         },
       });
     }
@@ -1579,6 +1706,63 @@ export function createApp(options: AppOptions = {}) {
       } catch {
         return json({ error: 'history unavailable' }, 503);
       }
+    }
+
+    if (req.method === 'GET' && path === '/data/flows') {
+      // The paid tier: the flow ring in depth and filtered, against the free
+      // stream's last 160. Order matters twice over here. The query is validated
+      // before anything is quoted, because a filter nobody can honour should not
+      // cost a signature. And no row leaves this handler before the settlement
+      // came back ok, because the other order is a paywall you can read through.
+      const cfg = dataTier();
+      const price = { usdc: DATA_PRICE_USDC, network: `eip155:${cfg?.chainId ?? ARC_MAINNET_CHAIN_ID}` };
+      if (!cfg) {
+        return json({
+          available: false,
+          error: 'the data tier is not for sale yet',
+          hint: 'it opens when the SELLER_PRIVATE_KEY binding is set',
+          price,
+        }, 503, 0);
+      }
+      if (!arcFeed) {
+        // Nothing to sell, and saying so beats taking money for an empty list:
+        // off-Arc this feed is a synthetic one, whose transfers are not data.
+        return json({ available: false, error: 'no Arc flow history is being recorded', price }, 503, 0);
+      }
+      const parsed = flowQueryFromUrl(url);
+      if ('error' in parsed) return json({ error: parsed.error, price }, 400, 0);
+      const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+      const read = readPayment(req);
+      if (!read.ok) return json({ x402Version: 2, error: read.reason, accepts: [requirement] }, 402, 0);
+      const nonce = String(read.auth.nonce ?? '');
+      if (nonce && settledNonces.has(nonce.toLowerCase())) {
+        // Refused here rather than at Circle: see the note on `data_settle_failed`
+        // for why this one is not counted.
+        return json({ x402Version: 2, error: 'this payment has already been spent', accepts: [requirement] }, 402, 0);
+      }
+      const verdict = await settleFromRequest(req, cfg, requirement).catch((err) => {
+        // Circle unreachable, DNS dead, TLS broken: `fetch` rejects and that
+        // rejection is not a verdict, so without this the buyer's request becomes
+        // a 500 with no trace anywhere. Reported as a facilitator-stage failure,
+        // which is the one kind the counter below agrees to carry.
+        console.error('[data] settleFromRequest threw:', err);
+        return { ok: false, reason: 'settlement unavailable', stage: 'facilitator' } as const;
+      });
+      if (!verdict.ok) {
+        // Only the failures that cost the seller something are counted. A
+        // precheck refusal needs no money and no wallet, so an anonymous flood
+        // of them would turn `/health` red on purpose — see the note on
+        // `data_settle_failed` in health.ts.
+        if (verdict.stage !== 'precheck') options.health?.note('data_settle_failed', verdict.reason);
+        return json({ x402Version: 2, error: verdict.reason ?? 'settlement failed', accepts: [requirement] }, 402, 0);
+      }
+      noteSettled(nonce);
+      dataSales += 1;
+      return json({
+        ...arcFeed.queryFlows(parsed.query),
+        settlement: { tx: verdict.tx ?? null, payer: verdict.payer ?? null, network: cfg.network, amount: requirement.amount },
+        sold: dataSales,
+      }, 200, 0);
     }
 
     if (req.method === 'GET' && path === '/judgments') {

@@ -7,10 +7,12 @@
  * which is what lets an intervention land in the same tick as the payment.
  *
  * RESERVED: interventions do not use this module. They are paid by burning
- * ABYS and proven with a burn receipt (see payments.ts). What remains here is
- * the USDC path for a future paid data tier: enabled by SELLER_PRIVATE_KEY
- * (the key controlling `payTo`), settling on Arc mainnet (eip155:5042), or on
- * the keyless Arc testnet trial (eip155:5042002) with X402_TESTNET=1.
+ * ABYS and proven with a burn receipt (see payments.ts). What this module sells
+ * is the data tier: `GET /data/flows`, priced in USDC and settled here. The
+ * seller key arrives as a binding like every other secret in this build (see
+ * `digestKey()` in handler.ts for why nothing trusts `process.env` first), and
+ * without one the route reports itself not for sale rather than quoting a price
+ * nobody can pay.
  */
 import { keccak256, recoverTypedDataAddress, toBytes } from 'viem';
 
@@ -35,25 +37,79 @@ export interface FacilitatorConfig {
   account: ReturnType<typeof privateKeyToAccount>;
 }
 
-/** Null unless a seller key is configured; the server then refuses to sell. */
-export function facilitatorConfig(): FacilitatorConfig | null {
-  const pk = process.env.SELLER_PRIVATE_KEY;
-  if (!pk) return null;
-  const chainId = process.env.X402_TESTNET === '1' ? ARC_TESTNET_CHAIN_ID : ARC_MAINNET_CHAIN_ID;
+/**
+ * What one call to the data tier costs, in whole USDC. Taken from TOKEN_PLAN.md
+ * §7 ("历史 API 单次调用 $0.001"), which is also the only place that price is
+ * written down — so the constant lives beside the code that charges it.
+ */
+export const DATA_PRICE_USDC = '0.001';
+
+/** Same shape the day-anchor key is checked against, for the same reason. */
+const KEY_SHAPE = /^0x[0-9a-fA-F]{64}$/;
+
+export interface FacilitatorSource {
+  /** Hex private key controlling `payTo`. Anything else means "not for sale". */
+  sellerKey?: string | null;
+  /** `1` selects the keyless Arc testnet trial; anything else is mainnet. */
+  testnet?: string | null;
+  /** Defaults to the address the seller key controls. */
+  payTo?: string | null;
+  /** Circle's hosted facilitator unless a test points this somewhere else. */
+  baseUrl?: string | null;
+}
+
+/**
+ * Null unless a well-formed seller key is present; the server then refuses to
+ * sell.
+ *
+ * Two things this does on purpose. It never reads an environment itself — the
+ * caller hands over what its runtime gave it, which is the arrangement
+ * `ARC_DIGEST_KEY` moved to and the reason a configured secret can no longer be
+ * invisible. And it shape-checks before `privateKeyToAccount`, because viem
+ * throws on a key that was truncated on its way into a dashboard, and a throw
+ * here would be a 500 on a route a paying customer just followed a 402 to.
+ */
+export function buildFacilitatorConfig(src: FacilitatorSource): FacilitatorConfig | null {
+  const pk = src.sellerKey ?? null;
+  if (!pk || !KEY_SHAPE.test(pk)) return null;
+  const chainId = src.testnet === '1' ? ARC_TESTNET_CHAIN_ID : ARC_MAINNET_CHAIN_ID;
   const account = privateKeyToAccount(pk as `0x${string}`);
   return {
     network: `eip155:${chainId}`,
     chainId,
-    payTo: (process.env.SELLER_PAY_TO ?? account.address).toLowerCase(),
-    baseUrl: process.env.FACILITATOR_URL ?? 'https://api.circle.com/v1/facilitator/x402',
+    payTo: (src.payTo ?? account.address).toLowerCase(),
+    baseUrl: src.baseUrl ?? 'https://api.circle.com/v1/facilitator/x402',
     usdc: ARC_USDC,
     account,
   };
 }
 
+/** USDC is a 6-decimal token, and that is the only precision money can hold. */
+const USDC_DECIMALS = 6;
+
+/**
+ * A price in whole USDC, as exact base units.
+ *
+ * `BigInt(Math.round(Number(price) * 1e6))` was the previous arithmetic, and it
+ * fails in the one direction that matters: a price finer than a USDC base unit
+ * rounds to `0`, which is an endpoint that quotes $0.0000001 and then accepts
+ * nothing. Multiplying by a power of ten is exact once the fraction is read as
+ * text, so it is read as text — and anything that does not fit in 6 decimals is
+ * a mistake in this file rather than a price, and says so.
+ */
+export function usdcUnits(priceUsdc: string): bigint {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(priceUsdc.trim());
+  if (!m) throw new TypeError(`not a USDC price: ${JSON.stringify(priceUsdc)}`);
+  const frac = m[2] ?? '';
+  if (frac.length > USDC_DECIMALS) {
+    throw new TypeError(`finer than a USDC base unit: ${priceUsdc}`);
+  }
+  return BigInt(m[1]) * 10n ** BigInt(USDC_DECIMALS) + BigInt(frac.padEnd(USDC_DECIMALS, '0'));
+}
+
 /** x402-spec payment requirements for a USDC price, settled by Circle. */
 export function exactRequirement(cfg: FacilitatorConfig, priceUsdc: string) {
-  const amount = String(BigInt(Math.round(Number(priceUsdc) * 1_000_000)));
+  const amount = String(usdcUnits(priceUsdc));
   return {
     scheme: 'exact',
     network: cfg.network,
@@ -122,11 +178,28 @@ async function sellerProof(
   return Buffer.from(JSON.stringify(envelope)).toString('base64url');
 }
 
+/**
+ * The verdict on one payment attempt, and where it came from.
+ *
+ * `stage` is not decoration. A caller that counts failures for `/health` has to
+ * tell "a buyer's wallet handed us an expired authorization" apart from "Circle
+ * could not be reached", because the first is reachable by anyone with a
+ * keyboard and no money, while the second costs the attacker a real payment.
+ * Counting both would let an anonymous flood turn the health light red, which is
+ * the exact failure mode this whole module exists to avoid.
+ */
 export interface Settlement {
   ok: boolean;
   tx?: string;
   payer?: string;
   reason?: string;
+  /** `precheck` refused before any network call; `facilitator` is what Circle answered. */
+  stage: 'precheck' | 'facilitator';
+}
+
+/** One of our own refusals, before a single packet leaves for the facilitator. */
+function reject(reason: string): Settlement {
+  return { ok: false, reason, stage: 'precheck' };
 }
 
 /** Submit a buyer authorization to /settle and wait out any pending state. */
@@ -146,10 +219,10 @@ async function settle(
   try {
     out = await res.json();
   } catch {
-    return { ok: false, reason: `facilitator http ${res.status}` };
+    return { ok: false, reason: `facilitator http ${res.status}`, stage: 'facilitator' };
   }
   if (out?.success === true) {
-    return { ok: true, tx: out.transaction, payer: out.payer };
+    return { ok: true, tx: out.transaction, payer: out.payer, stage: 'facilitator' };
   }
   const pending = out?.extensions?.['settlement-status'];
   if (out?.errorReason === 'settlement_pending' && pending?.paymentId) {
@@ -167,12 +240,12 @@ async function settle(
       } catch {
         continue;
       }
-      if (st?.status === 'completed') return { ok: true, tx: st.transaction, payer: st.payer };
-      if (st?.status && st.status !== 'pending') return { ok: false, reason: st.reason ?? st.status };
+      if (st?.status === 'completed') return { ok: true, tx: st.transaction, payer: st.payer, stage: 'facilitator' };
+      if (st?.status && st.status !== 'pending') return { ok: false, reason: st.reason ?? st.status, stage: 'facilitator' };
     }
-    return { ok: false, reason: 'settlement timed out' };
+    return { ok: false, reason: 'settlement timed out', stage: 'facilitator' };
   }
-  return { ok: false, reason: out?.errorReason ?? `facilitator http ${res.status}` };
+  return { ok: false, reason: out?.errorReason ?? `facilitator http ${res.status}`, stage: 'facilitator' };
 }
 
 /**
@@ -226,15 +299,18 @@ async function recoverSigner(
 }
 
 /**
- * Parse `X-Payment`, check the buyer's authorization against our own offer,
- * then settle it through Circle. Returns the settlement verdict; the caller
- * applies the intervention only on `ok`.
+ * One read of the `X-Payment` envelope, shared by the settlement path and by any
+ * caller that needs a field from it before deciding to settle.
+ *
+ * Exported because the alternative — a second decoder in the handler, written
+ * from memory of this one — is how the burn-receipt guard got two spellings of
+ * the same key and started disagreeing about casing.
  */
-export async function settleFromRequest(
-  req: Request,
-  cfg: FacilitatorConfig,
-  requirement: ExactRequirement,
-): Promise<Settlement> {
+export type PaymentRead =
+  | { ok: true; accepted: any; auth: any; signature: string; envelope: any }
+  | { ok: false; reason: string };
+
+export function readPayment(req: Request): PaymentRead {
   const header = req.headers.get('x-payment');
   if (!header) return { ok: false, reason: 'missing X-Payment' };
   let payload: any;
@@ -251,18 +327,37 @@ export async function settleFromRequest(
   const auth = payload?.payload?.authorization;
   const signature = payload?.payload?.signature;
   if (!accepted || !auth || !signature) return { ok: false, reason: 'malformed payment payload' };
-  if (String(accepted.amount) !== requirement.amount) return { ok: false, reason: 'amount mismatch' };
-  if (String(accepted.payTo).toLowerCase() !== requirement.payTo) return { ok: false, reason: 'payTo mismatch' };
-  if (accepted.network !== requirement.network) return { ok: false, reason: 'network mismatch' };
-  if (String(auth.to).toLowerCase() !== requirement.payTo) return { ok: false, reason: 'authorization payTo mismatch' };
-  if (String(auth.value) !== requirement.amount) return { ok: false, reason: 'authorization amount mismatch' };
+  // `envelope` is the whole decoded header, not the pieces above: it is what
+  // gets handed to Circle, so reassembling it here from three fields would put
+  // a second, lossier copy of the buyer's payment on the wire.
+  return { ok: true, accepted, auth, signature, envelope: payload };
+}
+
+/**
+ * Parse `X-Payment`, check the buyer's authorization against our own offer,
+ * then settle it through Circle. Returns the settlement verdict; the caller
+ * applies the intervention only on `ok`.
+ */
+export async function settleFromRequest(
+  req: Request,
+  cfg: FacilitatorConfig,
+  requirement: ExactRequirement,
+): Promise<Settlement> {
+  const read = readPayment(req);
+  if (!read.ok) return reject(read.reason);
+  const { accepted, auth, signature, envelope } = read;
+  if (String(accepted.amount) !== requirement.amount) return reject('amount mismatch');
+  if (String(accepted.payTo).toLowerCase() !== requirement.payTo) return reject('payTo mismatch');
+  if (accepted.network !== requirement.network) return reject('network mismatch');
+  if (String(auth.to).toLowerCase() !== requirement.payTo) return reject('authorization payTo mismatch');
+  if (String(auth.value) !== requirement.amount) return reject('authorization amount mismatch');
   const validBefore = Number(auth.validBefore);
   if (Number.isFinite(validBefore) && validBefore * 1000 < Date.now()) {
-    return { ok: false, reason: 'authorization expired' };
+    return reject('authorization expired');
   }
   const signer = await recoverSigner(cfg, requirement, auth, signature as `0x${string}`);
   if (signer && signer.toLowerCase() !== String(auth.from).toLowerCase()) {
-    return { ok: false, reason: 'signer_mismatch', payer: String(auth.from) };
+    return { ok: false, reason: 'signer_mismatch', payer: String(auth.from), stage: 'precheck' };
   }
-  return settle(cfg, payload, requirement);
+  return settle(cfg, envelope, requirement);
 }

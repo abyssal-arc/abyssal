@@ -7,13 +7,16 @@ import type { MarketFeed } from '../src/market.js';
 import { serveStatic } from '../src/static.js';
 import {
   ARC_USDC,
+  buildFacilitatorConfig,
+  DATA_PRICE_USDC,
   exactRequirement,
   settleFromRequest,
+  usdcUnits,
   type FacilitatorConfig,
 } from '../src/facilitator.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createServer } from 'node:http';
-import { appendFileSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
@@ -3254,6 +3257,15 @@ type HealthBody = {
     verifies: boolean;
     signer: string | null;
   } | null;
+  data: {
+    forSale: boolean;
+    priceUsdc: string;
+    network: string;
+    payTo: string | null;
+    arcFeed: boolean;
+    sales: number;
+    spentPayments: number;
+  };
   world: { tick: number; day: number; ticksPerDay: number; population: number };
   instance: string;
   isolateStartedAt: number | null;
@@ -3627,3 +3639,684 @@ test('the durable object forwards the signing key it was handed', async () => {
     'the object passed the binding down to the code that signs',
   );
 });
+
+/* ---------- the paid data tier: GET /data/flows ---------- */
+
+const SELLER_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
+const BUYER_KEY = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a';
+const STRANGER_KEY = '0x701b615bbdfb9de65240bc28bd21bbc0d996645a3dd57e7b12bc2bdf6f192c82';
+
+test('a price is exact base units, and a fraction finer than a cent is a mistake', () => {
+  // USDC has six decimals, so six decimals is all a price is ever allowed to
+  // carry. What this replaced was `BigInt(Math.round(Number(price) * 1e6))`, run
+  // side by side with the version above and measured rather than remembered:
+  const floats = (p: string): bigint => BigInt(Math.round(Number(p) * 1e6));
+  assert.equal(usdcUnits('0.001'), 1000n, 'the price this route actually charges');
+  assert.equal(usdcUnits('1'), 1000000n);
+  assert.equal(usdcUnits('0.000001'), 1n, 'one base unit is the smallest thing that can be sold');
+  assert.equal(usdcUnits('9007199254740.991'), 9007199254740991000n);
+  assert.equal(usdcUnits('10000000000000.001'), 10000000000000001000n);
+
+  // Measured difference #1: a price under half a base unit became `0`, which is
+  // an endpoint that advertises a payment and then charges nothing — the quote
+  // and the accepted amount disagree with reality, and the free tier is back.
+  assert.equal(floats('0.0000004'), 0n, 'what the old arithmetic made of it');
+  assert.throws(() => usdcUnits('0.0000004'), TypeError, 'and here it says so instead');
+  // Measured difference #2: past 2^53 base units a double stops carrying the
+  // fraction at all. The old path was off by 1048 and by 1048 again in the other
+  // direction, which is a buyer paying the wrong amount for a signed message.
+  assert.equal(floats('9007199254740.991'), 9007199254740989952n, 'measured, not recalled');
+  assert.equal(floats('10000000000000.001'), 10000000000000002048n);
+
+  for (const bad of ['0.0000001', '1,000', '', '   ', '1.', '-1', '0x10', '1e-6', 'abc']) {
+    assert.throws(() => usdcUnits(bad), TypeError, `${JSON.stringify(bad)} is not a price`);
+  }
+});
+
+test('the seller identity is built from a key that is a key, and from nothing else', () => {
+  const seller = privateKeyToAccount(SELLER_KEY as `0x${string}`);
+  for (const missing of [undefined, null, '', '0x', `0x${'ab'.repeat(31)}`, 'nope', SELLER_KEY.slice(2)]) {
+    assert.equal(buildFacilitatorConfig({ sellerKey: missing }), null, `${JSON.stringify(missing)} is not a key`);
+  }
+  // The shape check exists because viem throws on a truncated key, and a throw
+  // here is a 500 on a page where a paying customer just agreed to sign.
+  assert.equal(buildFacilitatorConfig({}), null, 'no key at all means nothing is for sale');
+
+  const main = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+  assert.ok(main);
+  assert.equal(main.chainId, 5042, 'Arc mainnet unless something says otherwise');
+  assert.equal(main.network, 'eip155:5042');
+  assert.equal(main.payTo, seller.address.toLowerCase(), 'the seller gets their own money, in one casing');
+  assert.equal(main.baseUrl, 'https://api.circle.com/v1/facilitator/x402');
+  assert.equal(main.usdc, ARC_USDC);
+
+  assert.equal(buildFacilitatorConfig({ sellerKey: SELLER_KEY, testnet: '1' })?.chainId, 5042002);
+  // Anything but `1` is mainnet, including the near-misses a dashboard typo
+  // produces: `true` read as a testnet setting must not quietly move real money
+  // onto a trial network.
+  for (const notTestnet of ['0', 'true', 'yes', '', undefined]) {
+    assert.equal(buildFacilitatorConfig({ sellerKey: SELLER_KEY, testnet: notTestnet })?.chainId, 5042);
+  }
+  const moved = buildFacilitatorConfig({ sellerKey: SELLER_KEY, payTo: `0x${'cd'.repeat(20)}` });
+  assert.equal(moved?.payTo, `0x${'cd'.repeat(20)}`, 'an explicit destination wins over the derived one');
+  assert.equal(buildFacilitatorConfig({ sellerKey: SELLER_KEY, baseUrl: 'http://127.0.0.1:9' })?.baseUrl, 'http://127.0.0.1:9');
+
+  // And the offer the buyer signs against is that identity, in base units.
+  const requirement = exactRequirement(main, DATA_PRICE_USDC);
+  assert.equal(requirement.amount, '1000');
+  assert.equal(requirement.payTo, seller.address.toLowerCase());
+  assert.equal(requirement.network, 'eip155:5042');
+  assert.equal(requirement.asset, ARC_USDC);
+  assert.equal(requirement.scheme, 'exact');
+});
+
+/**
+ * The pricing document, when the checkout has one. `TOKEN_PLAN.md` is
+ * deliberately gitignored — it carries commitments that are not published yet —
+ * so a CI checkout does not contain it and a lock that depends on reading it
+ * would fail there for the wrong reason. The lock is therefore a working-copy
+ * guarantee: asserted when the document is present, announced as skipped when
+ * it is not, so a green run never implies the two agreed.
+ */
+function readTokenPlan(): string | null {
+  // The search walks upward rather than hard-coding a relative path, because
+  // the same test runs from `src/` and from `dist/`, which are one level apart.
+  // It stops at the repository root and nowhere else: measured, a copy of the
+  // tree extracted into a subdirectory of a working copy climbed out of itself
+  // and found the outer copy's plan, so the lock was silently validating a
+  // file that did not belong to the checkout under test. `wrangler.toml` is the
+  // root marker because it is committed, and a checkout without it is not this
+  // repository.
+  let dir = new URL('..', import.meta.url);
+  for (let up = 0; up < 8; up += 1) {
+    const plan = new URL('TOKEN_PLAN.md', dir);
+    if (existsSync(plan)) return readFileSync(plan, 'utf8');
+    if (existsSync(new URL('wrangler.toml', dir))) return null;
+    dir = new URL('..', dir);
+  }
+  return null;
+}
+
+const TOKEN_PLAN = readTokenPlan();
+
+test('the price in the code is the price written in the plan', {
+  skip: TOKEN_PLAN === null ? 'TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy' : false,
+}, async () => {
+  // TOKEN_PLAN.md §7 is where the number is promised to whoever reads the plan;
+  // `DATA_PRICE_USDC` is where it is charged. Two places for one number is how
+  // they drift apart, so the document is read back here on purpose.
+  const plan = TOKEN_PLAN ?? '';
+  const line = plan.split('\n').find((l) => l.includes('历史 API'));
+  assert.ok(line, 'the plan still names the historical API price');
+  const stated = /\$\s*([0-9.]+)/.exec(line ?? '');
+  assert.ok(stated, `the price is a $ figure in: ${line}`);
+  assert.equal(stated[1], DATA_PRICE_USDC, 'what the plan promises is what the route charges');
+  assert.equal(usdcUnits(DATA_PRICE_USDC), 1000n, 'and it survives the conversion to base units');
+});
+
+/** One answer from the stub facilitator: a status, a JSON body, or neither. */
+interface StubReply { status?: number; json?: unknown; text?: string }
+
+interface StubFacilitator {
+  url: string;
+  /** What was POSTed, in arrival order — the whole body, not a summary of it. */
+  bodies: any[];
+  hits(): number;
+  close(): Promise<void>;
+}
+
+/** Circle, replaced by a local server that says exactly what a test needs said. */
+async function serveFacilitator(replies: StubReply[]): Promise<StubFacilitator> {
+  const bodies: any[] = [];
+  let hits = 0;
+  const server = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += String(chunk); });
+    req.on('end', () => {
+      const reply = replies[Math.min(hits, replies.length - 1)];
+      hits += 1;
+      try {
+        bodies.push(raw ? JSON.parse(raw) : null);
+      } catch {
+        bodies.push(raw);
+      }
+      res.setHeader('content-type', 'application/json');
+      res.statusCode = reply.status ?? 200;
+      res.end(reply.text ?? JSON.stringify(reply.json));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    bodies,
+    hits: () => hits,
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
+
+/**
+ * An `X-Payment` header carrying one EIP-3009 authorization for the price on
+ * offer, signed for real by `key` — the same `signTypedData` path a wallet runs.
+ * Nothing here is mocked except Circle itself, so a route test that settles has
+ * actually settled a signature the pre-checks had to accept.
+ */
+async function payHeader(
+  cfg: FacilitatorConfig,
+  requirement: ReturnType<typeof exactRequirement>,
+  key: ReturnType<typeof privateKeyToAccount>,
+  nonce: string,
+  over: Record<string, string> = {},
+): Promise<string> {
+  const authorization = {
+    from: key.address,
+    to: cfg.payTo,
+    value: requirement.amount,
+    validAfter: '0',
+    validBefore: String(Math.floor(Date.now() / 1000) + 600),
+    nonce,
+    ...over,
+  };
+  const signature = await key.signTypedData({
+    domain: {
+      name: 'USDC',
+      version: '2',
+      chainId: cfg.chainId,
+      verifyingContract: cfg.usdc as `0x${string}`,
+    },
+    types: {
+      TransferWithAuthorization: [
+        { name: 'from', type: 'address' },
+        { name: 'to', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'validAfter', type: 'uint256' },
+        { name: 'validBefore', type: 'uint256' },
+        { name: 'nonce', type: 'bytes32' },
+      ],
+    },
+    primaryType: 'TransferWithAuthorization',
+    message: {
+      from: authorization.from,
+      to: authorization.to as `0x${string}`,
+      value: BigInt(authorization.value),
+      validAfter: BigInt(authorization.validAfter),
+      validBefore: BigInt(authorization.validBefore),
+      nonce: authorization.nonce as `0x${string}`,
+    },
+  });
+  return Buffer.from(JSON.stringify({
+    x402Version: 2,
+    resource: { url: 'http://localhost/data/flows', description: 'flow ring', mimeType: 'application/json' },
+    accepted: requirement,
+    payload: { signature, authorization },
+  })).toString('base64url');
+}
+
+const ALPHA = '0x' + 'a1'.repeat(20);
+const BETA = '0x' + 'b2'.repeat(20);
+const GAMMA = '0x' + 'c3'.repeat(20);
+const T0 = 1_700_000_000_000;
+
+/** Four transfers, arranged so each filter has something only it can match. */
+const RING = [
+  { t: T0 + 1, block: 101, tx: '0x' + 'e1'.repeat(32), from: ALPHA, to: BETA, amount: 0.001, venue: 'x402', venueAddr: ARC_USDC, x402: true },
+  { t: T0 + 2, block: 102, tx: '0x' + 'e2'.repeat(32), from: BETA, to: GAMMA, amount: 1234.567891, venue: 'swap', venueAddr: '0x' + 'd4'.repeat(20), x402: false },
+  { t: T0 + 3, block: 103, tx: '0x' + 'e3'.repeat(32), from: GAMMA, to: ALPHA, amount: 5, venue: null, venueAddr: null, x402: null },
+  { t: T0 + 4, block: 104, tx: '0x' + 'e4'.repeat(32), from: BETA, to: ALPHA, amount: 7, venue: 'unknown', venueAddr: '0x' + 'f5'.repeat(20), x402: null },
+];
+
+/** An app whose feed is Arc (so there is a ring to sell) over a stub facilitator. */
+async function dataTierApp(env: {
+  sellerKey?: string | null;
+  replies?: StubReply[];
+  /** `false` runs the synthetic feed: a seller with nothing recorded. */
+  arc?: boolean;
+  health?: ReturnType<typeof createHealth>;
+}): Promise<{
+  app: ReturnType<typeof createApp>;
+  stub: StubFacilitator;
+  close: () => Promise<void>;
+}> {
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const stub = await serveFacilitator(env.replies ?? [{ json: { success: true, transaction: '0x' + 'fe'.repeat(32), payer: ALPHA } }]);
+  const arc = env.arc !== false;
+  const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  (feed as unknown as { flows: unknown[] }).flows = arc ? RING.map((r) => ({ ...r })) : [];
+  const app = createApp({
+    seed: 1,
+    store: memStore().store,
+    chainFeed: arc ? feed : offlineFeeds.chainFeed,
+    marketFeed: arc ? undefined : offlineFeeds.marketFeed,
+    sellerKey: env.sellerKey === null ? undefined : env.sellerKey ?? SELLER_KEY,
+    facilitatorUrl: stub.url,
+    health: env.health,
+  });
+  return { app, stub, close: () => stub.close() };
+}
+
+const get = (path: string, headers: Record<string, string> = {}): Request =>
+  new Request(`http://localhost${path}`, { headers });
+
+test('the data tier is closed until a seller key arrives, and names the knob', async () => {
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  const res = await app.fetch(get('/data/flows'));
+  assert.equal(res.status, 503, 'not for sale, and not pretending to be');
+  const body = (await res.json()) as { available: boolean; error: string; hint: string; price: { usdc: string; network: string } };
+  assert.equal(body.available, false);
+  assert.match(body.hint, /SELLER_PRIVATE_KEY/, 'a 503 that says which secret is missing is a fixable 503');
+  assert.equal(body.price.usdc, DATA_PRICE_USDC);
+  assert.equal(body.price.network, 'eip155:5042', 'the network the price would be charged on');
+
+  const health = await readHealth(app);
+  assert.equal(health.data.forSale, false);
+  assert.equal(health.data.payTo, null, 'nothing derived, because nothing was derived from');
+  assert.equal(health.data.arcFeed, false, 'a synthetic feed has no Arc history either');
+  assert.equal(health.data.sales, 0);
+  assert.equal(health.data.spentPayments, 0);
+});
+
+test('a key with nothing recorded still refuses to charge', async () => {
+  // The state worth covering is the half-configured one: secret installed, chain
+  // feed off. Selling an empty list for real money is worse than saying so.
+  const { app, stub, close } = await dataTierApp({ arc: false, replies: [{ text: 'must never be reached', status: 599 }] });
+  try {
+    const res = await app.fetch(get('/data/flows'));
+    assert.equal(res.status, 503);
+    const body = (await res.json()) as { error: string };
+    assert.match(body.error, /no Arc flow history/);
+    assert.equal(stub.hits(), 0, 'no payment was quoted, so none could be taken');
+
+    const health = await readHealth(app);
+    assert.equal(health.data.forSale, true, 'the key is there');
+    assert.equal(health.data.arcFeed, false, 'and the endpoint says the other half is not');
+  } finally {
+    await close();
+  }
+});
+
+test('a filter nobody can honour is refused before anything is quoted', async () => {
+  const { app, stub, close } = await dataTierApp({});
+  try {
+    for (const [path, needle] of [
+      ['/data/flows?addr=nothex', /addr/],
+      ['/data/flows?addr=' + ALPHA + '1', /addr/],
+      ['/data/flows?venue=exchange', /venue/],
+      ['/data/flows?blockFrom=-5', /blockFrom/],
+      ['/data/flows?blockFrom=9&blockTo=1', /blockFrom is after blockTo/],
+      ['/data/flows?from=99999&to=111', /from is after to/],
+      ['/data/flows?limit=many', /limit/],
+    ] as const) {
+      const res = await app.fetch(get(path));
+      assert.equal(res.status, 400, `${path} should be a bad request, not a bill`);
+      const body = (await res.json()) as { error: string };
+      assert.match(body.error, needle, `the refusal names the parameter: ${body.error}`);
+    }
+    assert.equal(stub.hits(), 0, 'and Circle never hears about a request that was never going to be answered');
+  } finally {
+    await close();
+  }
+});
+
+test('the 402 quotes one base-unit-exact price against the seller identity', async () => {
+  const { app, stub, close } = await dataTierApp({});
+  try {
+    const res = await app.fetch(get('/data/flows?addr=' + ALPHA));
+    assert.equal(res.status, 402);
+    const body = (await res.json()) as { x402Version: number; error: string; accepts: ReturnType<typeof exactRequirement>[] };
+    assert.equal(body.x402Version, 2);
+    assert.match(body.error, /missing X-Payment/, 'the reason is the missing header, not a mystery');
+    assert.equal(body.accepts.length, 1);
+    const req = body.accepts[0];
+    assert.equal(req.scheme, 'exact');
+    assert.equal(req.network, 'eip155:5042');
+    assert.equal(req.amount, '1000', '0.001 USDC, in the units the token actually has');
+    assert.equal(req.payTo, privateKeyToAccount(SELLER_KEY as `0x${string}`).address.toLowerCase());
+    assert.equal(req.asset, ARC_USDC);
+    assert.equal(req.extra.assetTransferMethod, 'eip3009');
+    assert.equal(stub.hits(), 0);
+  } finally {
+    await close();
+  }
+});
+
+test('flowQueryFromUrl defaults the depth it documents and refuses the rest', async () => {
+  const { flowQueryFromUrl } = await import('../src/handler.js');
+  type Parsed = { query?: Record<string, unknown>; error?: string };
+  const parse = (q: string): Parsed =>
+    flowQueryFromUrl(new URL(`http://localhost/data/flows${q}`)) as Parsed;
+  const error = (q: string): string => String(parse(q).error ?? '');
+
+  assert.equal(parse('').query?.limit, 500, 'the documented default');
+  assert.equal(parse('?limit=0').query?.limit, 500, 'a zero asks for the default, not for nothing');
+  assert.equal(parse('?limit=37').query?.limit, 37, 'a real number is honoured');
+  assert.equal(parse('?limit=999999').query?.limit, 2000, 'and the ceiling on one answer is the ceiling');
+  assert.equal(parse('?addr=' + ALPHA).query?.addr, ALPHA, 'kept as sent; the query normalizes, not the parser');
+  assert.equal(parse('?blockFrom=12').query?.blockFrom, 12);
+  assert.equal(parse('?blockTo=').query?.blockTo, null, 'an empty value is an absent value');
+  assert.ok(parse('?venue=x402').query, 'no error for a venue the feed reports');
+  for (const venue of ['swap', 'aa', 'direct', 'contract', 'unknown']) {
+    assert.equal(error(`?venue=${venue}`), '', `${venue} is a venue the feed reports`);
+  }
+  assert.match(error('?venue=borrowed'), /x402, swap, aa, direct, contract, unknown/);
+  assert.match(error('?blockFrom=1&limit=x&venue=y'), /;.*/, 'every problem at once, in one answer');
+});
+
+test('the ring answers its filters, and reports the ceiling on its own answer', async () => {
+  // `queryFlows` is the half of the paid tier that has no money in it, so it is
+  // tested as itself: same feed, same injected ring, no envelope.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  const ring = (rows: Record<string, unknown>[]): void => {
+    (feed as unknown as { flows: unknown[] }).flows = rows.map((r) => ({ ...r }));
+  };
+  ring(RING);
+
+  assert.equal(feed.queryFlows().matched, 4, 'no filter is everything retained');
+  ring([]);
+  const bare = feed.queryFlows();
+  assert.equal(bare.retained, 0, 'an empty ring says it is empty');
+  assert.equal(bare.matched, 0);
+  assert.deepEqual(bare.flows, []);
+  assert.deepEqual([bare.oldest, bare.newest], [null, null], 'and invents no span to fill the list');
+  assert.equal(bare.query.limit, 500, 'the echoed query carries the default that was applied');
+  ring(RING);
+
+  // Either side of a transfer matches, which is the only reading of "what came
+  // through this address" that a buyer would accept. Counted off `RING`, which is
+  // ALPHA→BETA, BETA→GAMMA, GAMMA→ALPHA, BETA→ALPHA.
+  assert.equal(feed.queryFlows({ addr: BETA }).matched, 3, 'one in, two out');
+  assert.equal(feed.queryFlows({ addr: ALPHA }).matched, 3, 'one out, two in');
+  assert.equal(feed.queryFlows({ addr: GAMMA }).matched, 2, 'one in, one out');
+  assert.equal(feed.queryFlows({ addr: '0x' + 'ff'.repeat(20) }).matched, 0, 'an address with nothing to show');
+
+  // `unknown` covers both ways an unattributed transfer can read: never
+  // resolved, and resolved to something uncatalogued.
+  assert.deepEqual(feed.queryFlows({ venue: 'unknown' }).flows.map((r) => r.tx), [RING[2].tx, RING[3].tx]);
+  assert.deepEqual(feed.queryFlows({ venue: 'x402' }).flows.map((r) => r.tx), [RING[0].tx]);
+
+  assert.deepEqual(feed.queryFlows({ blockFrom: 103 }).flows.map((r) => r.block), [103, 104]);
+  assert.deepEqual(feed.queryFlows({ blockTo: 102 }).flows.map((r) => r.block), [101, 102]);
+  assert.deepEqual(feed.queryFlows({ from: T0 + 2, to: T0 + 3 }).flows.map((r) => r.t), [T0 + 2, T0 + 3]);
+
+  // Over the limit, the recent end is what survives — and the response owns the
+  // fact rather than letting a short list imply one.
+  const page = feed.queryFlows({ limit: 2 });
+  assert.equal(page.matched, 4);
+  assert.equal(page.truncated, true);
+  assert.deepEqual(page.flows.map((r) => r.t), [T0 + 3, T0 + 4], 'newest last, and only the newest two');
+  assert.equal(feed.queryFlows({ limit: 4 }).truncated, false, 'exactly the depth asked for is not truncated');
+});
+
+test('a paid call settles first and answers with the depth the free stream withholds', async () => {
+  const health = createHealth();
+  const { app, stub, close } = await dataTierApp({ health });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+    const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+    const header = await payHeader(cfg, requirement, buyer, `0x${'11'.repeat(32)}`);
+    const res = await app.fetch(get('/data/flows', { 'x-payment': header }));
+    assert.equal(res.status, 200, `a settled payment must be answered, got ${JSON.stringify(await res.clone().json())}`);
+    const body = (await res.json()) as {
+      retained: number; matched: number; truncated: boolean;
+      oldest: { t: number; block: number } | null; newest: { t: number; block: number } | null;
+      flows: { amount: number; amountUnits: number; venue: string | null }[];
+      settlement: { tx: string; payer: string; network: string; amount: string };
+      sold: number;
+    };
+    assert.equal(stub.hits(), 1, 'Circle was asked once');
+    assert.equal(body.settlement.tx, '0x' + 'fe'.repeat(32));
+    assert.equal(body.settlement.network, 'eip155:5042');
+    assert.equal(body.settlement.amount, '1000');
+    assert.equal(body.sold, 1, 'one sale, counted');
+    assert.equal(body.retained, 4);
+    assert.equal(body.matched, 4);
+    assert.equal(body.truncated, false);
+    assert.deepEqual([body.oldest, body.newest], [{ t: T0 + 1, block: 101 }, { t: T0 + 4, block: 104 }]);
+
+    // The precision the paid rows carry and the display rows do not. This route
+    // sells for 0.001 USDC, and every one of its own sales is a flow in this
+    // ring: rounded to cents the way the free stream rounds, a buyer would pay
+    // for a ledger in which what they paid for reads as zero.
+    assert.equal(body.flows[0].amount, 0.001);
+    assert.equal(body.flows[0].amountUnits, 1000);
+    assert.equal(body.flows[1].amount, 1234.567891);
+    assert.equal(body.flows[1].amountUnits, 1234567891);
+
+    // What left for Circle is the buyer's envelope, whole. Reassembling it from
+    // the three fields this module needs would drop `x402Version` and
+    // `resource` from a document Circle defined them.
+    assert.equal(stub.bodies[0].x402Version, 2);
+    assert.equal(stub.bodies[0].paymentPayload.x402Version, 2);
+    assert.equal(stub.bodies[0].paymentPayload.resource.url, 'http://localhost/data/flows');
+    assert.equal(stub.bodies[0].paymentPayload.accepted.amount, '1000');
+    assert.equal(stub.bodies[0].paymentRequirements.payTo, cfg.payTo);
+
+    const after = await readHealth(app);
+    assert.equal(after.data.sales, 1);
+    assert.equal(after.data.spentPayments, 1, 'the nonce that bought this is remembered as spent');
+    assert.deepEqual(after.signals?.counts, {}, 'a sale is not a failure');
+  } finally {
+    await close();
+  }
+});
+
+test('a mixed-case ?addr= finds the transfers it describes', async () => {
+  // The burn receipts learned what one-sided normalization costs; this is the
+  // same comparison with the casing flipped, on the newest path that has it.
+  const { app, close } = await dataTierApp({});
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+    const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+    const mixed = '0x' + 'A1'.repeat(20);
+    assert.notEqual(mixed, ALPHA, 'the same address, spelled the other way');
+    const header = await payHeader(cfg, requirement, buyer, `0x${'12'.repeat(32)}`);
+    const res = await app.fetch(get(`/data/flows?addr=${mixed}`, { 'x-payment': header }));
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { matched: number; query: { addr: string }; flows: { from: string; to: string }[] };
+    assert.equal(body.matched, 3, 'the mixed-case spelling matches the lowercased ring');
+    assert.equal(body.query.addr, ALPHA, 'and the answer echoes one casing');
+    for (const row of body.flows) {
+      assert.ok([row.from, row.to].includes(ALPHA), `${row.from}->${row.to} does not involve ${ALPHA}`);
+    }
+  } finally {
+    await close();
+  }
+});
+
+test('one authorization buys one answer, whatever casing it returns in', async () => {
+  const health = createHealth();
+  const { app, stub, close } = await dataTierApp({ health });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+    const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+    // A nonce with letters, so that a second spelling of it exists to try.
+    const nonce = '0x' + 'aB'.repeat(32);
+    const first = await app.fetch(get('/data/flows', { 'x-payment': await payHeader(cfg, requirement, buyer, nonce) }));
+    assert.equal(first.status, 200);
+
+    const again = await app.fetch(get('/data/flows', { 'x-payment': await payHeader(cfg, requirement, buyer, nonce) }));
+    assert.equal(again.status, 402, 'the ring of spent nonces refuses before Circle is asked again');
+    const refused = (await again.json()) as { error: string; flows?: unknown };
+    assert.match(refused.error, /already been spent/);
+    assert.equal(refused.flows, undefined, 'and no row travels with the refusal');
+
+    // The bytes32 is the same bytes either way, so the signature still verifies
+    // and only the spelling changed. That is precisely the difference the
+    // receipts bug turned into infinite money, so it is tested here too.
+    const respelled = await app.fetch(get('/data/flows', { 'x-payment': await payHeader(cfg, requirement, buyer, '0x' + 'Ab'.repeat(32)) }));
+    assert.equal(respelled.status, 402, 'a re-spent nonce is refused in either casing');
+    assert.match(((await respelled.json()) as { error: string }).error, /already been spent/);
+
+    assert.equal(stub.hits(), 1, 'the facilitator was told about the sale exactly once');
+    const after = await readHealth(app);
+    assert.equal(after.data.sales, 1, 'the refusal did not sell anything');
+    assert.equal(after.data.spentPayments, 1);
+    assert.deepEqual(after.signals?.counts, {}, 'a replay is not counted as a failure: see data_settle_failed');
+  } finally {
+    await close();
+  }
+});
+
+test('a facilitator that answers badly is counted, and hands back no rows', async () => {
+  const health = createHealth();
+  const { app, stub, close } = await dataTierApp({ health, replies: [{ status: 502, text: 'upstream refused the request' }] });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const header = await payHeader(cfg, exactRequirement(cfg, DATA_PRICE_USDC), privateKeyToAccount(BUYER_KEY as `0x${string}`), `0x${'13'.repeat(32)}`);
+    const res = await app.fetch(get('/data/flows', { 'x-payment': header }));
+    assert.equal(res.status, 402, 'the buyer keeps their money and learns what failed');
+    const body = (await res.json()) as { error: string; flows?: unknown; accepts: unknown[] };
+    assert.equal(body.error, 'facilitator http 502');
+    assert.equal(body.flows, undefined, 'no row leaves the handler on a failed settlement — the other order is a paywall you can read through');
+    assert.equal(body.accepts.length, 1, 'and the offer is restated, so a client can try again');
+    assert.equal(stub.hits(), 1);
+
+    const after = await readHealth(app);
+    assert.equal(after.healthy, false, 'a lost sale has no other witness, so this one has to');
+    assert.equal(after.problem, 'data_settle_failed=1');
+    assert.match(after.signals?.last.data_settle_failed.detail ?? '', /facilitator http 502/);
+    assert.equal(after.data.sales, 0);
+    assert.equal(after.data.spentPayments, 0, 'a payment that never settled did not become a spent nonce');
+  } finally {
+    await close();
+  }
+});
+
+test('a facilitator that cannot be reached is a counted failure rather than a 500', async () => {
+  const health = createHealth();
+  const { app, close } = await dataTierApp({ health });
+  const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+  assert.ok(cfg);
+  const header = await payHeader(cfg, exactRequirement(cfg, DATA_PRICE_USDC), privateKeyToAccount(BUYER_KEY as `0x${string}`), `0x${'14'.repeat(32)}`);
+  // Outlive the stub first: now every request faces a port nobody listens on,
+  // which is a rejected `fetch` rather than an answer, and a rejection is not a
+  // verdict. Left uncaptured it becomes a 500 with nothing said anywhere about
+  // the sale that was lost.
+  await close();
+  const { value: res, errors } = await quiet(() => Promise.resolve(app.fetch(get('/data/flows', { 'x-payment': header }))));
+  assert.equal(res.status, 402, 'the buyer is told, not left with a stack trace');
+  const body = (await res.json()) as { error: string; flows?: unknown };
+  assert.equal(body.error, 'settlement unavailable');
+  assert.equal(body.flows, undefined);
+  assert.equal((await readHealth(app)).problem, 'data_settle_failed=1');
+  assert.match(errors.join('\n'), /settleFromRequest threw/, 'the console line stays, next to the counter');
+});
+
+test("a buyer's own bad payment is refused without turning the tank red", async () => {
+  const health = createHealth();
+  const { app, stub, close } = await dataTierApp({ health });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+    const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+    const stranger = privateKeyToAccount(STRANGER_KEY as `0x${string}`);
+    const expired = String(Math.floor(Date.now() / 1000) - 10);
+    let n = 0x20;
+    const once = async (over: Record<string, string>, key = buyer, ask = requirement): Promise<string> => {
+      const header = await payHeader(cfg, ask, key, `0x${(n += 1).toString(16).padStart(64, '0')}`, over);
+      const res = await app.fetch(get('/data/flows', { 'x-payment': header }));
+      assert.equal(res.status, 402, 'each of these is the buyer\'s fix to make, so each is answered');
+      const body = (await res.json()) as { error: string; flows?: unknown };
+      assert.equal(body.flows, undefined, 'and none of them is served data');
+      return body.error;
+    };
+
+    // Signed by somebody else over the buyer's own authorization.
+    assert.match(await once({ from: buyer.address }, stranger), /signer_mismatch/);
+    assert.match(await once({ validBefore: expired }), /authorization expired/);
+    assert.match(await once({ value: '999' }), /authorization amount mismatch/);
+    assert.match(await once({ to: '0x' + '99'.repeat(20) }), /authorization payTo mismatch/);
+    assert.match(await once({}, buyer, exactRequirement(cfg, '0.002')), /amount mismatch/, 'an offer from a different price list');
+    assert.match(((await (await app.fetch(get('/data/flows', { 'x-payment': 'not-even-base64' }))).json()) as { error: string }).error, /bad X-Payment encoding/);
+
+    assert.equal(stub.hits(), 0, 'not one of them reached Circle, which is the point of checking first');
+    const after = await readHealth(app);
+    assert.deepEqual(after.signals?.counts, {}, 'and none of them is counted as the tank being unwell');
+    assert.equal(after.healthy, true, 'anybody with a keyboard could otherwise keep this red forever');
+    assert.equal(after.problem, null);
+    assert.equal(after.data.sales, 0);
+  } finally {
+    await close();
+  }
+});
+
+test('a browser is allowed to send the payment header the paid route reads', async () => {
+  // The preflight list used to carry `x-payment-tx` (the burn path's receipt
+  // header) and not `X-Payment`, which is the header every x402 client puts the
+  // signed authorization in. A route that only server-to-server callers can
+  // reach is a route the product cannot sell from its own page.
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  const res = await app.fetch(new Request('http://localhost/data/flows', { method: 'OPTIONS' }));
+  assert.equal(res.status, 204);
+  const allow = res.headers.get('access-control-allow-headers') ?? '';
+  for (const header of ['content-type', 'x-payment', 'x-payment-tx']) {
+    assert.ok(allow.split(',').includes(header), `${header} must survive the preflight: ${allow}`);
+  }
+});
+
+test('the endpoint index advertises the price and the knob that opens it', async () => {
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  const index = (await (await app.fetch(get('/api'))).json()) as { endpoints?: Record<string, string> } & Record<string, any>;
+  const listing = JSON.stringify(index);
+  assert.match(listing, /GET \/data\/flows|\/data\/flows/);
+  assert.ok(listing.includes(DATA_PRICE_USDC), 'the price is published where a buyer can read it before signing');
+  assert.ok(listing.includes('SELLER_PRIVATE_KEY'), 'and so is the fact that it is closed until the secret arrives');
+});
+
+test('the durable object forwards the seller key the way it forwards the anchor key', async () => {
+  // Same reasoning as the anchor-key test: every other test here builds its own
+  // app, so only this one goes through the object the deployment constructs. The
+  // four knobs below are four separate lines in `worker.ts`, and each of them is
+  // a `wrangler secret put` or a var that can fail to arrive in silence.
+  const seller = privateKeyToAccount(SELLER_KEY as `0x${string}`);
+  const armed = await readHealth(worldDO(new Map(), { SELLER_PRIVATE_KEY: SELLER_KEY }).obj);
+  assert.equal(armed.data.forSale, true, 'the binding reached createApp');
+  assert.equal(armed.data.payTo, seller.address.toLowerCase(), 'and defaulted to the address it controls');
+  assert.equal(armed.data.network, 'eip155:5042');
+  assert.equal(armed.data.priceUsdc, DATA_PRICE_USDC);
+
+  const testnet = await readHealth(worldDO(new Map(), { SELLER_PRIVATE_KEY: SELLER_KEY, X402_TESTNET: '1' }).obj);
+  assert.equal(testnet.data.network, 'eip155:5042002', 'X402_TESTNET is what chooses the chain');
+
+  const swept = await readHealth(worldDO(new Map(), { SELLER_PRIVATE_KEY: SELLER_KEY, SELLER_PAY_TO: `0x${'CD'.repeat(20)}` }).obj);
+  assert.equal(swept.data.payTo, `0x${'cd'.repeat(20)}`, 'SELLER_PAY_TO arrives, in one casing');
+
+  const off = await readHealth(worldDO(new Map(), { SELLER_PRIVATE_KEY: `0x${'ab'.repeat(31)}` }).obj);
+  assert.equal(off.data.forSale, false, 'a truncated key is no key, and the route says closed rather than broken');
+  assert.equal(off.data.payTo, null);
+  const bare = await readHealth(worldDO().obj);
+  assert.equal(bare.data.forSale, false);
+});
+
+test('the seller binding wins over an ambient key, so a stale global cannot be paid', async () => {
+  // The failure mode that made the anchor key invisible in production, read
+  // first from `process.env` and never from the binding. On the data tier the
+  // consequence is worse than a missing feature: an ambient key left behind by
+  // another deployment would quietly take the money.
+  const had = process.env.SELLER_PRIVATE_KEY;
+  process.env.SELLER_PRIVATE_KEY = STRANGER_KEY;
+  try {
+    const app = createApp({ seed: 1, ...offlineFeeds, sellerKey: SELLER_KEY });
+    const body = await readHealth(app);
+    assert.equal(body.data.payTo, privateKeyToAccount(SELLER_KEY as `0x${string}`).address.toLowerCase(), 'the binding is who gets paid');
+    assert.notEqual(
+      body.data.payTo,
+      privateKeyToAccount(STRANGER_KEY as `0x${string}`).address.toLowerCase(),
+      'and not a key that happens to be in the environment',
+    );
+  } finally {
+    if (had === undefined) delete process.env.SELLER_PRIVATE_KEY;
+    else process.env.SELLER_PRIVATE_KEY = had;
+  }
+});
+
+
+
+

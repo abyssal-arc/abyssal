@@ -50,6 +50,21 @@ export const SIGNAL_KINDS = [
   'digest_not_broadcast',
   'digest_reverted',
   'digest_record_rejected',
+  /**
+   * A payer did the wallet work and the money could not be taken. Counted
+   * because nothing else can see it: the buyer gets a 402 back and moves on, and
+   * the only record of a lost sale would be a log line nobody tails.
+   *
+   * Two refusals on the same route are deliberately not on this list, for one
+   * reason: a refused replay and a precheck rejection (`signer_mismatch`, an
+   * expired authorization, a wrong `payTo`) are both reachable by anyone with a
+   * keyboard and no money, while everything counted here either cost a real
+   * payment or is a fact about our own infrastructure. An ordinary wallet retry
+   * after a timeout also looks like the first case from here. A counter that
+   * turns the health light red over what an anonymous caller chose to send is a
+   * counter that gets ignored the next time it matters.
+   */
+  'data_settle_failed',
 ] as const;
 
 export type SignalKind = (typeof SIGNAL_KINDS)[number];

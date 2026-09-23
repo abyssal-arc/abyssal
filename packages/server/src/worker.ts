@@ -53,6 +53,19 @@ interface Env {
    * choice rather than a typo in a dashboard.
    */
   ARC_DIGEST_KEY?: string;
+  /**
+   * The data tier's USDC seller key, set with `wrangler secret put
+   * SELLER_PRIVATE_KEY`. Until it is set, `GET /data/flows` answers 503 rather
+   * than quoting a price nothing can settle — the same arrangement as the anchor
+   * key above, and for the reason written there.
+   */
+  SELLER_PRIVATE_KEY?: string;
+  /** `1` settles the data tier on the keyless Arc testnet trial. */
+  X402_TESTNET?: string;
+  /** Where data-tier USDC goes; defaults to the seller key's own address. */
+  SELLER_PAY_TO?: string;
+  /** Facilitator override, so a staging deploy can point at a stub. */
+  FACILITATOR_URL?: string;
 }
 
 const SNAP_KEY = 'world';
@@ -225,6 +238,10 @@ export class AbyssalWorld {
         token: this.env.ABYS_TOKEN_ADDRESS,
         rpc: this.env.ARC_RPC_URL,
         digestKey: this.env.ARC_DIGEST_KEY,
+        sellerKey: this.env.SELLER_PRIVATE_KEY,
+        x402Testnet: this.env.X402_TESTNET,
+        sellerPayTo: this.env.SELLER_PAY_TO,
+        facilitatorUrl: this.env.FACILITATOR_URL,
         store: this.store(),
         health: this.health,
         metrics: () => ({
