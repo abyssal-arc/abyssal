@@ -17,7 +17,7 @@
  */
 import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
-import { toJSON } from '@abyssal/sim';
+import { toJSON, SNAPSHOT_BUDGET, DO_VALUE_LIMIT } from '@abyssal/sim';
 
 interface DoStorage {
   get<T = unknown>(key: string): Promise<T | undefined>;
@@ -45,12 +45,34 @@ interface Env {
 const SNAP_KEY = 'world';
 const INSTANCE_KEY = 'instance';
 const SAVE_EVERY_MS = 30_000;
+
+/**
+ * Whether a snapshot has just crossed the budget line, and whether that is news.
+ *
+ * Extracted and exported because no world built by legal means can reach it: the
+ * sim's caps, every one of them full, come to about 1.15 MiB, and the line is at
+ * 1.5 MiB on purpose — a budget that worst case already violates would warn on
+ * every save and then be ignored. So the only honest way to test this state
+ * machine is to hand it the numbers directly. Crossing up announces once,
+ * staying over does not repeat, and dropping back re-arms it.
+ */
+export function budgetCrossed(
+  bytes: number,
+  wasOver: boolean,
+  budget: number = SNAPSHOT_BUDGET,
+): { over: boolean; announce: boolean } {
+  const over = bytes > budget;
+  return { over, announce: over && !wasOver };
+}
 /** Internal path the cron handler pokes; never linked, never served to a viewer. */
 const CRON_PATH = '/__cron';
 
 export class AbyssalWorld {
   private app: ReturnType<typeof createApp> | null = null;
   private lastSave = 0;
+  // Edge-trigger for the budget warning, so a world sitting just over the line
+  // says so once rather than every 30 seconds.
+  private overBudget = false;
 
   private receipts: string[] | null = null;
   private ledgerState: LedgerLoad | null = null;
@@ -62,10 +84,20 @@ export class AbyssalWorld {
     setBurnLedger({
       load: async () => (await this.state0()).receipts,
       add: (hash: string) => {
-        void this.state0().then((s) => {
-          s.receipts.push(hash);
-          return this.ctx.storage.put('receipts', s.receipts);
-        });
+        void this.state0()
+          .then((s) => {
+            s.receipts.push(hash);
+            return this.ctx.storage.put('receipts', s.receipts);
+          })
+          .catch((err: unknown) => {
+            // Of the two writes this file fires without awaiting, this is the one
+            // that deserves a shout. The receipt is already in the in-memory set,
+            // so the duplicate is refused for as long as this isolate lives and
+            // accepted again the moment it does not: a failure nobody sees here
+            // is a burn that has quietly become spendable a second time, and the
+            // evidence for that is a single line in a log nobody reads.
+            console.error('burn receipt not stored: this burn can be replayed after an eviction', err);
+          });
       },
     });
   }
@@ -85,7 +117,24 @@ export class AbyssalWorld {
       load: async () => (await this.state0()).ledger,
       save: (s) => {
         this.ledgerState = s;
-        void this.ctx.storage.put('ledger', s);
+        // `save` is synchronous in the world's interface — the sim calls it and
+        // moves on — so this write cannot be awaited without redesigning that
+        // boundary. Unawaited is not the same as unanswerable: a `void` promise
+        // that rejects becomes an unhandled rejection inside the object, which
+        // surfaces as a platform error naming no file, line or value. Caught
+        // here so the log says which write broke and what was riding on it.
+        //
+        // No byte count is reported, deliberately. The snapshot next door is
+        // stored as a string, so its encoded size is comparable against the
+        // per-value limit; this one goes in as an object and Cloudflare sizes it
+        // with a serializer we cannot invoke. Printing `JSON.stringify(s).length`
+        // and calling it the stored size would be a number that is neither the
+        // bytes on the wire nor a bound on them.
+        void this.ctx.storage.put('ledger', s).catch((err: unknown) => {
+          // What an eviction now loses: the feed cursor (so blocks already
+          // counted get re-read), the day passes, and who burned what.
+          console.error('world ledger not stored: passes, burners and the feed cursor are memory-only', err);
+        });
       },
     };
   }
@@ -114,6 +163,34 @@ export class AbyssalWorld {
     if (now - this.lastSave < SAVE_EVERY_MS) return;
     this.lastSave = now;
     const snapshot = toJSON(app.world);
+    // Sized on every save, before the write, because the number is worth
+    // nothing if it can only be read after the damage.
+    //
+    // Encoded rather than taking `snapshot.length`, since the limit this gets
+    // compared against is in bytes and a string length is in UTF-16 code units.
+    // Nearly all of a snapshot is hex and digits, where the two agree — but
+    // creature names are bought by users, and the sanitizer caps them at 24
+    // characters without restricting them to ASCII, so an emoji is four bytes
+    // under a length of two. Everything downstream of here reports against a
+    // 2 MB byte ceiling, so this measures in bytes. The cost is one pass over a
+    // string `toJSON` has already built, once every 30 seconds.
+    const bytes = new TextEncoder().encode(snapshot).byteLength;
+    const { over, announce } = budgetCrossed(bytes, this.overBudget);
+    this.overBudget = over;
+    if (announce) {
+      // The alarm line is the budget the sim's caps are sized against, so
+      // crossing it means a collection outgrew its intended ceiling while the
+      // save still works — which is the moment this is worth saying something.
+      // Being straight about the lead time: this buys roughly half a megabyte
+      // of warning, and an unbounded map can cross that between two saves. It
+      // is not a guarantee of advance notice. What it does guarantee is that
+      // the first signal of the next growth bug is a line that says a budget
+      // was exceeded, instead of an HTTP 500 that says nothing.
+      console.warn(
+        `world snapshot past budget: ${bytes} of ${DO_VALUE_LIMIT} bytes `
+        + `(${Math.round((bytes / DO_VALUE_LIMIT) * 100)}% of one storage value)`,
+      );
+    }
     try {
       await this.ctx.storage.put(SNAP_KEY, snapshot);
     } catch (err) {
@@ -125,17 +202,6 @@ export class AbyssalWorld {
       // failure is a tank that stops being saved altogether, comes back from
       // whatever its last successful write happened to hold, and says so
       // nowhere.
-      //
-      // The size is encoded rather than taking `snapshot.length`, because the
-      // limit this number gets compared against is in bytes and a string length
-      // is in UTF-16 code units. Nearly all of a snapshot is hex and digits,
-      // where the two agree — but creature names are bought by users, and the
-      // sanitizer caps them at 24 characters without restricting them to ASCII,
-      // so an emoji is four bytes under a length of two. The one job of this
-      // line is to say how far over 2 MB the write was, and it should not be
-      // the thing that under-reports. Encoding runs only in here, on the path
-      // where the save has already failed.
-      const bytes = new TextEncoder().encode(snapshot).byteLength;
       console.error(`world snapshot not saved: ${bytes} bytes`, err);
     }
   }

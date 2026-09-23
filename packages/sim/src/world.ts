@@ -334,6 +334,31 @@ export interface World {
  * rather than an expectation that it will.
  */
 /**
+ * The platform ceiling itself, named rather than left in prose: every cap in
+ * this block is sized against it, the budget below is a fraction of it, and the
+ * worker warns against it when a world gets close. Two copies of a limit in two
+ * packages is two limits, and only the one that gets read will ever be honoured.
+ */
+export const DO_VALUE_LIMIT = 2 * 1024 * 1024;
+
+/**
+ * What the snapshot is aimed to stay under — three quarters of the ceiling.
+ *
+ * The quarter held back is not slack for its own sake. It is headroom for the
+ * part of a world whose bytes outnumber its characters: creature names are
+ * bought by users and the sanitizer caps them by length, not by ASCII, so a
+ * single name can cost twice as many bytes as it has characters. Everything the
+ * size budgets below count is entries and fields, which is the right unit to
+ * budget in — but the thing that trips `SQLITE_TOOBIG` is bytes, and this is
+ * where the two are reconciled.
+ *
+ * Exported, and asserted by the size-budget test, because until now this number
+ * lived only inside that test: production was being held to a target it could
+ * not read, which is how a world grew past the limit it was written to respect.
+ */
+export const SNAPSHOT_BUDGET = Math.floor(DO_VALUE_LIMIT * 0.75);
+
+/**
  * How many ticks of history to keep, and how many to drop once that is
  * exceeded. The trim is a hysteresis so the log is not spliced on every single
  * tick, which means the length sawtooths between `CAP - TRIM` and `CAP` — and

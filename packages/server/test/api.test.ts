@@ -698,6 +698,76 @@ test('used burn receipts persist through the ledger, so restarts cannot replay',
   }
 });
 
+test('one burn buys one intervention, whatever casing the hash arrives in', async () => {
+  const { setBurnLedger, verifyBurnReceipt, burnOffer, recordBurnReceipt, hydrateReceipts, isBurnRecorded } =
+    await import('../src/payments.js');
+
+  // A tx hash is hex, so its casing names nothing: `0xd4cB…` and `0xd4cb…` are
+  // the same transaction and one RPC answers for both. The replay check always
+  // compared the lowercased form, but the set was keyed by whatever casing the
+  // caller presented — so a burn recorded mixed-case was simply absent when the
+  // next request arrived in lowercase, the identical receipt verified again, and
+  // the paid action ran again. Every distinct spelling of one burn was another
+  // intervention, bounded only by how many letters the hash happened to contain.
+  //
+  // The test above missed this for a whole suite-run because it replays the same
+  // string it recorded: `'0x' + 'a5'.repeat(32)` is already lowercase, so both
+  // sides of its pair agreed by accident. This one varies the spelling on
+  // purpose, which is the only way it would have failed before the fix.
+  const MIXED = '0x' + 'd4cB9a7E'.repeat(8);
+  const variants = [MIXED, MIXED.toLowerCase(), '0x' + 'd4cB9a7E'.repeat(8).toUpperCase()];
+  assert.equal(new Set(variants).size, 3, 'three spellings of one burn, three distinct strings');
+
+  const stored: string[] = [];
+  setBurnLedger({ load: async () => [], add: (h) => { stored.push(h); } });
+
+  const PRICE = 100_000n * 10n ** 18n;
+  const srv = rpcStub((method, data) => (data === '0x313ce567'
+    ? DEC18
+    : {
+        status: '0x1',
+        blockNumber: '0x80',
+        logs: [{
+          address: process.env.ABYS_TOKEN_ADDRESS,
+          topics: [TRANSFER_TOPIC, `0x${'cd'.repeat(20).padStart(64, '0')}`, BURN_SINK],
+          data: `0x${PRICE.toString(16)}`,
+        }],
+      }));
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+  try {
+    const offer = (await burnOffer(url, 'feed'))!;
+    let accepted = 0;
+    for (const h of variants) {
+      const v = await verifyBurnReceipt(url, offer, h);
+      if (v.ok) {
+        accepted += 1;
+        recordBurnReceipt(h); // what the handler does once the action succeeded
+      }
+    }
+    assert.equal(accepted, 1, `one burn settled ${accepted} times; only the first spelling may buy anything`);
+
+    // What an eviction hydrates back has to be canonical too, or the guard holds
+    // only as long as this isolate does.
+    assert.deepEqual(stored, [MIXED.toLowerCase()], 'the ledger is written in the one canonical form');
+
+    // Receipts already sitting in production storage from before this was fixed
+    // are mixed case, and that is the case this has to survive: hydrating them
+    // must guard both spellings, not just the one they were stored under.
+    const legacy = '0x' + 'e5fA0b1C'.repeat(8);
+    setBurnLedger({ load: async () => [legacy], add: () => {} });
+    await hydrateReceipts();
+    assert.ok(isBurnRecorded(legacy), 'a legacy mixed-case entry guards the spelling it arrived in');
+    assert.ok(isBurnRecorded(legacy.toLowerCase()), 'and the canonical one, which is the whole point');
+
+    // Normalizing must not collapse distinct payments into a single bucket.
+    assert.ok(!isBurnRecorded('0x' + 'f6eB1c2D'.repeat(8)), 'a different hash is still its own money');
+  } finally {
+    srv.close();
+    setBurnLedger({ load: async () => [], add: () => {} });
+  }
+});
+
 test('passes and burners survive a restart through the store', async () => {
   const mem = { passes: [] as [string, number][], burners: [] as [string, { total: number; last: number }][] };
   const store = {
@@ -2184,4 +2254,117 @@ test('a snapshot too big to store costs a log line, not the response', async () 
     /world snapshot not saved: [1-9]\d* bytes/,
     'with the size it tried to write, which is the number that decides whether the caps still hold',
   );
+});
+
+test('a write fired without awaiting still says which one broke', async () => {
+  // The snapshot above got a guard; these two had none. Both are `void promise`
+  // with no `.catch()`, and inside a Durable Object a rejected `void` is an
+  // unhandled rejection: the platform reports that something failed and the
+  // report names no key, no line and no consequence.
+  //
+  // The receipts write is why this is worth a test rather than a shrug. A burn
+  // receipt that never reaches storage sits in the in-memory set, refuses the
+  // duplicate for as long as this isolate lives, and admits it again the moment
+  // the isolate is gone. One burn, two paid interventions, and nothing anywhere
+  // in the running system says a word. That is a payment invariant failing
+  // quietly, which is precisely the class of thing the size caps cannot catch.
+  const { AbyssalWorld } = await import('../src/worker.js');
+  const { recordBurnReceipt, setBurnLedger } = await import('../src/payments.js');
+
+  const stored = new Map<string, unknown>();
+  const attempted: string[] = [];
+  const failing = new Set(['ledger', 'receipts']);
+  const obj = new AbyssalWorld(
+    {
+      storage: {
+        get: async <T = unknown>(key: string): Promise<T | undefined> => stored.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => {
+          attempted.push(key);
+          if (failing.has(key)) throw new Error(`SQLITE_TOOBIG on ${key}`);
+          stored.set(key, value);
+        },
+      },
+      waitUntil: (promise: Promise<unknown>) => { void promise.catch(() => {}); },
+    },
+    { WORLD: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response(null) }) } },
+  );
+
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args); };
+  const settle = () => new Promise((r) => setTimeout(r, 60));
+  const lines = () => logged.map((a) => String(a[0]));
+  try {
+    // The first cron only boots the tank; `catchUp()` repays *wall-clock* ticks
+    // and calls saveStore() on the way, which is the only thing that puts
+    // 'ledger' on the wire. One tick is 250ms, so owe a couple of them.
+    await obj.fetch(new Request('https://abyssal.internal/__cron'));
+    await new Promise((r) => setTimeout(r, 600));
+    attempted.length = 0;
+    const res = await obj.fetch(new Request('https://abyssal.internal/__cron'));
+    await settle();
+
+    assert.ok(attempted.includes('ledger'), 'the cron advanced the tank and tried to store the ledger');
+    assert.equal(res.status, 200, 'a ledger that cannot be stored is still not the cron\u2019s answer');
+    assert.equal(
+      lines().filter((l) => /world ledger not stored/.test(l)).length,
+      1,
+      'the failed ledger write was reported exactly once',
+    );
+
+    logged.length = 0;
+    const burn = '0x' + 'c3'.repeat(32);
+    recordBurnReceipt(burn);
+    await settle();
+    assert.ok(attempted.includes('receipts'), 'the receipt write was attempted');
+    assert.equal(
+      lines().filter((l) => /burn receipt not stored/.test(l)).length,
+      1,
+      'and reported once, on its own line',
+    );
+    assert.ok(
+      lines().some((l) => /replayed after an eviction/.test(l)),
+      'the line says what is at stake, because \u201csave failed\u201d is not enough to act on',
+    );
+
+    // Telling the two apart is the entire value of the guard, so a shared or
+    // generic message would pass a weaker test and still be useless at 3am.
+    assert.ok(
+      !lines().some((l) => /world ledger not stored/.test(l)),
+      'the receipt failure does not borrow the ledger\u2019s message',
+    );
+
+    assert.deepEqual(unhandled, [], 'neither rejection escaped as an unhandled rejection');
+  } finally {
+    console.error = realError;
+    process.off('unhandledRejection', onUnhandled);
+    setBurnLedger({ load: async () => [], add: () => {} });
+  }
+});
+
+test('the snapshot budget announces a crossing, not a condition', async () => {
+  const { budgetCrossed } = await import('../src/worker.js');
+  const { SNAPSHOT_BUDGET, DO_VALUE_LIMIT } = await import('@abyssal/sim');
+
+  // No legally built world reaches this line — every cap full is about 1.15 MiB
+  // against a 1.5 MiB alarm — so the state machine is driven by numbers here
+  // rather than by a world. Asserted against the imported budget, which is the
+  // point of moving it into the sim: the worker's alarm line and the caps'
+  // target stop being two numbers that happen to agree.
+  const B = SNAPSHOT_BUDGET;
+  assert.deepEqual(budgetCrossed(B - 1, false, B), { over: false, announce: false }, 'under the line is silent');
+  assert.deepEqual(budgetCrossed(B, false, B), { over: false, announce: false }, 'exactly at budget is not past it');
+  assert.deepEqual(budgetCrossed(B + 1, false, B), { over: true, announce: true }, 'crossing up announces');
+  assert.deepEqual(budgetCrossed(B + 1, true, B), { over: true, announce: false }, 'staying over does not repeat');
+  assert.deepEqual(budgetCrossed(B - 1, true, B), { over: false, announce: false }, 'dropping back re-arms it');
+
+  // And the default argument is the shared budget, not a second literal: if
+  // someone re-hardcodes a threshold here the crossing tests above stop lining
+  // up with what persist() actually calls.
+  assert.equal(budgetCrossed(B + 1, false).announce, true, 'the default budget is the imported one');
+  assert.ok(B < DO_VALUE_LIMIT, 'the alarm sits inside the wall, not on it');
+  assert.ok(DO_VALUE_LIMIT - B >= 512 * 1024, 'and leaves at least half a megabyte of lead time to act on');
 });

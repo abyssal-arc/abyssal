@@ -45,19 +45,44 @@ export interface BurnLedger {
 let ledger: BurnLedger | null = null;
 const usedReceipts = new Set<string>();
 
+/**
+ * The one form a receipt is stored and looked up under.
+ *
+ * A tx hash is hex, so casing carries no information: `0xA5…` and `0xa5…` name
+ * the same transaction, and an RPC answers for either. This set was keyed by
+ * whatever casing the caller happened to present while the replay check in
+ * `verifyBurnReceipt` looked up the lowercased form — so a burn recorded as
+ * `0xA5…` was absent from the set under `0xa5…`, the same receipt verified
+ * again, and the paid action ran a second time. Each distinct casing was a
+ * fresh intervention bought by one burn, with no ceiling beyond the number of
+ * letters in the hash.
+ *
+ * Normalizing here rather than at the three `recordBurnReceipt` call sites is
+ * the point: this module owns the set, so it owns the key form, and a caller
+ * cannot re-introduce the split by forgetting to lowercase. Lowercasing on load
+ * is safe against receipts already stored in mixed case — distinct hashes never
+ * lowercase to the same string, so old entries merge into the guard instead of
+ * escaping it.
+ */
+const receiptKey = (hash: string): string => hash.toLowerCase();
+
 export function setBurnLedger(next: BurnLedger): void {
   ledger = next;
 }
 export async function hydrateReceipts(): Promise<void> {
   if (!ledger) return;
-  for (const h of await ledger.load()) usedReceipts.add(h);
+  for (const h of await ledger.load()) usedReceipts.add(receiptKey(h));
 }
 export function isBurnRecorded(hash: string): boolean {
-  return usedReceipts.has(hash);
+  return usedReceipts.has(receiptKey(hash));
 }
 export function recordBurnReceipt(hash: string): void {
-  usedReceipts.add(hash);
-  ledger?.add(hash);
+  // Both sides of the canonical form: the in-memory set and what an eviction
+  // will hydrate back out of it. Storing the raw casing here would just move
+  // the bug past the restart.
+  const key = receiptKey(hash);
+  usedReceipts.add(key);
+  ledger?.add(key);
 }
 
 /** ABYS prices per intervention, in whole tokens; base units come from the token's decimals(). */
@@ -187,7 +212,9 @@ export async function verifyBurnReceipt(
   txHash: string,
 ): Promise<BurnVerdict> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return { ok: false, reason: 'bad tx hash' };
-  const key = txHash.toLowerCase();
+  // `receiptKey`, spelled the same way the recorder spells it: two independent
+  // lowercasings are how this check and `recordBurnReceipt` drifted apart.
+  const key = receiptKey(txHash);
   if (usedReceipts.has(key)) return { ok: false, reason: 'receipt already used' };
   let receipt: any;
   try {

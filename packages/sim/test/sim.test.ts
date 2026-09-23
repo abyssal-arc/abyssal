@@ -12,6 +12,7 @@ import {
   fromJSON,
   STATS_LOG_CAP,
   STATS_LOG_TRIM,
+  SNAPSHOT_BUDGET,
   DEFAULT_CONFIG,
   ARCHETYPES,
   archetypeOf,
@@ -899,11 +900,17 @@ test('eaters: a tx pellet is traceable to the creature that ate it', () => {
  * over 2 MB is refused outright. Measured worst case — every capped collection
  * at its cap, each entry copied from a real one — comes to about 1.1 MiB, so
  * this sits above that with room for the world to grow and well under the limit
- * that breaks it. Written as a literal rather than derived from the caps: a
- * budget computed from the same numbers the code uses can only ever agree with
- * itself.
+ * that breaks it.
+ *
+ * Imported rather than written out here, which is a change of mind worth
+ * recording: this used to be a literal living in the test, and that is exactly
+ * why production could miss it. A target nobody outside the suite can read is a
+ * target the code is not held to.
+ *
+ * The independence that made it a good literal is preserved: the budget is a
+ * fraction of the *platform's* ceiling, not a sum of the caps below. A budget
+ * computed from the numbers under test could only ever agree with itself.
  */
-const SNAPSHOT_BUDGET = 1.5 * 1024 * 1024;
 
 /** A 32-byte hex hash that is distinct per index, the shape `eaters` is keyed by. */
 function fakeHash(i: number): string {
