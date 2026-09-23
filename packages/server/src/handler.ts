@@ -34,6 +34,7 @@ import {
   newDigestRecord, nextDigestAction, verifyPayload, DIGEST_MAX_ATTEMPTS,
   type DigestRecord,
 } from './digest.js';
+import { healthProblem, type Health } from './health.js';
 import {
   ABYS_PRICES,
   ABYS_PRICE_LEGENDARY_NAME,
@@ -220,6 +221,21 @@ export interface WorldStore {
   save(s: LedgerSnapshot): void;
 }
 
+/** What the host's storage looks like from the outside, as reported by `metrics`. */
+export interface StorageMetrics {
+  /** Bytes in the last snapshot this isolate tried to store; null before the first save. */
+  snapshotBytes: number | null;
+  /** Whether that snapshot is currently over the budget the sim's caps target. */
+  overBudget: boolean;
+  /** Stored burn receipts — the whole replay guard, as one array. */
+  receipts: number | null;
+  receiptsBytes: number | null;
+  receiptsOver: boolean;
+  /** The alarm line, and the wall behind it, in bytes. */
+  budget: number;
+  limit: number;
+}
+
 /** How long a flare burns, in ticks (~4 minutes at 250ms/tick). */
 const FLARE_LIFE_TICKS = 1000;
 /** Flares fade over their last this-many ticks before burning out. */
@@ -256,6 +272,19 @@ export interface AppOptions {
    * Durable Object's storage.
    */
   store?: WorldStore;
+  /**
+   * Signal counters, owned by whoever provides `store`. Every guard in this file
+   * prints a line and, where a ledger is wired, also counts itself, because a
+   * log line only helps a reader who happens to be tailing the worker.
+   */
+  health?: Health;
+  /**
+   * Storage sizes the handler cannot see: the snapshot bytes, the receipt count
+   * and the ceilings they are measured against all belong to the durable object
+   * that hosts the app. Absent for a bare `createApp` (tests, the node adapter),
+   * where `/health` reports the counters and says nothing about storage.
+   */
+  metrics?: () => StorageMetrics;
   /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
@@ -513,6 +542,7 @@ export function createApp(options: AppOptions = {}) {
         // awaiting is fine; not answering for it is not — the record itself
         // records the attempt, this line is only for what escapes it.
         console.error('day digest pump failed: the anchor may be stuck on the previous day', err);
+        options.health?.note('digest_pump_failed', err);
       });
     }
 
@@ -689,6 +719,56 @@ export function createApp(options: AppOptions = {}) {
     };
   }
 
+  /**
+   * `GET /health`: the counters those log lines were meant to raise.
+   *
+   * Every guard in this build prints something and, where a ledger is wired,
+   * counts itself. The print is addressed to a reader who happens to be tailing
+   * the worker at the second the failure happens; the count is addressed to
+   * anyone who asks later, which is the only way to answer "has a burn receipt
+   * failed to store since the last deploy" when nobody was watching.
+   *
+   * Deliberately not cached, and deliberately carrying the raw counts rather
+   * than a curated subset: a health endpoint that hides which numbers it looked
+   * at is a hunch with a URL.
+   */
+  async function healthPayload() {
+    const view = options.health?.view() ?? null;
+    const problem = view ? healthProblem(view) : null;
+    // Derived rather than counted: this describes the record as it stands now,
+    // so it cannot "happen" a number of times the way a failed write does. It is
+    // also the only digest condition that is reportable without an attempt — a
+    // record written before the field list existed is coherent, untrusted, and
+    // never gets as far as the gate that would have counted it.
+    const mismatch = digest && !(await verifyPayload(digest.payload)) ? 'digest_payload_mismatch' : null;
+    const parts = [problem, mismatch].filter((p): p is string => Boolean(p));
+    return {
+      // `null` when no ledger is wired at all — the honest difference between
+      // "nothing went wrong" and "nobody was counting".
+      healthy: view ? parts.length === 0 : null,
+      problem: parts.length ? parts.join(' ') : null,
+      signals: view ? { counts: view.counts, last: view.last } : null,
+      storage: options.metrics?.() ?? null,
+      digest: digest ? {
+        day: digest.day,
+        status: digest.status,
+        attempts: digest.attempts,
+        maxAttempts: DIGEST_MAX_ATTEMPTS,
+        txHash: digest.txHash,
+        verifies: !mismatch,
+      } : null,
+      world: {
+        tick: world.tick,
+        day: Math.floor(world.tick / world.config.ticksPerDay),
+        ticksPerDay: world.config.ticksPerDay,
+        population: world.creatures.length,
+      },
+      instance: options.instance ?? instanceId,
+      isolateStartedAt: view?.startedAt ?? null,
+      serverTime: Date.now(),
+    };
+  }
+
   // Three daily propositions resolved from the world itself at day roll: no
   // oracle and no market, just standings anybody can recompute from /history.
   let dayStartDay = -1;
@@ -821,6 +901,7 @@ export function createApp(options: AppOptions = {}) {
       // permanent in one day rather than forever.
       digest = markFailed(markSubmitted(r, Date.now()), Date.now());
       saveStore();
+      options.health?.note('digest_verify_refused');
       return;
     }
     // Marked before the await, so an isolate that dies mid-send leaves a record
@@ -864,6 +945,7 @@ export function createApp(options: AppOptions = {}) {
         `day digest not broadcast: day ${r.day} attempt ${submitted.attempts}/${DIGEST_MAX_ATTEMPTS} `
         + `(${String((err as Error)?.message ?? err)})`,
       );
+      options.health?.note('digest_not_broadcast', err);
       digest = markFailed(submitted, Date.now());
     }
     saveStore();
@@ -898,6 +980,7 @@ export function createApp(options: AppOptions = {}) {
         // Broadcast and reverted: the hash stays, because it is evidence of a
         // real attempt, and the retry budget decides whether to follow it up.
         console.error(`day digest transaction reverted on chain: day ${r.day} tx ${r.txHash}`);
+        options.health?.note('digest_reverted');
         digest = markFailed(current, Date.now(), r.txHash);
         saveStore();
       }
@@ -1337,6 +1420,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /api': 'this endpoint index',
         'GET /state': 'tick, day, population, chain + market temperature, harvest/judgment countdowns, price list, legendary thresholds, editable traits',
         'GET /world': 'render snapshot: creatures (with archetype, plus paid identity where any exists), foods, world size',
+        'GET /health': 'self-observation: failure counters (receipt/ledger/snapshot writes, budget crossings, digest signals), storage sizes, day-anchor state; healthy:null when nothing is counting',
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
@@ -1395,6 +1479,17 @@ export function createApp(options: AppOptions = {}) {
 
     if (req.method === 'GET' && path === '/state') return json(await statePayload(), 200, 3);
     if (req.method === 'GET' && path === '/world') return json(worldPayload(), 200, 3);
+    // No cache on this one: a stale "healthy" is worse than no answer, and the
+    // whole point of the route is that it can be polled at any moment.
+    // It needs no `hydrate()` of its own, and says so rather than looking
+    // defensive: the exported `fetch` below hydrates before dispatching, and
+    // every caller — the Durable Object, dev.ts, the tests — goes through it. A
+    // second call here would be a promise awaiting a promise, and the reader
+    // would take it as the thing that makes the answer trustworthy. It isn't;
+    // the wrapper is, and the mutation test for that line is M26.
+    if (req.method === 'GET' && path === '/health') {
+      return json(await healthPayload(), 200, 0);
+    }
 
     if (req.method === 'GET' && path === '/history') {
       // The charts draw CHART_SLOTS points and decimate whatever they receive,
@@ -1970,8 +2065,14 @@ export function createApp(options: AppOptions = {}) {
       // every status in `/state`.
       if (s.digest) {
         const problem = coherenceProblem(s.digest);
-        if (problem) console.error(`stored digest record rejected: ${problem} (day ${s.digest.day})`);
-        else digest = s.digest;
+        if (problem) {
+          console.error(`stored digest record rejected: ${problem} (day ${s.digest.day})`);
+          // Counted per hydrate, not per event: a record that cannot be read
+          // back fails this check on every cold start until something writes a
+          // new one, so a growing count is the sound of anchoring restarting
+          // from scratch each time the isolate moves.
+          options.health?.note('digest_record_rejected');
+        } else digest = s.digest;
       }
     })();
     return hydrated;

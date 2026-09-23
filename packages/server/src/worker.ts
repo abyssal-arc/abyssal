@@ -17,6 +17,7 @@
  */
 import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
+import { createHealth, receiptsValueBytes, type HealthView } from './health.js';
 import { toJSON, SNAPSHOT_BUDGET, DO_VALUE_LIMIT } from '@abyssal/sim';
 
 interface DoStorage {
@@ -44,6 +45,15 @@ interface Env {
 
 const SNAP_KEY = 'world';
 const INSTANCE_KEY = 'instance';
+/**
+ * The signal counters, in their own value.
+ *
+ * They cannot ride along inside the ledger or the snapshot, which is where the
+ * intuition points: those are exactly the two writes this record exists to
+ * report failing. A counter that lives in the thing it is watching goes silent
+ * at the moment it has something to say.
+ */
+const HEALTH_KEY = 'health';
 const SAVE_EVERY_MS = 30_000;
 
 /**
@@ -73,6 +83,16 @@ export class AbyssalWorld {
   // Edge-trigger for the budget warning, so a world sitting just over the line
   // says so once rather than every 30 seconds.
   private overBudget = false;
+  // The receipts array has its own copy of that edge state, because it has its
+  // own ceiling: one storage value, grown by one entry per burn, and until now
+  // watched by nothing.
+  private receiptsOver = false;
+
+  // Written after every attempted save, including the one that throws, so the
+  // number that matters is the one that survives the failure it describes.
+  private lastSnapshotBytes: number | null = null;
+
+  private health = createHealth(Date.now(), (v) => this.saveHealth(v));
 
   private receipts: string[] | null = null;
   private ledgerState: LedgerLoad | null = null;
@@ -87,6 +107,21 @@ export class AbyssalWorld {
         void this.state0()
           .then((s) => {
             s.receipts.push(hash);
+            // The receipts array is one storage value like the snapshot is, and
+            // it is append-only by design: dropping an entry to make room is
+            // dropping a replay guard. So its ceiling is reached monotonically,
+            // one burn at a time, at roughly 30k entries — and nothing watched.
+            // This is that watch, on the same edge trigger the snapshot uses.
+            const receiptsBytes = receiptsValueBytes(s.receipts.length);
+            const receiptsCrossed = budgetCrossed(receiptsBytes, this.receiptsOver);
+            this.receiptsOver = receiptsCrossed.over;
+            if (receiptsCrossed.announce) {
+              this.health.note('receipts_past_budget');
+              console.warn(
+                `burn receipts past budget: ${s.receipts.length} receipts, ~${receiptsBytes} of `
+                + `${DO_VALUE_LIMIT} bytes in one value; the next burn may not be stored at all`,
+              );
+            }
             return this.ctx.storage.put('receipts', s.receipts);
           })
           .catch((err: unknown) => {
@@ -96,10 +131,28 @@ export class AbyssalWorld {
             // accepted again the moment it does not: a failure nobody sees here
             // is a burn that has quietly become spendable a second time, and the
             // evidence for that is a single line in a log nobody reads.
+            this.health.note('receipt_not_stored', err);
             console.error('burn receipt not stored: this burn can be replayed after an eviction', err);
           });
       },
     });
+  }
+
+  /**
+   * Persist the counters. Fired from `note`, so it runs when something has gone
+   * wrong and at no other time.
+   *
+   * Its own failure is printed and not counted: the ledger has no kind to file
+   * "the thing that counts failures failed" under without recursing, and a
+   * counter that cannot be stored is already, by construction, a counter whose
+   * last known value is the one still on disk.
+   */
+  private saveHealth(view: HealthView): void {
+    this.ctx.waitUntil(
+      this.ctx.storage.put(HEALTH_KEY, view).catch((err: unknown) => {
+        console.error('health counters not stored: /health will report a stale history after an eviction', err);
+      }),
+    );
   }
 
   private async state0() {
@@ -133,6 +186,7 @@ export class AbyssalWorld {
         void this.ctx.storage.put('ledger', s).catch((err: unknown) => {
           // What an eviction now loses: the feed cursor (so blocks already
           // counted get re-read), the day passes, and who burned what.
+          this.health.note('ledger_not_stored', err);
           console.error('world ledger not stored: passes, burners and the feed cursor are memory-only', err);
         });
       },
@@ -147,12 +201,28 @@ export class AbyssalWorld {
         instance = crypto.randomUUID();
         await this.ctx.storage.put(INSTANCE_KEY, instance);
       }
+      // Counters outlive the isolate that recorded them, but only if they are
+      // read back: an isolate that starts at zero is an isolate that reports a
+      // clean bill of health over a tank whose receipts have been memory-only
+      // for a week. `merge` takes the max of each count, so the order of this
+      // call relative to any early `note` does not matter.
+      this.health.merge(await this.ctx.storage.get<HealthView>(HEALTH_KEY));
       this.app = createApp({
         snapshot: snapshot ?? undefined,
         instance,
         token: this.env.ABYS_TOKEN_ADDRESS,
         rpc: this.env.ARC_RPC_URL,
         store: this.store(),
+        health: this.health,
+        metrics: () => ({
+          snapshotBytes: this.lastSnapshotBytes,
+          overBudget: this.overBudget,
+          receipts: this.receipts?.length ?? null,
+          receiptsBytes: this.receipts === null ? null : receiptsValueBytes(this.receipts.length),
+          receiptsOver: this.receiptsOver,
+          budget: SNAPSHOT_BUDGET,
+          limit: DO_VALUE_LIMIT,
+        }),
       });
     }
     return this.app;
@@ -175,6 +245,7 @@ export class AbyssalWorld {
     // 2 MB byte ceiling, so this measures in bytes. The cost is one pass over a
     // string `toJSON` has already built, once every 30 seconds.
     const bytes = new TextEncoder().encode(snapshot).byteLength;
+    this.lastSnapshotBytes = bytes;
     const { over, announce } = budgetCrossed(bytes, this.overBudget);
     this.overBudget = over;
     if (announce) {
@@ -190,6 +261,7 @@ export class AbyssalWorld {
         `world snapshot past budget: ${bytes} of ${DO_VALUE_LIMIT} bytes `
         + `(${Math.round((bytes / DO_VALUE_LIMIT) * 100)}% of one storage value)`,
       );
+      this.health.note('snapshot_past_budget');
     }
     try {
       await this.ctx.storage.put(SNAP_KEY, snapshot);
@@ -203,6 +275,7 @@ export class AbyssalWorld {
       // whatever its last successful write happened to hold, and says so
       // nowhere.
       console.error(`world snapshot not saved: ${bytes} bytes`, err);
+      this.health.note('snapshot_not_saved', err);
     }
   }
 

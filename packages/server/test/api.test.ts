@@ -26,6 +26,10 @@ import {
   type DigestPayload, type DigestRecord,
 } from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
+import {
+  createHealth, healthProblem, receiptsValueBytes, SIGNAL_KINDS,
+  type HealthView,
+} from '../src/health.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -2256,8 +2260,14 @@ test('a snapshot too big to store costs a log line, not the response', async () 
     logged.push(args);
   };
   let res: Response;
+  let health: HealthBody;
   try {
     res = await obj.fetch(new Request('https://abyssal.internal/api'));
+    // Read through the same object rather than a second one: what is being
+    // checked here is that the guard which prints also counts, so both halves
+    // have to be observed on the isolate that failed. Fetched inline rather
+    // than through the helper below, which is declared after this test runs.
+    health = (await (await obj.fetch(new Request('https://abyssal.internal/health'))).json()) as HealthBody;
   } finally {
     console.error = realError;
   }
@@ -2270,6 +2280,9 @@ test('a snapshot too big to store costs a log line, not the response', async () 
     /world snapshot not saved: [1-9]\d* bytes/,
     'with the size it tried to write, which is the number that decides whether the caps still hold',
   );
+  assert.equal(health.signals?.counts.snapshot_not_saved, 1, 'and counted, for anyone who asks later');
+  assert.equal(health.healthy, false);
+  assert.ok((health.storage?.snapshotBytes ?? 0) > 1000, 'the size that failed is still the size on record');
 });
 
 test('a write fired without awaiting still says which one broke', async () => {
@@ -3065,4 +3078,407 @@ test('the preview a viewer watches all day is the computation the anchor uses', 
   assert.equal(state.dayAnchor.day, Math.floor(app.world.tick / state.ticksPerDay));
   assert.equal(state.dayAnchor.digest, await digestHash(digestStats(state.dayAnchor.day, app.world)));
   assert.match(state.dayAnchor.digest, /^[0-9a-f]{64}$/, 'a SHA-256, not eight hex digits');
+});
+
+/* ---------- self-observation: the counters behind the log lines ---------- */
+
+/**
+ * Nine guards in the deployed code print a line when something fails, and every
+ * one of those lines is addressed to a reader who happens to be tailing the
+ * worker at the second the failure happens. Whether that reader exists is not a
+ * hypothetical to argue about: in the tail captures kept on disk, console output
+ * has never once arrived, while platform exceptions have. These tests are the
+ * other half — a number that can be asked for later, through the same durable
+ * object that had the failure, and through an isolate that did not.
+ */
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+test('a signal ledger counts, keeps the reason, and refuses a name nobody declared', () => {
+  const h = createHealth(1000);
+  assert.deepEqual(h.view(), { startedAt: 1000, counts: {}, last: {} }, 'a fresh ledger has nothing to say');
+  assert.equal(healthProblem(h.view()), null);
+
+  h.note('ledger_not_stored', new Error('string or blob too big'));
+  h.note('ledger_not_stored', 'a reason that is only a string');
+  const v = h.view();
+  assert.equal(v.counts.ledger_not_stored, 2);
+  assert.equal(v.last.ledger_not_stored.count, 2, 'the event carries the total it was the second of');
+  assert.equal(v.last.ledger_not_stored.detail, 'a reason that is only a string', 'the newest reason wins');
+  assert.equal(healthProblem(v), 'ledger_not_stored=2');
+
+  assert.throws(
+    () => h.note('made_up_kind' as never),
+    /unknown health signal/,
+    'a typo at a call site is a bug, not a place to lose a count',
+  );
+
+  // Every declared kind has to be usable and has to reach `problem`: dropping
+  // one from the list would otherwise turn that guard back into a log line.
+  const all = createHealth(1);
+  for (const kind of SIGNAL_KINDS) all.note(kind);
+  assert.deepEqual(Object.keys(all.view().counts).sort(), [...SIGNAL_KINDS].sort());
+  const reported = healthProblem(all.view())?.split(' ') ?? [];
+  assert.equal(reported.length, SIGNAL_KINDS.length, 'nothing is counted and then left unsaid');
+
+  // A detail is capped, because this object is written to storage: an error
+  // carrying a 1 MB SQL statement must not become a 1 MB health record. And the
+  // cap keeps both ends, because the errors met for real here bury the reason
+  // last: viem prints a headline, then the request (hundreds of characters of
+  // calldata), then `Details:` with the endpoint's own answer.
+  const long = createHealth(1);
+  long.note('snapshot_not_saved', new Error('x'.repeat(5000)));
+  const clipped = long.view().last.snapshot_not_saved.detail;
+  assert.ok(clipped.length <= 400, `capped, was ${clipped.length}`);
+  assert.match(clipped, / … /, 'with the cut marked rather than hidden');
+});
+
+test('merging a stored ledger only ever moves it forward', () => {
+  const mine = createHealth(1000);
+  mine.note('receipt_not_stored');
+  mine.note('receipt_not_stored');
+
+  // The stored copy is behind. Reading it must not rewrite history this isolate
+  // has already lived through — the write that would have raised it is the
+  // failure being counted.
+  mine.merge({ counts: { receipt_not_stored: 1 }, last: {} });
+  assert.equal(mine.view().counts.receipt_not_stored, 2, 'a merge never lowers a count');
+
+  // The stored copy is ahead: another isolate saw things this one did not.
+  const later = Date.now() + 60_000;
+  mine.merge({
+    counts: { receipt_not_stored: 7, snapshot_not_saved: 3 },
+    last: {
+      receipt_not_stored: { at: later, detail: 'from disk', count: 7 },
+      snapshot_not_saved: { at: later, detail: 'older isolate', count: 3 },
+    },
+  });
+  const v = mine.view();
+  assert.equal(v.counts.receipt_not_stored, 7, 'what the other isolate saw is still counted');
+  assert.equal(v.counts.snapshot_not_saved, 3);
+  assert.equal(v.last.receipt_not_stored.detail, 'from disk', 'and the newer event wins for that kind');
+  assert.equal(v.last.receipt_not_stored.count, 7);
+
+  // Junk in storage is ignored rather than trusted, and cannot invent a kind.
+  const strict = createHealth(1);
+  strict.merge('not an object');
+  strict.merge({ counts: { made_up_kind: 9, real_but_float: 1.5, snapshot_not_saved: -4 }, last: null });
+  assert.deepEqual(strict.view().counts, {}, 'unknown, non-numeric and negative entries all go unread');
+
+  // And a view that went through JSON is the same shape it came out as: this is
+  // what the Durable Object stores.
+  const round = createHealth(2222);
+  round.note('digest_reverted', new Error('execution reverted'));
+  const json = JSON.parse(JSON.stringify(round.view())) as HealthView;
+  assert.deepEqual(json.counts, { digest_reverted: 1 });
+  assert.equal(json.startedAt, 2222);
+});
+
+test('the receipts byte formula is checked against the array it describes', async () => {
+  const { SNAPSHOT_BUDGET, DO_VALUE_LIMIT } = await import('@abyssal/sim');
+  // The claim is that one storage value grows by exactly 69 bytes a burn, which
+  // is only true while every entry is a 66-character hash. Measured against the
+  // real thing rather than trusted: if the shape of a stored receipt ever
+  // changes, this is the test that notices the arithmetic did not follow.
+  for (const n of [0, 1, 2, 7, 500]) {
+    const arr = Array.from({ length: n }, (_, i) => '0x' + i.toString(16).padStart(64, '0'));
+    assert.equal(receiptsValueBytes(n), JSON.stringify(arr).length, `n=${n}`);
+  }
+
+  // Where that leaves the guard, in burns rather than bytes.
+  const crossing = Math.floor((SNAPSHOT_BUDGET - 1) / 69);
+  assert.ok(receiptsValueBytes(crossing) <= SNAPSHOT_BUDGET, 'the last count under the alarm line');
+  assert.ok(receiptsValueBytes(crossing + 1) > SNAPSHOT_BUDGET, 'and the first over it');
+  const wall = Math.floor((DO_VALUE_LIMIT - 1) / 69);
+  assert.ok(receiptsValueBytes(wall) <= DO_VALUE_LIMIT && receiptsValueBytes(wall + 1) > DO_VALUE_LIMIT);
+  assert.ok(crossing > 20_000, 'which puts the alarm tens of thousands of burns away, not around the corner');
+  assert.ok(wall > crossing, 'and the wall behind it');
+});
+
+/* ---------- the same thing through the Durable Object that has to do it ---------- */
+
+const { AbyssalWorld: WorldDO } = await import('../src/worker.js');
+
+interface DoHandle {
+  obj: InstanceType<typeof WorldDO>;
+  stored: Map<string, unknown>;
+  attempted: string[];
+  failing: Set<string>;
+}
+
+/**
+ * A Durable Object over an in-memory storage, with the keys a caller wants to
+ * break held in a set that can still be edited after the object is built —
+ * seeding a condition and *then* making the write fail is most of what is worth
+ * testing here.
+ */
+function worldDO(stored = new Map<string, unknown>()): DoHandle {
+  const attempted: string[] = [];
+  const failing = new Set<string>();
+  const obj = new WorldDO(
+    {
+      storage: {
+        get: async <T = unknown>(key: string): Promise<T | undefined> => stored.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => {
+          attempted.push(key);
+          if (failing.has(key)) throw new Error(`string or blob too big: SQLITE_TOOBIG on ${key}`);
+          stored.set(key, value);
+        },
+      },
+      waitUntil: (promise: Promise<unknown>) => { void promise.catch(() => {}); },
+    },
+    { WORLD: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response(null) }) } },
+  );
+  return { obj, stored, attempted, failing };
+}
+
+type HealthBody = {
+  healthy: boolean | null;
+  problem: string | null;
+  signals: { counts: Record<string, number>; last: Record<string, { at: number; detail: string; count: number }> } | null;
+  storage: {
+    snapshotBytes: number | null;
+    overBudget: boolean;
+    receipts: number | null;
+    receiptsBytes: number | null;
+    receiptsOver: boolean;
+    budget: number;
+    limit: number;
+  } | null;
+  digest: {
+    day: number;
+    status: DigestRecord['status'];
+    attempts: number;
+    maxAttempts: number;
+    txHash: string | null;
+    verifies: boolean;
+  } | null;
+  world: { tick: number; day: number; ticksPerDay: number; population: number };
+  instance: string;
+  isolateStartedAt: number | null;
+  serverTime: number;
+};
+
+const readHealth = async (target: { fetch(req: Request): Promise<Response> }): Promise<HealthBody> =>
+  (await (await target.fetch(new Request('http://localhost/health'))).json()) as HealthBody;
+
+/** The stored reason for one kind, or '' when that kind was never counted. */
+const healthDetail = (body: HealthBody, kind: string): string => body.signals?.last[kind]?.detail ?? '';
+
+/** Capture rather than silence: several of these tests assert on the printed line too. */
+async function quiet<T>(fn: () => Promise<T>): Promise<{ value: T; errors: string[]; warnings: string[] }> {
+  const realError = console.error;
+  const realWarn = console.warn;
+  const errs: unknown[][] = [];
+  const warns: unknown[][] = [];
+  console.error = (...args: unknown[]) => { errs.push(args); };
+  console.warn = (...args: unknown[]) => { warns.push(args); };
+  try {
+    const value = await fn();
+    return { value, errors: errs.map((a) => String(a[0])), warnings: warns.map((a) => String(a[0])) };
+  } finally {
+    console.error = realError;
+    console.warn = realWarn;
+  }
+}
+
+test('/health reports a tank with nothing to report, with the numbers behind the answer', async () => {
+  const { SNAPSHOT_BUDGET, DO_VALUE_LIMIT } = await import('@abyssal/sim');
+  const { obj } = worldDO();
+  const { value: body, errors, warnings } = await quiet(async () => {
+    await obj.fetch(new Request('http://localhost/api'));
+    return readHealth(obj);
+  });
+  assert.deepEqual(errors, [], 'a healthy tank prints nothing and claims nothing');
+  assert.deepEqual(warnings, []);
+  assert.equal(body.healthy, true);
+  assert.equal(body.problem, null);
+  assert.deepEqual(body.signals?.counts, {});
+  assert.equal(body.storage?.receipts, 0, 'the receipt count comes from the object that owns the array');
+  assert.equal(body.storage?.budget, SNAPSHOT_BUDGET);
+  assert.equal(body.storage?.limit, DO_VALUE_LIMIT);
+  assert.ok((body.storage?.snapshotBytes ?? 0) > 1000, 'the last save reported the size it wrote');
+  assert.equal(body.storage?.overBudget, false);
+  assert.equal(body.digest, null, 'day zero has anchored nothing, and does not invent a status for it');
+  assert.ok(body.world.population > 0, 'the world it is reporting on is the one it is holding');
+  assert.ok(body.isolateStartedAt && body.isolateStartedAt <= body.serverTime);
+  assert.ok(typeof body.instance === 'string' && body.instance.length > 0);
+});
+
+test('/health says nothing at all when nobody is counting', async () => {
+  // A bare `createApp` has no durable object to ask about storage and no ledger
+  // wired, which is the truth the route has to tell. Reporting `healthy: true`
+  // from an uninstrumented process is how a monitor learns to trust a hunch.
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  const { value: body } = await quiet(() => readHealth(app));
+  assert.equal(body.healthy, null, 'unknown, not clean');
+  assert.equal(body.signals, null);
+  assert.equal(body.storage, null);
+  assert.equal(body.problem, null);
+});
+
+test('a burn that cannot be stored becomes a number a later isolate can still read', async () => {
+  const { recordBurnReceipt, setBurnLedger } = await import('../src/payments.js');
+  const { obj, stored, attempted, failing } = worldDO();
+  try {
+    const { value } = await quiet(async () => {
+      await obj.fetch(new Request('http://localhost/api'));
+      failing.add('receipts');
+      recordBurnReceipt('0x' + 'd7'.repeat(32));
+      await sleep(80);
+      return readHealth(obj);
+    });
+    assert.ok(attempted.includes('receipts'), 'the write was attempted');
+    assert.equal(value.healthy, false);
+    assert.equal(value.problem, 'receipt_not_stored=1');
+    assert.equal(value.signals?.counts.receipt_not_stored, 1);
+    assert.match(
+      value.signals?.last.receipt_not_stored.detail ?? '',
+      /SQLITE_TOOBIG on receipts/,
+      'the counter keeps the reason, not only the tally',
+    );
+
+    // The counters live in their own storage value precisely because the
+    // failure they describe is a storage value that could not be written. A
+    // receipt too big to store says nothing about a 300-byte record of it.
+    assert.ok(stored.has('health'), 'the counter itself reached storage');
+    assert.equal((stored.get('health') as HealthView).counts.receipt_not_stored, 1);
+
+    // An eviction: same storage, new object, no new failure.
+    failing.clear();
+    const second = worldDO(stored);
+    const afterEviction = await quiet(async () => {
+      await second.obj.fetch(new Request('http://localhost/api'));
+      return readHealth(second.obj);
+    });
+    assert.equal(afterEviction.value.signals?.counts.receipt_not_stored, 1, 'the count outlived the isolate that recorded it');
+    assert.equal(afterEviction.value.healthy, false, 'and the tank still reports as unwell');
+    assert.deepEqual(afterEviction.errors, [], 'reading it back does not re-print the failure');
+  } finally {
+    setBurnLedger({ load: async () => [], add: () => {} });
+  }
+});
+
+test('the receipt array gets its own alarm, because it is its own storage value', async () => {
+  // This one is not hypothetical in the way the snapshot warning is: the receipts
+  // array is append-only by design, since dropping an entry is dropping a replay
+  // guard. So it reaches the ceiling on one storage value eventually, and until
+  // now the only thing that said so was a line nobody reads.
+  const { SNAPSHOT_BUDGET } = await import('@abyssal/sim');
+  const { recordBurnReceipt, setBurnLedger } = await import('../src/payments.js');
+  const seeded = Math.floor((SNAPSHOT_BUDGET - 1) / 69);
+  assert.ok(receiptsValueBytes(seeded) <= SNAPSHOT_BUDGET, 'the seeded count is under the line');
+
+  const stored = new Map<string, unknown>();
+  stored.set('receipts', Array.from({ length: seeded }, (_, i) => '0x' + i.toString(16).padStart(64, '0')));
+  const { obj } = worldDO(stored);
+  try {
+    const first = await quiet(async () => {
+      await obj.fetch(new Request('http://localhost/api'));
+      recordBurnReceipt('0x' + 'e5'.repeat(32));
+      await sleep(120);
+      return readHealth(obj);
+    });
+    assert.equal(first.value.storage?.receipts, seeded + 1, 'the burn was recorded');
+    assert.equal(first.value.signals?.counts.receipts_past_budget, 1, 'and crossing the line announced itself once');
+    assert.match(first.warnings.join('\n'), /burn receipts past budget/);
+    assert.deepEqual(first.errors, [], 'a warning is not an error: nothing has failed yet');
+
+    const second = await quiet(async () => {
+      recordBurnReceipt('0x' + 'e6'.repeat(32));
+      await sleep(120);
+      return readHealth(obj);
+    });
+    assert.equal(second.value.storage?.receipts, seeded + 2);
+    assert.equal(
+      second.value.signals?.counts.receipts_past_budget,
+      1,
+      'staying over the line is not a second crossing, which is what makes the count worth reading',
+    );
+  } finally {
+    setBurnLedger({ load: async () => [], add: () => {} });
+  }
+});
+
+test('a refused broadcast is counted by the same guard that prints about it', async () => {
+  const rpc = await digestRpcStub('insufficient funds for gas * price + value');
+  const m = memStore();
+  const health = createHealth(1);
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+      await quiet(() => tickTimes(app, 4));
+      await untilDigest(m.digest, (r) => r.status === 'failed', 'failed');
+      const body = await readHealth(app);
+      assert.equal(body.signals?.counts.digest_not_broadcast, 1);
+      assert.equal(body.healthy, false);
+      assert.match(body.problem ?? '', /digest_not_broadcast=1/);
+      // The record and the counter are two views of one fact, and saying so in
+      // one payload is the point: a reader can check the status against the tally
+      // rather than take either on faith.
+      assert.equal(body.digest?.status, 'failed');
+      assert.equal(body.digest?.attempts, 1);
+      assert.equal(body.digest?.verifies, true, 'the payload was sound; the broadcast is what failed');
+      assert.equal(
+        healthDetail(body, 'digest_not_broadcast').length <= 400,
+        true,
+        'the stored reason is bounded, whatever the endpoint said',
+      );
+      assert.match(
+        healthDetail(body, 'digest_not_broadcast'),
+        /^TransactionExecutionError: The total cost /,
+        'the headline survives the cap',
+      );
+      assert.match(
+        healthDetail(body, 'digest_not_broadcast'),
+        /insufficient funds for gas \* price \+ value/,
+        'and so does the endpoint\u2019s own answer, which sits at the end of a message whose '
+        + 'middle is several hundred characters of calldata',
+      );
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a stored record that cannot be read back is counted every time it is refused', async () => {
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDigest({
+    ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)),
+    status: 'pending',
+    txHash: null,
+    attempts: 1,
+    lastAttemptAt: 1,
+  });
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value } = await quiet(() => readHealth(app));
+  assert.equal(value.digest, null, 'a lie is still not a status worth publishing');
+  assert.equal(value.signals?.counts.digest_record_rejected, 1);
+  assert.match(value.problem ?? '', /digest_record_rejected=1/);
+  assert.equal(value.healthy, false, 'and the tank says so rather than reporting an empty history as clean');
+});
+
+test('a payload whose hash no longer describes it is named without an attempt being made', async () => {
+  // The condition this covers is not one the code can produce any more, which is
+  // exactly why it needs reporting: a record written while the hashed field list
+  // was different passes every state transition check, is still the outstanding
+  // anchor, and will never be caught by the gate in front of a broadcast because
+  // nothing ever reaches the gate — the day is already settled.
+  const good = await buildPayload({ ...STATS, day: 12 }, 7);
+  const tampered: DigestPayload = { ...good, population: good.population + 1 };
+  assert.equal(await verifyPayload(tampered), false, 'the hash no longer describes the numbers');
+  assert.equal(coherenceProblem(newDigestRecord(12, tampered)), null, 'and no state rule can see it');
+
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDigest(newDigestRecord(12, tampered));
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value } = await quiet(() => readHealth(app));
+  assert.deepEqual(value.signals?.counts, {}, 'nothing happened, so nothing was counted');
+  assert.equal(value.problem, 'digest_payload_mismatch', 'and it is still said');
+  assert.equal(value.healthy, false);
+  assert.equal(value.digest?.verifies, false);
+  assert.equal(value.digest?.status, 'queued');
 });
