@@ -286,6 +286,12 @@ export interface AppOptions {
    */
   metrics?: () => StorageMetrics;
   /**
+   * Day-anchor signing key. The Worker passes the `ARC_DIGEST_KEY` binding;
+   * without one the handler falls back to the environment variable. See
+   * `digestKey()` for why the binding is the channel that is trusted first.
+   */
+  digestKey?: string;
+  /**
    * Serves static files when provided (the node adapter passes one backed by
    * node:fs). Keeping it injected keeps this module free of node builtins, so
    * the same handler runs inside a Cloudflare Worker where static assets come
@@ -341,11 +347,35 @@ function creatureIdOf(raw: unknown): number | null {
 
 const PUBLIC_ARC_RPC = 'https://rpc.mainnet.arc.io';
 
+/**
+ * One place to read an environment variable, because the runtime may not have one.
+ *
+ * `process` is a node thing: the same handler source runs inside workerd, where
+ * it exists only if the deployment asks for it. Measured, not assumed — a
+ * throwaway worker with no `nodejs_compat` flag, run through `wrangler dev`
+ * against the local runtime, fails the request with `ReferenceError: process is
+ * not defined` the first time it touches `process.env`, while the deployed
+ * worker answers 200 with the same lines in its boot path. So the two runtimes
+ * are not the same, and nothing should depend on which is which: a property
+ * lookup on `globalThis` cannot throw, and an absent environment reads as
+ * "not configured" — which is what every one of these knobs already means.
+ *
+ * The injectable second argument is the seam that keeps that claim testable in
+ * a process that does have a real `process` — hence the export, which is
+ * otherwise something this module keeps to itself.
+ */
+export function readEnv(
+  name: string,
+  proc: { env?: Record<string, string | undefined> } | null | undefined = globalThis.process,
+): string | undefined {
+  return proc?.env?.[name];
+}
+
 function defaultChainFeedFromEnv(rpc?: string): ChainFeed {
   // Arc is the product; the offline rain is an explicit opt-out for working
   // without network (and for hermetic tests), not the default.
-  if (process.env.CHAIN_FEED === 'synthetic') return new SyntheticFeed();
-  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, process.env.ARC_USDC_ADDRESS ?? ARC_USDC_ADDRESS);
+  if (readEnv('CHAIN_FEED') === 'synthetic') return new SyntheticFeed();
+  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, readEnv('ARC_USDC_ADDRESS') ?? ARC_USDC_ADDRESS);
 }
 
 function round1(v: number): number {
@@ -396,7 +426,7 @@ export function createApp(options: AppOptions = {}) {
   const world: World = options.snapshot
     ? resumeWorld(options.snapshot)
     : createWorld(options.seed ?? 1337);
-  const chainFeed: ChainFeed = options.chainFeed ?? defaultChainFeedFromEnv(options.rpc ?? process.env.ARC_RPC_URL);
+  const chainFeed: ChainFeed = options.chainFeed ?? defaultChainFeedFromEnv(options.rpc ?? readEnv('ARC_RPC_URL'));
   /** Non-null when running against Arc: powers /observe and the market feed. */
   const arcFeed = chainFeed instanceof ArcUsdcFeed ? chainFeed : null;
   const marketFeed: MarketFeed =
@@ -407,7 +437,7 @@ export function createApp(options: AppOptions = {}) {
   // Interventions are paid by burning ABYS: no seller key, no facilitator,
   // the receipt is the proof. Until the token address is configured there is
   // nothing to burn and /intervene answers 503. There is no demo path.
-  const rpcUrl = options.rpc ?? process.env.ARC_RPC_URL ?? PUBLIC_ARC_RPC;
+  const rpcUrl = options.rpc ?? readEnv('ARC_RPC_URL') ?? PUBLIC_ARC_RPC;
   let timer: ReturnType<typeof setInterval> | null = null;
   let lastAdvanceAt = Date.now();
   const instanceId = crypto.randomUUID();
@@ -572,7 +602,7 @@ export function createApp(options: AppOptions = {}) {
   function foreignOrigin(req: Request): boolean {
     const origin = req.headers.get('origin');
     if (!origin) return false;
-    const allowlist = (process.env.CORS_ORIGINS ?? '').split(',').filter(Boolean);
+    const allowlist = (readEnv('CORS_ORIGINS') ?? '').split(',').filter(Boolean);
     return origin !== new URL(req.url).origin && !allowlist.includes(origin);
   }
 
@@ -756,6 +786,12 @@ export function createApp(options: AppOptions = {}) {
         maxAttempts: DIGEST_MAX_ATTEMPTS,
         txHash: digest.txHash,
         verifies: !mismatch,
+        // Which account signs, or `null` for none. Publishing an address that
+        // will appear on chain anyway is what makes the difference between "no
+        // key is configured" and "a key is configured and I cannot see it" —
+        // the first is a statement, the second is a guess, and before this field
+        // existed the only way to tell them apart was to wait for a day to close.
+        signer: digestSigner(),
       } : null,
       world: {
         tick: world.tick,
@@ -830,10 +866,30 @@ export function createApp(options: AppOptions = {}) {
    */
   let digestPumpInFlight = false;
 
+  /**
+   * The signing key, from whichever channel actually delivered it.
+   *
+   * The binding first, because that is the channel proven to reach a Durable
+   * Object: `ABYS_TOKEN_ADDRESS` arrives through it in production and the burn
+   * gate runs on it, while no secret has ever been observed turning up in
+   * `process.env` at the edge. The variable stays as the node adapter's route
+   * and for a deployment that sets globals rather than bindings.
+   *
+   * Both are shape-checked instead of trusted. A secret truncated on the way
+   * into a dashboard should read as "not configured", which is a state the
+   * digest records already has and reports; a key handed to viem that is not a
+   * key is an exception thrown from inside a cron.
+   */
   function digestKey(): `0x${string}` | null {
-    const pk = process.env.ARC_DIGEST_KEY;
+    const pk = options.digestKey ?? readEnv('ARC_DIGEST_KEY');
     if (!pk || !/^0x[0-9a-fA-F]{64}$/.test(pk)) return null;
     return pk as `0x${string}`;
+  }
+
+  /** The account an anchor would be signed by, or null when nothing will be. */
+  function digestSigner(): `0x${string}` | null {
+    const pk = digestKey();
+    return pk ? privateKeyToAccount(pk).address : null;
   }
 
   /**
@@ -878,7 +934,7 @@ export function createApp(options: AppOptions = {}) {
     const r = digest;
     if (!r) return;
     const pk = digestKey();
-    const rpc = options.rpc ?? process.env.ARC_RPC_URL;
+    const rpc = options.rpc ?? readEnv('ARC_RPC_URL');
     if (!pk || !rpc) {
       // Terminal for this record, and `isSettled` says so, so the next day
       // closes over it. Configuring a key therefore starts anchoring within one
@@ -958,7 +1014,7 @@ export function createApp(options: AppOptions = {}) {
     // mistake and reported as pending. Here it is unreachable from a failed
     // send, so this is a guard rather than a workaround.
     if (!r?.txHash) return;
-    const rpc = options.rpc ?? process.env.ARC_RPC_URL;
+    const rpc = options.rpc ?? readEnv('ARC_RPC_URL');
     if (!rpc) return;
     // Take the poll slot first. Otherwise a fetch that fails leaves
     // `lastAttemptAt` where it was and the next tick — a quarter second later —
@@ -1681,7 +1737,7 @@ export function createApp(options: AppOptions = {}) {
 
     if (req.method === 'POST' && path === '/tick') {
       // Debug-only: anyone could fast-forward a public tank otherwise.
-      if (process.env.ALLOW_DEBUG_TICK !== '1') {
+      if (readEnv('ALLOW_DEBUG_TICK') !== '1') {
         return json({ error: 'debug route disabled', hint: 'set ALLOW_DEBUG_TICK=1' }, 404);
       }
       await advance();

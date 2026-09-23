@@ -41,6 +41,18 @@ interface Env {
   ABYS_TOKEN_ADDRESS?: string;
   /** Set with `wrangler secret put ARC_RPC_URL`, so it never enters the repo. */
   ARC_RPC_URL?: string;
+  /**
+   * The day-anchor signer, set with `wrangler secret put ARC_DIGEST_KEY`.
+   *
+   * It has to travel as a binding rather than be read off `process.env`, which
+   * is what the handler used to do: this Worker asks for no `nodejs_compat`
+   * flag, and a runtime that is not told to provide node globals may provide no
+   * `process` at all (measured locally — see `readEnv` in handler.ts). A secret
+   * that silently reads as absent is the worst failure shape available here,
+   * because the digest then reports `unconfigured` forever and looks like a
+   * choice rather than a typo in a dashboard.
+   */
+  ARC_DIGEST_KEY?: string;
 }
 
 const SNAP_KEY = 'world';
@@ -212,6 +224,7 @@ export class AbyssalWorld {
         instance,
         token: this.env.ABYS_TOKEN_ADDRESS,
         rpc: this.env.ARC_RPC_URL,
+        digestKey: this.env.ARC_DIGEST_KEY,
         store: this.store(),
         health: this.health,
         metrics: () => ({

@@ -1,7 +1,7 @@
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
-import { createApp, type LedgerSnapshot, type WorldStore } from '../src/handler.js';
+import { createApp, readEnv, type LedgerSnapshot, type WorldStore } from '../src/handler.js';
 import type { ChainFeed, FeedState, PulseRow } from '../src/chain.js';
 import type { MarketFeed } from '../src/market.js';
 import { serveStatic } from '../src/static.js';
@@ -3212,7 +3212,7 @@ interface DoHandle {
  * seeding a condition and *then* making the write fail is most of what is worth
  * testing here.
  */
-function worldDO(stored = new Map<string, unknown>()): DoHandle {
+function worldDO(stored = new Map<string, unknown>(), env: Record<string, unknown> = {}): DoHandle {
   const attempted: string[] = [];
   const failing = new Set<string>();
   const obj = new WorldDO(
@@ -3227,7 +3227,7 @@ function worldDO(stored = new Map<string, unknown>()): DoHandle {
       },
       waitUntil: (promise: Promise<unknown>) => { void promise.catch(() => {}); },
     },
-    { WORLD: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response(null) }) } },
+    { WORLD: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response(null) }) }, ...env },
   );
   return { obj, stored, attempted, failing };
 }
@@ -3252,6 +3252,7 @@ type HealthBody = {
     maxAttempts: number;
     txHash: string | null;
     verifies: boolean;
+    signer: string | null;
   } | null;
   world: { tick: number; day: number; ticksPerDay: number; population: number };
   instance: string;
@@ -3481,4 +3482,148 @@ test('a payload whose hash no longer describes it is named without an attempt be
   assert.equal(value.healthy, false);
   assert.equal(value.digest?.verifies, false);
   assert.equal(value.digest?.status, 'queued');
+});
+
+/* ---------- how a signing key reaches the code that has to sign with it ---------- */
+
+/**
+ * The handler read its key out of `process.env` and nothing else, which is a
+ * reasonable thing to write and an unreasonable thing to leave unwitnessed:
+ * `wrangler secret put ARC_DIGEST_KEY` deposits a binding on the Durable Object,
+ * and whether that binding also appears as a node-style environment variable is
+ * a property of a runtime flag this Worker never asked for. Measured against the
+ * local runtime, a worker without `nodejs_compat` throws `ReferenceError:
+ * process is not defined` the first time it touches `process.env` at all — so
+ * the two runtimes differ, and the failure mode of guessing wrong is the worst
+ * one available: not an error, but a digest that reports `unconfigured` every
+ * day, forever, while a key sits configured in a dashboard.
+ *
+ * These tests are the difference between "the plumbing exists" and "the
+ * plumbing was checked from both ends".
+ */
+const BINDING_KEY = `0x${'ab'.repeat(32)}`;
+const AMBIENT_KEY = `0x${'cd'.repeat(32)}`;
+
+/** Run with no digest key in the environment, whatever the suite had before. */
+async function withoutDigestEnv<T>(fn: () => Promise<T>): Promise<T> {
+  const had = process.env.ARC_DIGEST_KEY;
+  delete process.env.ARC_DIGEST_KEY;
+  try {
+    return await fn();
+  } finally {
+    if (had === undefined) delete process.env.ARC_DIGEST_KEY;
+    else process.env.ARC_DIGEST_KEY = had;
+  }
+}
+
+test('an environment that is not there reads as unset instead of throwing', () => {
+  // The whole point of the seam: `undefined` is an answer, a crash is not. The
+  // no-process case is injected as `null` rather than `undefined` because a
+  // default parameter fires on `undefined` — passing nothing is the way to ask
+  // for the real `process`, so it cannot also be the way to say there is none.
+  assert.equal(readEnv('PATH'), process.env.PATH, 'the real process is the default source');
+  assert.equal(readEnv('PATH', null), undefined, 'no process at all is no value, not a crash');
+  assert.equal(readEnv('PATH', {}), undefined, 'a process with no env answers the same way');
+  assert.equal(
+    readEnv('ARC_DIGEST_KEY', { env: { ARC_DIGEST_KEY: 'from-injected' } }),
+    'from-injected',
+    'and an injected source is read',
+  );
+});
+
+test('the anchor key can arrive as a binding, and /health names the account it came from', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withoutDigestEnv(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, digestKey: BINDING_KEY, ...offlineFeeds });
+      shortenDay(app);
+      await quiet(() => tickTimes(app, 4));
+      const rec = await untilDigest(
+        m.digest,
+        (r) => r.txHash !== null,
+        'a broadcast that came back with a hash',
+      );
+      assert.equal(rec.status, 'pending');
+      assert.equal(rpc.sends.length, 1, 'a key in the binding alone was enough to reach the wire');
+      const body = await readHealth(app);
+      assert.equal(
+        body.digest?.signer,
+        privateKeyToAccount(BINDING_KEY as `0x${string}`).address,
+        'the address is derived from the key rather than configured next to it',
+      );
+      assert.equal(body.problem, null, 'and a tank that anchored normally counts nothing as a failure');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the binding wins over an ambient variable, so a stale global cannot sign', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const had = process.env.ARC_DIGEST_KEY;
+  process.env.ARC_DIGEST_KEY = AMBIENT_KEY;
+  try {
+    const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, digestKey: BINDING_KEY, ...offlineFeeds });
+    shortenDay(app);
+    await quiet(() => tickTimes(app, 4));
+    await untilDigest(m.digest, (r) => r.txHash !== null, 'a broadcast');
+    const signer = (await readHealth(app)).digest?.signer;
+    assert.equal(signer, privateKeyToAccount(BINDING_KEY as `0x${string}`).address, 'the binding is what signed');
+    assert.notEqual(
+      signer,
+      privateKeyToAccount(AMBIENT_KEY as `0x${string}`).address,
+      'and not a key left behind in the environment by some other deployment',
+    );
+  } finally {
+    if (had === undefined) delete process.env.ARC_DIGEST_KEY;
+    else process.env.ARC_DIGEST_KEY = had;
+    rpc.close();
+  }
+});
+
+test('a key that is not a key is reported as no key, and never reaches the wire', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withoutDigestEnv(async () => {
+      // 62 hex digits: the shape a secret gets when a dashboard truncates it, or
+      // when somebody pastes the wrong thing. viem would take this and throw
+      // somewhere inside a cron; the record already had a status for it.
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, digestKey: `0x${'ab'.repeat(31)}`, ...offlineFeeds });
+      shortenDay(app);
+      const { errors } = await quiet(() => tickTimes(app, 4));
+      const rec = await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+      assert.equal(rec.txHash, null, 'no transaction, because no usable key');
+      assert.deepEqual(rpc.sends, [], 'the endpoint was never asked to accept one');
+      assert.equal((await readHealth(app)).digest?.signer, null, 'and the answer says so rather than guessing');
+      assert.deepEqual(errors, [], 'reported as a state, not as a stack trace');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the durable object forwards the signing key it was handed', async () => {
+  // `handler.ts` preferring its binding is only half of it: the line that
+  // decides whether `wrangler secret put` reaches anything at all is the one in
+  // `worker.ts` that hands `env` to `createApp`. Delete that argument and every
+  // test above still passes, because they all build the app themselves — this is
+  // the one that goes through the object the deployment actually constructs.
+  //
+  // A day record is seeded rather than lived: crossing a day boundary would mean
+  // shortening the tank's day, and the app is private inside the object. Which
+  // day got anchored is beside the point; that the key travelled from the
+  // binding into the code that signs is the entire claim.
+  const stored = new Map<string, unknown>();
+  stored.set('ledger', { digest: newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)) });
+  const { obj } = worldDO(stored, { ARC_DIGEST_KEY: BINDING_KEY });
+  const value = await withoutDigestEnv(() => readHealth(obj));
+  assert.equal(value.digest?.status, 'queued', 'the stored record came back, so there is one to sign');
+  assert.equal(
+    value.digest?.signer,
+    privateKeyToAccount(BINDING_KEY as `0x${string}`).address,
+    'the object passed the binding down to the code that signs',
+  );
 });
