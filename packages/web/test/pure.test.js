@@ -228,3 +228,63 @@ test('pulse columns keep their rhythm on a short series and never become slabs',
     }
   }
 });
+
+test('the asset filter hides the development files and nothing the client loads', () => {
+  // wrangler.toml points `[assets] directory` at this package root, so every file
+  // here is downloadable from the live site — including `test/` and the workspace
+  // manifest. `.assetsignore` is what drops them at upload time. The failure this
+  // guards is the expensive direction: a pattern that also matches a file the
+  // browser needs turns the site into a blank page with a JSON 404 behind it,
+  // which no other test here can see, because the render smoke test imports the
+  // modules from disk and never asks the asset router about them.
+  const root = new URL('../', import.meta.url);
+  const patterns = readFileSync(fileURLToPath(new URL('.assetsignore', root)), 'utf8')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+
+  // Gitignore semantics, reduced to the three shapes this file is allowed to use.
+  const ignored = (rel) => {
+    const p = `/${rel}`;
+    return patterns.some((pat) => (
+      pat.endsWith('/') ? p.startsWith(pat)
+        : pat.startsWith('/') ? p === pat
+          : p === `/${pat}` || p.endsWith(`/${pat}`)
+    ));
+  };
+
+  // Everything the entry point reaches: markup attributes first, then the ES
+  // module graph, transitively, so a file that only app.js imports is covered.
+  const local = (href) => href && !/^(https?:|data:|#|\/\/)/.test(href) ? href.replace(/^\//, '') : null;
+  const seen = new Set();
+  const queue = ['index.html'];
+  while (queue.length) {
+    const rel = queue.pop();
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    const src = readFileSync(fileURLToPath(new URL(rel, root)), 'utf8');
+    const refs = rel.endsWith('.html')
+      ? [...src.matchAll(/(?:src|href)="([^"]+)"/g)].map((m) => m[1])
+      : [...src.matchAll(/from\s+'([^']+)'/g)].map((m) => m[1]);
+    for (const ref of refs) {
+      const path = local(ref);
+      if (path === null) continue;
+      const resolved = path.startsWith('./') ? path.slice(2) : path;
+      queue.push(resolved);
+    }
+  }
+
+  const reached = [...seen].filter((r) => r !== 'index.html');
+  assert.ok(
+    reached.includes('src/geom.js') && reached.includes('src/format.js') && reached.includes('app.js'),
+    `the walk found the modules app.js imports, read ${reached.join(', ')}`,
+  );
+  const dropped = reached.filter(ignored);
+  assert.deepEqual(dropped, [], `${dropped.join(', ')} is loaded by the client but excluded from the upload`);
+
+  // And the filter has to actually be doing something: an emptied file passes
+  // every assertion above by ignoring nothing.
+  for (const dev of ['test/pure.test.js', 'test/render.test.js', 'package.json']) {
+    assert.ok(ignored(dev), `${dev} is development-only and should not be served`);
+  }
+});

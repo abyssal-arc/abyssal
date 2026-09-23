@@ -1,0 +1,15 @@
+# Everything in this directory is served as a static asset by Cloudflare Workers,
+# because `wrangler.toml` points `[assets] directory` straight at the package root.
+# These entries are development-only and nothing on the site asks for them:
+# verified with `grep -rn "package.json\|test/pure\|test/render"` across app.js,
+# index.html, i18n.js, style.css and packages/server/src — no hits.
+#
+# `src/` is deliberately NOT listed. app.js imports ./src/geom.js and
+# ./src/format.js at runtime, so those files are part of the shipped bundle, not
+# a leak; excluding them would break the first paint.
+#
+# Wrangler drops `.assetsignore`, `_headers` and `_redirects` from the upload on
+# its own. To see the decisions, run `wrangler deploy --dry-run --log-level=debug`
+# and look for lines reading "Ignoring asset:".
+/test/
+package.json
