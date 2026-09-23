@@ -533,9 +533,19 @@ export class ArcUsdcFeed implements ChainFeed {
    * within a few polls — it refills at exactly the rate it records. Left in
    * memory alone, an object collected every minute or two served a chart of one
    * bar, and the 1h and 24h ranges each came back with a single nonzero column.
-   * `flows` still does not ride along: a ring really does refill from the
-   * next backfill, and a stale copy would be indistinguishable from a fresh one,
-   * whereas every bucket here carries the timestamp that says how old it is.
+   * `flows` still does not ride along, and the reason it first went without is
+   * not the reason it does now. The comment used to claim a ring "refills from
+   * the next backfill" — which cannot happen, because `lastBlock` is precisely
+   * what suppresses a backfill: `isBackfill` needs the cursor to be unset or
+   * older than `MAX_LIVE_SPAN`, and a restored cursor is neither. Measured on
+   * the deployed worker: two paid reads of the ring, 563 rows spanning 138
+   * blocks and 162 rows spanning 46, against the 3600 blocks a real cold
+   * backfill would cover. So the ring refills one live poll at a time, which
+   * makes its depth a property of how long this isolate has been alive. That is
+   * honest only if the answer says so, which is what `retained`, `oldest` and
+   * `newest` are for — and it is cheap for a free display that shows 160 rows
+   * anyway. For the paid route, where depth is the product being sold, it is an
+   * open question, not a settled one.
    */
   exportState(): FeedState {
     return {

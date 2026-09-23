@@ -1622,7 +1622,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
-        'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the retained Arc USDC flow ring in depth and filtered — ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; 503 until the SELLER_PRIVATE_KEY binding is set`,
+        'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the Arc USDC flow ring this isolate has polled so far, filtered by ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; the answer carries retained/oldest/newest so the coverage bought is visible rather than implied; 503 until the SELLER_PRIVATE_KEY binding is set`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
