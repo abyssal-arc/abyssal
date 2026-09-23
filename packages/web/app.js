@@ -2389,26 +2389,57 @@ function updateTopbar() {
       fmtCountdown(state.judgment.ticksRemaining, ticksPerHour);
 
   if (state.dayAnchor) {
-    document.getElementById('day-digest').textContent =
-      `D${state.dayAnchor.day} · ${state.dayAnchor.digest}`;
+    // A full SHA-256 does not fit the chip, so the visible text is a prefix and
+    // the whole value goes on `title` for hovering and copying. Display-only:
+    // `digestChain.payload` carries the complete field either way.
+    const el = document.getElementById('day-digest');
+    const d = state.dayAnchor.digest;
+    el.textContent = `D${state.dayAnchor.day} · ${d.slice(0, 12)}…`;
+    el.title = d;
   }
 
-  // Day Digest on-chain status indicator
+  // Day Digest on-chain status indicator.
+  //
+  // The label may not promise more than the record proves. `pending` is the only
+  // status that carries a transaction hash, so it is the only one that links to
+  // a block explorer; the statuses before it have broadcast nothing and say so
+  // in different words. This widget used to render "Committing…" for a state the
+  // send-failure path produced with no hash at all — a wallet-shaped assurance
+  // about a transaction no chain had ever been asked about — so a `pending`
+  // arriving without one is now reported as broken rather than displayed as hope.
   const digestEl = document.getElementById('digest-status');
   const dc = state.digestChain;
+  const anchorBroken = dc
+    && (dc.verifies === false
+      || ((dc.status === 'pending' || dc.status === 'confirmed') && !dc.txHash));
   if (!dc) {
     digestEl.innerHTML = '';
     digestEl.className = 'digest-status';
+  } else if (anchorBroken) {
+    // The payload disagrees with its own hash, or a status claims a transaction
+    // that is not there. Either way the anchor is worthless, and this is the
+    // only place anybody would ever find out.
+    digestEl.className = 'digest-status failed';
+    digestEl.innerHTML = '<span class="ds-dot"></span>Anchor corrupt';
   } else if (dc.status === 'confirmed') {
     digestEl.className = 'digest-status confirmed';
-    const short = dc.txHash ? dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4) : '';
+    const short = dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4);
     digestEl.innerHTML = `<span class="ds-dot"></span><a class="ds-link" href="${explorerTxUrl}${dc.txHash}" target="_blank" rel="noopener" title="View on explorer">✓ ${short}</a>`;
   } else if (dc.status === 'pending') {
     digestEl.className = 'digest-status pending';
-    digestEl.innerHTML = '<span class="ds-dot"></span>Committing…';
+    const short = dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4);
+    digestEl.innerHTML = `<span class="ds-dot"></span><a class="ds-link" href="${explorerTxUrl}${dc.txHash}" target="_blank" rel="noopener" title="Broadcast, waiting for a block">Committing… ${short}</a>`;
+  } else if (dc.status === 'queued' || dc.status === 'submitting') {
+    // Due, or attempted and not yet answered. Amber because something is being
+    // spent on it, unlinked because there is nothing on chain to link to.
+    digestEl.className = 'digest-status pending';
+    digestEl.innerHTML = '<span class="ds-dot"></span>Anchoring…';
   } else if (dc.status === 'failed') {
+    const spent = dc.attempts >= dc.maxAttempts;
     digestEl.className = 'digest-status failed';
-    digestEl.innerHTML = '<span class="ds-dot"></span>Retry…';
+    digestEl.innerHTML = `<span class="ds-dot"></span>${spent
+      ? `Anchor dropped (${dc.attempts} tries)`
+      : `Retry ${dc.attempts}/${dc.maxAttempts}`}`;
   } else {
     digestEl.className = 'digest-status unconfigured';
     digestEl.innerHTML = '<span class="ds-dot"></span>Off-chain';

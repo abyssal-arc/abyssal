@@ -17,6 +17,14 @@ import { appendFileSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
+import {
+  buildPayload, digestHash, digestStats, encodeDigest, newDigestRecord,
+  markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
+  nextDigestAction, coherenceProblem, verifyPayload, isSettled,
+  DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
+  DIGEST_RETRY_MS, DIGEST_V,
+  type DigestPayload, type DigestRecord,
+} from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
@@ -1284,6 +1292,14 @@ function memStore() {
     clock: () => state.lastAdvanceAt,
     seedFeedState: (f: FeedState) => { state = { ...state, feedState: f }; },
     feedState: () => state.feedState,
+    /**
+     * The day digest, read straight out of what the app last persisted rather
+     * than out of its closure. The pump is a floating promise on the request
+     * path, so the only honest way to watch it is through the storage it is
+     * required to write every transition to — which is also the D2 regression.
+     */
+    digest: () => state.digest,
+    seedDigest: (d: DigestRecord) => { state = { ...state, digest: d }; },
   };
 }
 
@@ -2367,4 +2383,686 @@ test('the snapshot budget announces a crossing, not a condition', async () => {
   assert.equal(budgetCrossed(B + 1, false).announce, true, 'the default budget is the imported one');
   assert.ok(B < DO_VALUE_LIMIT, 'the alarm sits inside the wall, not on it');
   assert.ok(DO_VALUE_LIMIT - B >= 512 * 1024, 'and leaves at least half a megabyte of lead time to act on');
+});
+
+/* ---------- the day digest: what is promised, and what may be claimed ---------- */
+
+/**
+ * Nothing in this section existed when the digest code was moved out of
+ * `handler.ts`, which is the reason the move was safe to make and the reason it
+ * had to be paid for afterwards: six defects sat in ~80 lines that no test had
+ * ever executed, one of which (`pending` written by the send-failure path with
+ * no transaction behind it) was telling every visitor "Committing…" about a
+ * broadcast that had never been attempted.
+ *
+ * The chain is stubbed locally. `sendTransaction` on viem 2.56 walks
+ * `eth_fillTransaction → eth_getTransactionCount → eth_getBlockByNumber →
+ * eth_maxPriorityFeePerGas → eth_estimateGas → eth_sendRawTransaction` before
+ * it gives anyone a hash, so the stub answers all of them — and records the raw
+ * transaction it was finally handed, because the payload arriving on the wire is
+ * the only end-to-end proof that what was hashed is what was broadcast.
+ */
+const DIGEST_BLOCK = {
+  number: '0x100',
+  hash: `0x${'11'.repeat(32)}`,
+  parentHash: `0x${'22'.repeat(32)}`,
+  nonce: '0x0000000000000000',
+  sha3Uncles: `0x${'33'.repeat(32)}`,
+  logsBloom: `0x${'00'.repeat(256)}`,
+  transactionsRoot: `0x${'44'.repeat(32)}`,
+  stateRoot: `0x${'55'.repeat(32)}`,
+  receiptsRoot: `0x${'66'.repeat(32)}`,
+  miner: `0x${'00'.repeat(20)}`,
+  difficulty: '0x0',
+  totalDifficulty: '0x0',
+  extraData: '0x',
+  size: '0x200',
+  gasLimit: '0x1c9c380',
+  gasUsed: '0x0',
+  timestamp: '0x65c00000',
+  // Arc's constant base fee, measured against mainnet block 22326411.
+  baseFeePerGas: '0x4a817c800',
+  uncles: [],
+};
+
+/** The hash a broadcast is answered with, unless a test overrides it. */
+const DIGEST_TX = `0x${'ee'.repeat(32)}`;
+
+type DigestRpc = {
+  url: string;
+  /** Serialized transactions, in the order the endpoint was asked to accept them. */
+  sends: string[];
+  methods: string[];
+  setReceipt: (result: unknown) => void;
+  close: () => void;
+};
+
+/**
+ * `sendError` models the failure mode the old code mistook for a commitment.
+ *
+ * The balance is answered rather than left null because this path is about an
+ * account that can pay and is still refused; an unfunded stub would describe a
+ * different tank's problem. Worth knowing when a rejection fails the suite:
+ * viem re-narrates whatever the endpoint answers — a refusal here comes out
+ * headed "the total cost exceeds the balance of the account" with the real
+ * message only in `Details` — so the assertion on `eth_sendRawTransaction`
+ * appearing in `methods` is what proves the wire was asked at all.
+ */
+async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
+  const sends: string[] = [];
+  const methods: string[] = [];
+  let receipt: unknown = null;
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    const call = JSON.parse(body || '{}') as { method?: string; params?: unknown[] };
+    methods.push(call.method ?? '');
+    let result: unknown = null;
+    switch (call.method) {
+      case 'eth_blockNumber': result = '0x100'; break;
+      case 'eth_chainId': result = '0x13b2'; break;
+      case 'eth_getBlockByNumber': result = DIGEST_BLOCK; break;
+      case 'eth_getTransactionCount': result = '0x0'; break;
+      case 'eth_maxPriorityFeePerGas': result = '0x0'; break;
+      case 'eth_estimateGas': result = '0x61a8'; break;
+      case 'eth_gasPrice': result = '0x4a817c800'; break;
+      case 'eth_getBalance': result = `0x${(10n ** 18n).toString(16)}`; break;
+      case 'eth_getTransactionReceipt': result = receipt; break;
+      case 'eth_sendRawTransaction':
+        if (sendError) {
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: sendError } }));
+          return;
+        }
+        sends.push(String(call.params?.[0]));
+        result = DIGEST_TX;
+        break;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    sends,
+    methods,
+    setReceipt: (result) => { receipt = result; },
+    close: () => server.close(),
+  };
+}
+
+/** The signing key, set for one test and removed afterwards like every other env the suite touches. */
+async function withDigestKey<T>(fn: () => Promise<T>): Promise<T> {
+  const had = process.env.ARC_DIGEST_KEY;
+  process.env.ARC_DIGEST_KEY = `0x${'ab'.repeat(32)}`;
+  try {
+    return await fn();
+  } finally {
+    if (had === undefined) delete process.env.ARC_DIGEST_KEY;
+    else process.env.ARC_DIGEST_KEY = had;
+  }
+}
+
+/**
+ * A day is 19200 ticks, which is not a number of `advance()` calls anybody
+ * wants to sit through. Replacing the config with a clone shortens the day
+ * without touching `DEFAULT_CONFIG`, which every other test in this file shares
+ * by reference — mutating it in place would quietly redefine the length of a
+ * day for the whole suite.
+ */
+function shortenDay(app: ReturnType<typeof createApp>, ticksPerDay = 4): void {
+  app.world.config = { ...app.world.config, ticksPerDay };
+}
+
+async function tickTimes(app: ReturnType<typeof createApp>, times: number): Promise<void> {
+  for (let i = 0; i < times; i++) {
+    const res = await app.fetch(post('/tick', {}));
+    assert.equal(res.status, 200, `the debug tick is enabled for the whole suite`);
+  }
+}
+
+/**
+ * Wait for the pump to reach a state. `advance()` deliberately does not await
+ * it — a stalled chain RPC must not be able to hold up a page load — so the
+ * only observable truth is what the pump has persisted, and the assertion has to
+ * read that rather than assume the floating promise already landed.
+ */
+async function untilDigest(
+  read: () => DigestRecord | undefined,
+  done: (r: DigestRecord) => boolean,
+  what: string,
+): Promise<DigestRecord> {
+  const deadline = Date.now() + 3_000;
+  for (;;) {
+    const r = read();
+    if (r && done(r)) return r;
+    if (Date.now() > deadline) throw new Error(`digest never became ${what}`);
+    await new Promise((res) => setTimeout(res, 5));
+  }
+}
+
+/**
+ * Let the floating pump land before concluding it did nothing.
+ *
+ * `advance()` deliberately does not await the pump, so an assertion that fires
+ * the instant a request returns is racing a promise that still has a hash to
+ * compute and a round trip to make. Positive assertions dodge this by waiting
+ * for a state (`untilDigest`); a negative one — "no second transaction was
+ * bought" — has to wait for the absence, which means giving the pump more than
+ * the local endpoint needs to answer. Without this, a test passes identically
+ * whether the code is correct or the guard it is checking has been deleted.
+ */
+async function pumpQuiet(): Promise<void> {
+  await new Promise((r) => setTimeout(r, 150));
+}
+
+type StateWithDigest = {
+  day: number;
+  ticksPerDay: number;
+  dayAnchor: { day: number; digest: string };
+  digestChain: {
+    day: number;
+    status: DigestRecord['status'];
+    txHash: string | null;
+    confirmedAt: number | null;
+    attempts: number;
+    maxAttempts: number;
+    payload: DigestPayload;
+    hash: string;
+    verifies: boolean;
+  } | null;
+};
+
+const readState = async (app: ReturnType<typeof createApp>): Promise<StateWithDigest> =>
+  (await (await app.fetch(new Request('http://localhost/state'))).json()) as StateWithDigest;
+
+const STATS = {
+  day: 7, tick: 12345, population: 44, totalEnergy: 8123,
+  born: 500, died: 480, predations: 311, topPredator: 'ghast:12',
+};
+
+test('the pre-image is a fixed published string, so a stranger can reproduce the hash', async () => {
+  // Both literals below came from a different SHA-256 implementation
+  // (`printf '%s' '…' | shasum -a 256`), written out by hand from
+  // `DIGEST_HASH_FIELDS`. This is the test that turns "somebody tidied the
+  // pre-image" into a red build instead of a chain of anchors that nobody can
+  // verify any more — which is the whole asset the anchor is.
+  assert.equal(
+    await digestHash(STATS),
+    'de7c09b114dae50e27882d2af92fca863e0fe4ef78366f9e595cb84cd75cb746',
+  );
+  // An empty world anchors too, and `null` renders as `~` rather than nothing.
+  assert.equal(
+    await digestHash({ ...STATS, day: 0, tick: 19200, population: 0, totalEnergy: 0, born: 0, died: 0, predations: 0, topPredator: null }),
+    'bde238eb14bb65166e582d60b37339e65269bd055cd69087462627a545a044f7',
+  );
+  // Positional, not serialization-dependent: a verifier who rebuilds the object
+  // in a different key order must still agree.
+  const shuffled = {
+    topPredator: STATS.topPredator, born: STATS.born, totalEnergy: STATS.totalEnergy,
+    predations: STATS.predations, died: STATS.died, population: STATS.population,
+    tick: STATS.tick, day: STATS.day,
+  };
+  assert.equal(await digestHash(shuffled), await digestHash(STATS));
+  assert.equal(DIGEST_V, 1, 'v:1 is the only rule that ever anchored anything');
+});
+
+test('the day\'s numbers come off the world, and a tie is settled by name', async () => {
+  const creatures = [
+    { archetype: 'ghast', kills: 3, energy: 10.4 },
+    { archetype: 'angler', kills: 3, energy: 20.6 },
+  ];
+  const w = { tick: 99, creatures, totalBorn: 12, totalDied: 7, totalPredations: 6 };
+  assert.deepEqual(digestStats(5, w), {
+    day: 5, tick: 99, population: 2, totalEnergy: 31, born: 12, died: 7, predations: 6,
+    topPredator: 'angler:3',
+  });
+  // The same population in the other order must produce the same winner. Built
+  // by iterating the array, an order-dependent tie-break would anchor a fact
+  // about who spawned first — which no holder of the payload can reproduce.
+  assert.equal(
+    digestStats(5, { ...w, creatures: [...creatures].reverse() }).topPredator,
+    'angler:3',
+    'a tie settled by array order is not a commitment',
+  );
+  assert.equal(digestStats(0, { ...w, creatures: [] }).topPredator, null);
+  assert.equal(digestStats(0, { ...w, creatures: [] }).totalEnergy, 0, 'an empty tank hashes cleanly');
+});
+
+test('every field the payload publishes is inside the commitment', async () => {
+  const p = await buildPayload(STATS, 1_700_000_000_000);
+  // D3, structurally: the payload's own key list minus the two fields that are
+  // not world facts must equal the published field list. A field added for the
+  // viewer without joining the pre-image — the exact gap that let the old code
+  // show `topPredator` uncommitted — fails here rather than in production.
+  assert.deepEqual(
+    Object.keys(p).filter((k) => k !== 'hash' && k !== 'ts'),
+    [...DIGEST_HASH_FIELDS],
+  );
+  assert.equal(await verifyPayload(p), true, 'and a payload we built verifies');
+
+  for (const field of DIGEST_HASH_FIELDS) {
+    const value = p[field];
+    const tampered = { ...p, [field]: value === null ? 'x:1' : typeof value === 'number' ? value + 1 : 'tampered' };
+    assert.equal(await verifyPayload(tampered), false, `${field} is in the hash, so changing it must break it`);
+  }
+  // Dropping a field breaks it too: `undefined` is not `~`.
+  const { predations: _dropped, ...minusOne } = p;
+  assert.equal(await verifyPayload(minusOne as DigestPayload), false);
+  // When we broadcast is not a world fact, so it is deliberately outside the
+  // hash and may change without invalidating anything.
+  assert.equal(await verifyPayload({ ...p, ts: p.ts + 60_000 }), true);
+});
+
+test('the next move is decided by the wall clock, not by how often the pump runs', () => {
+  const now = 1_800_000_000_000;
+  const base = newDigestRecord(0, { ...STATS, day: 0, v: DIGEST_V, hash: 'x', ts: now });
+  assert.equal(base.status, 'queued');
+  assert.equal(base.lastAttemptAt, 0, 'a fresh record is due immediately, so a day boundary can anchor in the same tick');
+  assert.equal(nextDigestAction(base, now), 'submit');
+
+  const sent = markSubmitted(base, now);
+  assert.equal(sent.status, 'submitting');
+  assert.equal(sent.attempts, 1, 'the attempt is counted before the network call, not after');
+  assert.equal(nextDigestAction(sent, now), 'none', 'an in-flight attempt is not retried a quarter second later');
+  assert.equal(nextDigestAction(sent, now + DIGEST_RETRY_MS), 'submit', 'a crashed isolate is recovered on the retry clock');
+
+  const acked = markPending(sent, DIGEST_TX, now);
+  assert.equal(nextDigestAction(acked, now + DIGEST_POLL_MS - 1), 'none');
+  assert.equal(nextDigestAction(acked, now + DIGEST_POLL_MS), 'poll');
+  assert.equal(isSettled(acked), false, 'a transaction in flight is not the end of the day');
+
+  const dropped = markFailed(sent, now);
+  assert.equal(nextDigestAction(dropped, now + DIGEST_RETRY_MS), 'submit');
+  const exhausted = { ...dropped, attempts: DIGEST_MAX_ATTEMPTS };
+  assert.equal(nextDigestAction(exhausted, now + DIGEST_RETRY_MS * 10), 'none', 'the budget is finite');
+  assert.equal(isSettled(exhausted), true, 'so the next day may take over the record');
+  assert.equal(isSettled(dropped), false, 'one hiccup across a day boundary does not forfeit the anchor');
+
+  assert.equal(nextDigestAction(markConfirmed(acked, now), now), 'none');
+  assert.equal(nextDigestAction(markUnconfigured(base, now), now), 'none');
+  assert.equal(isSettled(markUnconfigured(base, now)), true, 'unconfigured is terminal, so configuring a key starts within a day');
+});
+
+test('a record may not claim a transaction that was never broadcast', () => {
+  const now = 1_800_000_000_000;
+  const base = newDigestRecord(0, { ...STATS, day: 0, v: DIGEST_V, hash: 'x', ts: now });
+  // Every transition the pump can perform lands clean, which is the point of
+  // having them: the states below are reachable only by writing a status and a
+  // txHash independently, and that separation is the bug this module exists to
+  // make unrepresentable.
+  for (const r of [
+    base,
+    markSubmitted(base, now),
+    markPending(markSubmitted(base, now), DIGEST_TX, now),
+    markFailed(markSubmitted(base, now), now),
+    markConfirmed(markPending(markSubmitted(base, now), DIGEST_TX, now), now),
+    markUnconfigured(base, now),
+  ]) {
+    assert.equal(coherenceProblem(r), null, `${r.status} is a legal state`);
+  }
+
+  const liar = { ...markPending(markSubmitted(base, now), DIGEST_TX, now), txHash: null };
+  assert.match(coherenceProblem(liar) ?? '', /pending without a txHash/, 'D1 named out loud');
+  const confirmed = markConfirmed(markPending(markSubmitted(base, now), DIGEST_TX, now), now);
+  assert.match(
+    coherenceProblem({ ...confirmed, confirmedAt: null }) ?? '',
+    /confirmed without a confirmation time/,
+    'a checkmark needs a time, or the UI is promising a fact it does not have',
+  );
+  assert.match(
+    coherenceProblem({ ...confirmed, txHash: null }) ?? '',
+    /confirmed without a txHash/,
+  );
+  assert.match(coherenceProblem({ ...base, attempts: 3 }) ?? '', /fresh record/, 'an attempt count cannot predate the record');
+  // On an otherwise sound record, so the named problem is the one under test:
+  // the checks are ordered, and a `pending` with no hash reports that first.
+  assert.match(coherenceProblem({ ...confirmed, attempts: -1 }) ?? '', /negative/);
+  assert.match(coherenceProblem({ ...confirmed, txHash: '0x123' }) ?? '', /not a tx hash/);
+
+  // A revert keeps its hash, because the chain produced real evidence; a throw
+  // keeps nothing, because there is no transaction to point at.
+  assert.equal(markFailed(markSubmitted(base, now), now, DIGEST_TX).txHash, DIGEST_TX);
+  assert.equal(markFailed(markSubmitted(base, now), now).txHash, null);
+});
+
+test('the calldata is a tagged payload a reader of the chain can decode alone', () => {
+  const p = { ...STATS, v: DIGEST_V, hash: 'ab'.repeat(32), ts: 1 };
+  const data = encodeDigest(p);
+  assert.ok(data.startsWith(DIGEST_MAGIC), '"ABYS", so our records are findable on a block explorer');
+  assert.deepEqual(
+    JSON.parse(Buffer.from(data.slice(DIGEST_MAGIC.length), 'hex').toString('utf8')),
+    p,
+    'the JSON survives the hex round trip byte for byte',
+  );
+});
+
+/* ---------- the pump, driven through the handler ---------- */
+
+test('crossing into a new day anchors the day that closed', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 3);
+      assert.equal(m.digest(), undefined, 'day 0 has not closed, so nothing is promised about it');
+      assert.equal(rpc.sends.length, 0, 'and no gas has been offered for it');
+
+      await tickTimes(app, 1); // tick 4, day 1: the pump now owns day 0
+      const rec = await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
+      assert.equal(rec.day, 0, 'the day that closed, not the one that opened');
+      assert.equal(rec.attempts, 1);
+      assert.equal(rec.txHash, DIGEST_TX, 'pending is the one status that may carry a hash');
+      assert.equal(coherenceProblem(rec), null);
+      assert.equal(rec.payload.tick, 4, 'the world as of the boundary, not as of whenever the send landed');
+      assert.deepEqual(
+        rec.payload,
+        await buildPayload(digestStats(0, app.world), rec.payload.ts),
+        'the record is exactly what the shared stats+hash calls produce from this world',
+      );
+
+      const state = await readState(app);
+      assert.equal(state.digestChain?.status, 'pending');
+      assert.equal(state.digestChain?.verifies, true, 'and the API invites the reader to check it');
+      assert.equal(state.digestChain?.maxAttempts, DIGEST_MAX_ATTEMPTS);
+      assert.equal(state.digestChain?.txHash, DIGEST_TX);
+      assert.equal(state.digestChain?.hash, rec.payload.hash);
+
+      // The signed transaction carries the payload whole, so what was hashed is
+      // what the chain will hold. RLP leaves the calldata verbatim, which makes
+      // a substring check a complete test of the encode-to-wire path.
+      assert.equal(rpc.sends.length, 1);
+      assert.ok(
+        rpc.sends[0].includes(encodeDigest(rec.payload).slice(2)),
+        'the bytes on the wire are the bytes in the API',
+      );
+
+      // A day still outstanding is not replaced, and not resent either: an
+      // unresolved anchor crossing a boundary must not buy a second one.
+      await tickTimes(app, 4);
+      await pumpQuiet();
+      assert.equal(rpc.sends.length, 1, 'no duplicate commitment while the first is unconfirmed');
+      assert.equal(m.digest()?.day, 0, 'the unsettled day keeps its record rather than being dropped for a newer one');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a broadcast the endpoint refuses is recorded as a failure, not as a commitment', async () => {
+  // The exact shape of the first real deployment: Arc takes fees in USDC, so an
+  // account that was funded with nothing throws on the very first send.
+  const rpc = await digestRpcStub('insufficient funds for gas * price + value');
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      const rec = await untilDigest(m.digest, (r) => r.status === 'failed', 'failed');
+      assert.equal(rec.txHash, null, 'there is no transaction to point at');
+      assert.equal(rec.attempts, 1);
+      assert.equal(coherenceProblem(rec), null, 'a failure is a legal state, unlike the one it replaces');
+      assert.equal(rpc.sends.length, 0, 'and it was never accepted');
+      assert.ok(
+        rpc.methods.includes('eth_sendRawTransaction'),
+        'the endpoint was actually asked and actually refused, not a client-side complaint about '
+        + 'a balance the stub never gave it',
+      );
+      assert.equal(
+        nextDigestAction(rec, Date.now() + DIGEST_RETRY_MS),
+        'submit',
+        'and it is the state a retry follows, which the old one was not',
+      );
+
+      const state = await readState(app);
+      assert.notEqual(state.digestChain?.status, 'pending', 'the UI can never render "Committing…" over this');
+      assert.equal(state.digestChain?.txHash, null);
+      assert.equal(state.digestChain?.attempts, 1);
+      assert.equal(state.digestChain?.verifies, true, 'the payload was sound; the broadcast is what failed');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a retry re-sends the numbers it committed, not a fresh reading of the tank', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      // Deliberately a payload from a different world than the one the app is
+      // about to run: only a mismatch between "recorded then" and "reading now"
+      // can distinguish resending a commitment from re-sampling it. The old code
+      // did the latter, so a retried anchor carried a hash from one moment and
+      // numbers from a later one — still verifiable against itself, and lying
+      // about the day it claimed to describe.
+      const committed = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      m.seedDigest(markFailed(markSubmitted(newDigestRecord(0, committed), 1), 0));
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      const rec = await untilDigest(m.digest, (r) => r.status === 'pending', 'resent');
+      assert.deepEqual(rec.payload, committed, 'the record still describes the world it was taken from');
+      assert.equal(rec.attempts, 2, 'the retry consumed its own attempt');
+      assert.equal(rpc.sends.length, 1);
+      assert.ok(
+        rpc.sends[0].includes(encodeDigest(committed).slice(2)),
+        'and the bytes the chain was handed are the bytes that were hashed, not the live tank',
+      );
+      assert.notEqual(
+        rec.payload.population,
+        app.world.creatures.length,
+        'sanity: the two really do differ, or none of the above proves anything',
+      );
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a cold isolate inherits the outstanding anchor instead of buying a second one', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const first = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(first);
+      await tickTimes(first, 4);
+      const sent = await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
+      assert.equal(rpc.sends.length, 1);
+
+      // A fresh isolate, same storage: this is every eviction and every cold
+      // boot. The record has to come back out of the ledger, because a digest
+      // that starts from nothing re-submits the day it already paid for.
+      const second = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(second);
+      const inherited = await readState(second);
+      assert.equal(inherited.digestChain?.payload.hash, sent.payload.hash, 'hydrated, before any day boundary');
+      assert.equal(inherited.digestChain?.status, 'pending');
+
+      await tickTimes(second, 4);
+      await pumpQuiet();
+      assert.equal(rpc.sends.length, 1, 'and the second isolate never asks the chain to take the same money twice');
+      assert.equal(m.digest()?.attempts, 1, 'the attempt count survived, so the retry budget did not reset');
+      assert.deepEqual(m.digest()?.payload, sent.payload, 'the payload is the one that was broadcast, not a re-read');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a stored record that claims more than happened is dropped, not trusted', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    // Written under some other set of rules, or by a bug since fixed: the
+    // storage outlives the code, and this is the one place anybody finds out.
+    m.seedDigest({
+      ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)),
+      status: 'pending',
+      txHash: null,
+      attempts: 1,
+      lastAttemptAt: 1,
+    });
+    const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+    const state = await readState(app);
+    assert.equal(state.digestChain, null, 'a lie is not a status worth publishing');
+    await tickTimes(app, 1);
+    assert.equal(rpc.sends.length, 0, 'and it is not one worth acting on');
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a payload that does not verify is never broadcast, and never wedges the pipeline', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      // One attempt short of the budget, with a hash that cannot survive
+      // verification — the state a corrupted payload or a changed rule produces.
+      const broken = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      m.seedDigest({
+        ...newDigestRecord(0, broken),
+        status: 'failed',
+        attempts: DIGEST_MAX_ATTEMPTS - 1,
+        lastAttemptAt: 0,
+        payload: { ...broken, hash: 'ff'.repeat(32) },
+      });
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+
+      // The gate is before the network: refusing to anchor a claim we cannot
+      // stand behind costs a hash and buys the guarantee that anything on the
+      // chain is internally consistent, which is the only thing an anchor is.
+      const spent = await untilDigest(m.digest, (r) => r.attempts >= DIGEST_MAX_ATTEMPTS, 'a spent budget');
+      assert.equal(rpc.sends.length, 0, 'nothing was broadcast');
+      assert.equal(spent.status, 'failed');
+      assert.equal(isSettled(spent), true, 'an attempt that cannot succeed is counted, so the budget still closes');
+
+      // And closing is the point: an attempt that was never counted would leave
+      // this record unsettled forever, holding every later day behind it.
+      await tickTimes(app, 4);
+      // Waiting for the outcome, not merely for the day: `submitting` is written
+      // to storage before the network call, so a record for day 1 is visible
+      // while the broadcast is still in flight. A test that stopped at the day
+      // would end with a live promise against an endpoint it is about to close.
+      const next = await untilDigest(m.digest, (r) => r.day === 1 && r.status === 'pending', 'the next day anchored');
+      assert.equal(rpc.sends.length, 1);
+      assert.equal(next.attempts, 1, 'a fresh budget, because the broken day spent its own');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the receipt settles an anchor, and a settled day lets the next one through', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, 1));
+      m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
+      rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+
+      const done = await untilDigest(m.digest, (r) => r.status === 'confirmed', 'confirmed');
+      assert.equal(done.txHash, DIGEST_TX, 'the hash that was confirmed stays on the record');
+      assert.ok((done.confirmedAt ?? 0) > 1, 'with a time, so the UI can show a checkmark and nothing more');
+      assert.equal(rpc.methods.filter((x) => x === 'eth_sendRawTransaction').length, 0, 'a poll is not a resend');
+      assert.equal(coherenceProblem(done), null);
+
+      const state = await readState(app);
+      assert.equal(state.digestChain?.status, 'confirmed');
+      assert.equal(state.digestChain?.confirmedAt, done.confirmedAt);
+
+      // Day 2 opens, and the record is free to move on because day 0 is finished.
+      await tickTimes(app, 4);
+      const next = await untilDigest(m.digest, (r) => r.day === 1 && r.status === 'pending', 'day 1 anchored');
+      assert.equal(next.attempts, 1, 'a fresh budget for a fresh day');
+      assert.equal(rpc.sends.length, 1);
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a transaction that mined and reverted keeps its hash and loses its status', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, 1));
+      m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
+      rpc.setReceipt({ status: '0x0', blockNumber: '0x101', transactionHash: DIGEST_TX });
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+
+      const reverted = await untilDigest(m.digest, (r) => r.status === 'failed', 'a failed revert');
+      assert.equal(reverted.txHash, DIGEST_TX, 'the chain produced real evidence, so the record keeps it');
+      assert.equal(coherenceProblem(reverted), null);
+      assert.equal((await readState(app)).digestChain?.txHash, DIGEST_TX);
+
+      // No receipt at all means still in flight, which is precisely what
+      // `pending` claims — the honest reading, and the one the old code reached
+      // by accident from a path that had never broadcast anything.
+      const still = markPending(markSubmitted(queued, 1), DIGEST_TX, 0);
+      rpc.setReceipt(null);
+      m.seedDigest(still);
+      const another = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(another);
+      await tickTimes(another, 4);
+      await pumpQuiet();
+      // Both halves of the record are checked, because they are two different
+      // chances to be wrong: an unanswered poll may rewrite what was persisted,
+      // or rewrite only this isolate's copy of it and leave `/state` reporting
+      // something the ledger never agreed to.
+      assert.equal(m.digest()?.status, 'pending', 'an unanswered poll says nothing about the transaction');
+      assert.equal(m.digest()?.txHash, DIGEST_TX);
+      assert.equal((await readState(another)).digestChain?.status, 'pending', 'including what the API tells a viewer');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('with no signing key a day closes off-chain and says so', async () => {
+  assert.equal(process.env.ARC_DIGEST_KEY, undefined, 'no test may leak a key into this one');
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
+    shortenDay(app);
+    await tickTimes(app, 4);
+    const rec = await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+    assert.equal(rec.txHash, null);
+    assert.equal(rpc.sends.length, 0, 'not one request was made');
+    const state = await readState(app);
+    assert.equal(state.digestChain?.status, 'unconfigured', 'the same word the UI renders as "Off-chain"');
+    assert.equal(isSettled(rec), true, 'so configuring a key starts anchoring within a day, without a restart');
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the preview a viewer watches all day is the computation the anchor uses', async () => {
+  const m = memStore();
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  await tickTimes(app, 2);
+  const state = await readState(app);
+  // The label under the chip promises that this number commits on chain at the
+  // end of the day. It used to be an 8-digit FNV over a different field list
+  // than the one that got broadcast, so the promise was false for the entire
+  // life of the feature; both sides now call the same two functions, which is
+  // the only arrangement that cannot drift back apart.
+  assert.equal(state.dayAnchor.day, Math.floor(app.world.tick / state.ticksPerDay));
+  assert.equal(state.dayAnchor.digest, await digestHash(digestStats(state.dayAnchor.day, app.world)));
+  assert.match(state.dayAnchor.digest, /^[0-9a-f]{64}$/, 'a SHA-256, not eight hex digits');
 });

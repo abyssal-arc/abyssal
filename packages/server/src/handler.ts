@@ -29,6 +29,12 @@ import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
+  buildPayload, coherenceProblem, digestHash, digestStats, encodeDigest, isSettled,
+  markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
+  newDigestRecord, nextDigestAction, verifyPayload, DIGEST_MAX_ATTEMPTS,
+  type DigestRecord,
+} from './digest.js';
+import {
   ABYS_PRICES,
   ABYS_PRICE_LEGENDARY_NAME,
   burnOffer,
@@ -42,7 +48,7 @@ import {
   verifyBurnReceipt,
   type InterventionType,
 } from './payments.js';
-import { createWalletClient, http, toHex } from 'viem';
+import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 /**
@@ -179,6 +185,15 @@ export interface LedgerSnapshot {
    * through the ring to push out the live ones a viewer asked for.
    */
   feedState?: FeedState;
+  /**
+   * The day digest and what has been done about it. Durable for the same reason
+   * the wall clock is: it used to be a closure variable, so every cold isolate
+   * reset to "never committed anything" and promptly re-broadcast the previous
+   * day — a second transaction, and a second gas payment, for a day already
+   * pinned. The record also carries the payload itself, so a retry resends what
+   * was first hashed rather than re-reading a world that has moved on.
+   */
+  digest?: DigestRecord;
 }
 
 /**
@@ -196,6 +211,8 @@ export interface LedgerLoad {
   lastAdvanceAt?: number;
   /** Absent in ledgers written before the feed was resumable. */
   feedState?: FeedState;
+  /** Absent in ledgers written before the digest was made durable. */
+  digest?: DigestRecord;
 }
 
 export interface WorldStore {
@@ -482,22 +499,22 @@ export function createApp(options: AppOptions = {}) {
     pruneFlares();
     updateFossils();
 
-    // Day Digest on-chain commit: detect day boundary and submit.
+    // Day Digest on-chain commit: the record for the day that just closed is
+    // created and driven by `pumpDigest()`. Every time-shaped decision in it —
+    // when to resend, when to look for a receipt — is taken against the wall
+    // clock by `nextDigestAction`, never by how often this function happens to
+    // run, because on a Worker that is up to four times a second and on a quiet
+    // tank once a minute.
     const day = Math.floor(world.tick / world.config.ticksPerDay);
-    if (day > 0 && day !== lastCommittedDay) {
-      // A new day started — commit the *previous* day's digest.
-      const prevDay = day - 1;
-      if (prevDay !== lastCommittedDay) {
-        lastCommittedDay = prevDay;
-        const prevHash = fnv1a(
-          [prevDay, world.tick, world.creatures.length, Math.round(world.creatures.reduce((s, c) => s + c.energy, 0)), world.totalBorn, world.totalDied, world.totalPredations].join('|'),
-        );
-        void commitDayDigest(prevDay, prevHash);
-      }
+    if (day > 0) {
+      void pumpDigest(day - 1).catch((err: unknown) => {
+        // `advance()` is on the viewer's request path, so the pump cannot be
+        // awaited without letting a stalled chain RPC hold up a page load. Not
+        // awaiting is fine; not answering for it is not — the record itself
+        // records the attempt, this line is only for what escapes it.
+        console.error('day digest pump failed: the anchor may be stuck on the previous day', err);
+      });
     }
-    // Check pending digest confirmation or retry failed commits.
-    void checkDigestConfirmation();
-    void retryDigestCommit();
 
     lastAdvanceAt = Date.now();
   }
@@ -556,19 +573,17 @@ export function createApp(options: AppOptions = {}) {
     };
   }
 
-  // Pure-TS FNV-1a (no node:crypto) so the digest also runs on CF Workers.
-  function fnv1a(str: string): string {
-    let h = 0x811c9dc5;
-    for (let i = 0; i < str.length; i++) {
-      h ^= str.charCodeAt(i);
-      h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h.toString(16).padStart(8, '0');
-  }
+  // Pure-TS FNV-1a used to hash the day digest here. Replaced by SHA-256 in
+  // `digest.ts`: a 32-bit digest collides at about 2^16 tries, which is not a
+  // commitment. Nothing was ever anchored under the old rule, so no published
+  // value was invalidated by the change.
 
   let richestIds = new Set<number>();
 
-  function statePayload() {
+  // Async because the day anchor is now a real SHA-256 commitment computed on
+  // the same path the chain record uses — see `pumpDigest`. Both call sites
+  // already live inside `fetch()`.
+  async function statePayload() {
     const cfg = world.config;
     const day = Math.floor(world.tick / cfg.ticksPerDay);
     const top = (
@@ -601,17 +616,11 @@ export function createApp(options: AppOptions = {}) {
       ticksPerDay: cfg.ticksPerDay,
       dayAnchor: {
         day,
-        digest: fnv1a(
-          [
-            day,
-            world.tick,
-            world.creatures.length,
-            Math.round(world.creatures.reduce((s, c) => s + c.energy, 0)),
-            world.totalBorn,
-            world.totalDied,
-            world.totalPredations,
-          ].join('|'),
-        ),
+        // The same two calls the on-chain record makes, so a viewer watching
+        // this number all day is watching the value that gets committed when
+        // the day closes. It used to be a separate FNV over a different field
+        // list, under a label promising otherwise.
+        digest: await digestHash(digestStats(day, world)),
       },
       population: world.creatures.length,
       totalEnergy: round1(world.creatures.reduce((s, c) => s + c.energy, 0)),
@@ -644,12 +653,20 @@ export function createApp(options: AppOptions = {}) {
         paid: e.paid,
       })),
       totals: { born: world.totalBorn, died: world.totalDied, predations: world.totalPredations },
-      digestChain: digestChain ? {
-        day: digestChain.day,
-        hash: digestChain.hash,
-        status: digestChain.status,
-        txHash: digestChain.txHash,
-        confirmedAt: digestChain.confirmedAt,
+      // Reported as it stands rather than as a curated subset: the payload that
+      // was hashed, the hash it produced, whether they still agree, and how
+      // many attempts were spent. `status` is only worth anything to a reader
+      // who can check it against the rest.
+      digestChain: digest ? {
+        day: digest.day,
+        status: digest.status,
+        txHash: digest.txHash,
+        confirmedAt: digest.confirmedAt,
+        attempts: digest.attempts,
+        maxAttempts: DIGEST_MAX_ATTEMPTS,
+        payload: digest.payload,
+        hash: digest.payload.hash,
+        verifies: await verifyPayload(digest.payload),
       } : null,
       network: NETWORK,
       chainId: CHAIN_ID,
@@ -717,27 +734,21 @@ export function createApp(options: AppOptions = {}) {
 
   /* ---------- Day Digest on-chain commit ---------- */
 
-  interface DigestChainState {
-    day: number;
-    hash: string;
-    status: 'unconfigured' | 'pending' | 'confirmed' | 'failed';
-    txHash: string | null;
-    confirmedAt: number | null;
-    retries: number;
-    /** Stats snapshot at commit time. */
-    stats: {
-      born: number;
-      died: number;
-      predations: number;
-      population: number;
-      topPredator: string | null;
-      totalEnergy: number;
-    } | null;
-  }
-
-  let digestChain: DigestChainState | null = null;
-  let lastCommittedDay = -1;
-  let digestCommitInFlight = false;
+  /**
+   * The one digest record. Replaced when the day it describes has settled and a
+   * newer day needs anchoring, so at most one day is ever in flight.
+   */
+  let digest: DigestRecord | null = null;
+  /**
+   * Guards against two pumps running at once inside this isolate.
+   *
+   * Deliberately a boolean rather than the record's status, which is the other
+   * concurrency mechanism in play: the status says what *has happened*, and
+   * writing 'submitting' before an await would claim an attempt this isolate
+   * might not survive to make. Two questions, two answers — and the status is
+   * durable while this flag is not, which is the point of keeping them apart.
+   */
+  let digestPumpInFlight = false;
 
   function digestKey(): `0x${string}` | null {
     const pk = process.env.ARC_DIGEST_KEY;
@@ -745,76 +756,158 @@ export function createApp(options: AppOptions = {}) {
     return pk as `0x${string}`;
   }
 
-  function buildDigestPayload(day: number): DigestChainState['stats'] {
-    const killsBy: Record<string, number> = {};
-    for (const c of world.creatures) killsBy[c.archetype] = (killsBy[c.archetype] ?? 0) + c.kills;
-    const winner = Object.entries(killsBy).sort((a, b) => b[1] - a[1])[0];
-    return {
-      born: world.totalBorn,
-      died: world.totalDied,
-      predations: world.totalPredations,
-      population: world.creatures.length,
-      topPredator: winner ? `${winner[0]}:${winner[1]}` : null,
-      totalEnergy: Math.round(world.creatures.reduce((s, c) => s + c.energy, 0)),
-    };
+  /**
+   * Move the digest one step forward, if a step is due.
+   *
+   * Called from `advance()`, which on a Worker runs on every request and every
+   * cron poke that finds elapsed ticks — anywhere between four times a second
+   * and once a minute depending on traffic. So the part that matters for
+   * correctness is that nothing here consults the call rate: `nextDigestAction`
+   * decides against the wall clock, and this function only carries out the one
+   * action it is handed.
+   */
+  async function pumpDigest(prevDay: number): Promise<void> {
+    if (digestPumpInFlight) return;
+    digestPumpInFlight = true;
+    try {
+      let rec = digest;
+      if (!rec || (rec.day !== prevDay && isSettled(rec))) {
+        // A day has closed and the previous record is finished with, so take the
+        // snapshot now. `digestStats` is the same call the `/state` preview
+        // makes, which is what keeps the number viewers watched all day equal to
+        // the number that gets committed rather than merely similar to it — they
+        // used to be two expressions over two field lists, and never matched.
+        //
+        // An unsettled record is deliberately *not* replaced. Dropping a day
+        // that still has retries left would lose its anchor silently the first
+        // time an RPC hiccuped across a day boundary.
+        rec = newDigestRecord(prevDay, await buildPayload(digestStats(prevDay, world), Date.now()));
+        digest = rec;
+        saveStore();
+      }
+      const action = nextDigestAction(rec, Date.now());
+      if (action === 'submit') await submitDigest();
+      else if (action === 'poll') await pollDigest();
+    } finally {
+      digestPumpInFlight = false;
+    }
   }
 
-  async function commitDayDigest(day: number, hash: string): Promise<void> {
-    if (digestCommitInFlight) return;
+  /** Broadcast the outstanding record. Only reached when the clock says it is due. */
+  async function submitDigest(): Promise<void> {
+    const r = digest;
+    if (!r) return;
     const pk = digestKey();
     const rpc = options.rpc ?? process.env.ARC_RPC_URL;
     if (!pk || !rpc) {
-      digestChain = { day, hash, status: 'unconfigured', txHash: null, confirmedAt: null, retries: 0, stats: buildDigestPayload(day) };
+      // Terminal for this record, and `isSettled` says so, so the next day
+      // closes over it. Configuring a key therefore starts anchoring within one
+      // day rather than needing a restart to notice.
+      digest = markUnconfigured(r, Date.now());
+      saveStore();
       return;
     }
-    digestCommitInFlight = true;
+    // Refuse to spend gas on a payload our own verifier rejects. Costs one hash,
+    // buys the guarantee that anything reaching the chain is internally
+    // consistent — the alternative is finding out years later, in public, about
+    // a transaction nobody can undo.
+    if (!await verifyPayload(r.payload)) {
+      console.error(`day digest payload does not verify: refusing to broadcast day ${r.day}`);
+      // Counted as an attempt before it fails. A payload that cannot verify will
+      // never verify, so an uncounted refusal here is a record that stays
+      // unsettled forever — and since an unsettled record is deliberately not
+      // replaced, it would hold every later day behind it and silently end
+      // anchoring for the tank. The budget is what makes a permanent failure
+      // permanent in one day rather than forever.
+      digest = markFailed(markSubmitted(r, Date.now()), Date.now());
+      saveStore();
+      return;
+    }
+    // Marked before the await, so an isolate that dies mid-send leaves a record
+    // saying an attempt happened. `nextDigestAction` recovers that on the same
+    // clock as an ordinary failure, which is the honest reading: from here, a
+    // crash and a throw both look like an attempt with no transaction behind it.
+    const submitted = markSubmitted(r, Date.now());
+    digest = submitted;
+    saveStore();
     try {
       const account = privateKeyToAccount(pk);
       const client = createWalletClient({ account, transport: http(rpc) });
-      // Encode digest as calldata: magic "ABYS" + day(u32) + hash + JSON stats
-      const stats = buildDigestPayload(day);
-      const payload = JSON.stringify({ day, hash, ts: Date.now(), ...stats });
-      const data = ('0x41425953' + toHex(payload).slice(2)) as `0x${string}`;
       const txHash = await client.sendTransaction({
         to: account.address,
         value: 0n,
-        data,
-        chain: { id: CHAIN_ID, name: 'Arc', nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 6 }, rpcUrls: { default: { http: [rpc] } } } as any,
+        data: encodeDigest(r.payload),
+        // Arc's fee unit is 18-decimal, not the 6 the token contract uses.
+        // Measured against mainnet: for one address `eth_getBalance` and USDC
+        // `balanceOf` differ by exactly 1e12 while naming the same 6,167,837.56
+        // USDC, and a 21,000-gas transfer costs 4.22e14 fee units — $0.0004 read
+        // at 18 decimals, $422 million read at 6. `decimals` only sizes display
+        // today, so this is not a live bug; it is a wrong fact about the chain we
+        // deploy to, and the sort that becomes a bug the first time a balance is
+        // printed for a human to read.
+        chain: {
+          id: CHAIN_ID,
+          name: 'Arc',
+          nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
+          rpcUrls: { default: { http: [rpc] } },
+        } as any,
       });
-      digestChain = { day, hash, status: 'pending', txHash, confirmedAt: null, retries: 0, stats };
-    } catch {
-      const retries = (digestChain?.day === day ? digestChain.retries : 0) + 1;
-      digestChain = { day, hash, status: retries >= 3 ? 'failed' : 'pending', txHash: null, confirmedAt: null, retries, stats: buildDigestPayload(day) };
-      if (retries >= 3) digestChain.status = 'failed';
-    } finally {
-      digestCommitInFlight = false;
+      digest = markPending(submitted, txHash, Date.now());
+    } catch (err) {
+      // The status written here is the reason this function exists. A throwing
+      // send used to produce `pending` with no txHash — a public "Committing…"
+      // over a transaction that was never broadcast — while the retry that could
+      // have rescued it fired only on `failed`, a status this path could never
+      // reach. Both halves of that are impossible now: `markFailed` is the only
+      // outcome, and it is the state `nextDigestAction` resends from.
+      console.error(
+        `day digest not broadcast: day ${r.day} attempt ${submitted.attempts}/${DIGEST_MAX_ATTEMPTS} `
+        + `(${String((err as Error)?.message ?? err)})`,
+      );
+      digest = markFailed(submitted, Date.now());
     }
+    saveStore();
   }
 
-  async function checkDigestConfirmation(): Promise<void> {
-    if (!digestChain || digestChain.status !== 'pending' || !digestChain.txHash) return;
+  /** Ask the chain whether the outstanding transaction has mined. */
+  async function pollDigest(): Promise<void> {
+    const r = digest;
+    // No hash means nothing to ask, which is the state the old code reached by
+    // mistake and reported as pending. Here it is unreachable from a failed
+    // send, so this is a guard rather than a workaround.
+    if (!r?.txHash) return;
     const rpc = options.rpc ?? process.env.ARC_RPC_URL;
     if (!rpc) return;
+    // Take the poll slot first. Otherwise a fetch that fails leaves
+    // `lastAttemptAt` where it was and the next tick — a quarter second later —
+    // asks again, turning a dead endpoint into a request per tick.
+    const current = { ...r, lastAttemptAt: Date.now() };
+    digest = current;
+    saveStore();
     try {
       const res = await globalThis.fetch(rpc, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [digestChain.txHash] }),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [r.txHash] }),
       });
-      const json = (await res.json()) as { result?: { status?: string } | null };
-      if (json.result && json.result.status === '0x1') {
-        digestChain.status = 'confirmed';
-        digestChain.confirmedAt = Date.now();
-      } else if (json.result && json.result.status === '0x0') {
-        digestChain.status = 'failed';
+      const j = (await res.json()) as { result?: { status?: string } | null };
+      if (j.result?.status === '0x1') {
+        digest = markConfirmed(current, Date.now());
+        saveStore();
+      } else if (j.result?.status === '0x0') {
+        // Broadcast and reverted: the hash stays, because it is evidence of a
+        // real attempt, and the retry budget decides whether to follow it up.
+        console.error(`day digest transaction reverted on chain: day ${r.day} tx ${r.txHash}`);
+        digest = markFailed(current, Date.now(), r.txHash);
+        saveStore();
       }
-    } catch { /* will retry next tick */ }
-  }
-
-  /** Retry a failed digest commit (up to 3 total attempts). */
-  async function retryDigestCommit(): Promise<void> {
-    if (!digestChain || digestChain.status !== 'failed' || digestChain.retries >= 3) return;
-    await commitDayDigest(digestChain.day, digestChain.hash);
+      // No receipt yet means still in flight, which is precisely what `pending`
+      // claims, and the poll clock asks again on schedule.
+    } catch {
+      // Stay `pending`. An unanswered poll says nothing about the transaction,
+      // and rewriting the record to claim otherwise is the error this whole
+      // function replaces.
+    }
   }
 
   function scoreReports() {
@@ -1300,7 +1393,7 @@ export function createApp(options: AppOptions = {}) {
       return json(apiIndex());
     }
 
-    if (req.method === 'GET' && path === '/state') return json(statePayload(), 200, 3);
+    if (req.method === 'GET' && path === '/state') return json(await statePayload(), 200, 3);
     if (req.method === 'GET' && path === '/world') return json(worldPayload(), 200, 3);
 
     if (req.method === 'GET' && path === '/history') {
@@ -1363,7 +1456,7 @@ export function createApp(options: AppOptions = {}) {
       if (tail > 0 && events.length > tail) events = events.slice(-tail);
       return json({
         world: worldPayload(),
-        state: statePayload(),
+        state: await statePayload(),
         events,
         txRain: rainAfter(url.searchParams.get('tx')),
       }, 200, 3);
@@ -1870,6 +1963,16 @@ export function createApp(options: AppOptions = {}) {
       // stored block is back in place is a poll that backfills from -1 — the
       // exact work the persisted state exists to skip.
       if (s.feedState) chainFeed.importState?.(s.feedState);
+      // Checked on the way in rather than trusted. This storage outlives code
+      // changes, and a record written under different rules is the kind of row
+      // that reappears months later as a status nothing can produce. Dropping
+      // one costs a day's anchor; believing a bad one costs the meaning of
+      // every status in `/state`.
+      if (s.digest) {
+        const problem = coherenceProblem(s.digest);
+        if (problem) console.error(`stored digest record rejected: ${problem} (day ${s.digest.day})`);
+        else digest = s.digest;
+      }
     })();
     return hydrated;
   }
@@ -1882,6 +1985,7 @@ export function createApp(options: AppOptions = {}) {
       fossils,
       lastAdvanceAt,
       feedState: chainFeed.exportState?.(),
+      digest: digest ?? undefined,
     });
   }
 
