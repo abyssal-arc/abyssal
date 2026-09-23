@@ -1844,7 +1844,13 @@ function computePulseBars(pts) {
     const slice = pts.slice(i, i + group);
     bars.push({
       t: slice[0].t,
-      span: slice.length * 15,
+      // From the timestamps rather than from `slice.length * 15`. A bucket is
+      // appended once per poll and keyed to a 15s boundary, so a feed that only
+      // its cron is polling leaves 60s between neighbours while the slots keep
+      // saying 15. Counting them would label a minute of chain as a quarter of
+      // one, and the right-hand axis label — `t + span` — would finish a minute
+      // short of the last transfer it claims to cover.
+      span: (slice[slice.length - 1].t - slice[0].t) / 1000 + 15,
       volume: slice.reduce((s, p) => s + p.volume, 0),
       count: slice.reduce((s, p) => s + p.count, 0),
       x402: slice.reduce((s, p) => s + p.x402, 0),
@@ -1944,9 +1950,26 @@ function drawPulse() {
   const plotH = h - top - 15;
   const base = top + plotH;
   const bw = w / bars.length;
-  // Centered columns with a consistent breathing gap: never a solid wall,
-  // never hairlines, whatever the bucket count or canvas width.
-  const barW = Math.max(2, Math.min(bw * 0.62, 12));
+  // Columns keep a 62% fill — a breathing gap, never a solid wall — at every
+  // bucket count, and the ceiling is there for one job only: stopping a
+  // degenerate handful of buckets from becoming slabs. It has to sit below the
+  // count where 62% still applies, or it eats the very case it was added for.
+  //
+  // A flat 12px could not express that, because a slab is a proportion of the
+  // canvas and 12px is not. It binds whenever a column gets more than
+  // 12 / 0.62, about 19px of slot, so the same series drew at 62% on a narrow
+  // canvas and as hairlines on a wide one — and widening the window grew the
+  // gaps while the bars stayed put, which is what "the columns are too far
+  // apart" looks like from the viewer's side. The canvas is sized from its own
+  // bounding rect and the card holds two fifths of the observe row, so which of
+  // those two regimes a given series lands in depends on the viewport as much as
+  // on the data; the live range was serving about forty columns at the time.
+  // One twelfth of the width binds below eight columns at *any* canvas size
+  // (`n < 0.62 * 12`, so the crossover is 7.44), where there are fewer bars than
+  // there are digits in an axis label and nothing drawn would look like a chart
+  // regardless; from eight columns up the rhythm is the intended 62%, whatever
+  // the viewport.
+  const barW = Math.max(2, Math.min(bw * 0.62, Math.max(12, w / 12)));
 
   // Faint dotted grid at quarter steps, brighter axis line at the floor.
   pctx.save();

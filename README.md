@@ -373,8 +373,8 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   denominator had been backfilled, and the backfill kept winning because it kept
   happening. `lastBlock` and the two rank meters' windows now ride in the
   persisted ledger: small, and the only parts an eviction cannot re-derive.
-  `flows` and `pulse` stay in memory, because both refill within a few polls and
-  a restored copy of either would be indistinguishable from a fresh one.
+  `flows` stays in memory, because a flow ring really does refill from the next
+  backfill and a stale copy of it would be indistinguishable from a live one.
   `warmFeed()` hydrates *before* it settles, and that ordering is load-bearing
   rather than tidy — `settle()` starts a poll on a cold feed, and a poll that
   runs first backfills no matter how faithfully the block was saved. A restored
@@ -383,6 +383,48 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   it reads with `now`, and resuming across an hour that way would fold an hour of
   transfers into a single 15s bucket — a spike that never happened, sitting in
   the history for a day.
+- **And the chart was left out of that ledger on a reasoning that did not hold.**
+  `pulse` stayed in memory beside `flows` on the argument that both refill within
+  a few polls. A flow ring does. A pulse bucket is one per fifteen seconds of
+  *wall clock*, so the series refills at exactly the rate it records — filling a
+  day takes a day, and an object collected every minute or two never got one.
+  Measured against production, the 1h range came back with exactly one nonzero
+  column out of 60 and the 24h range with one out of 96 — and, measured again
+  after the object had been evicted once more, with none at all. Not a sparse
+  chart but an empty one with a single bar in it, which is also what "the columns
+  are too far apart" looks like from the viewer's side. The buckets ride in the
+  ledger now, as tuples rather than objects — the ledger is rewritten whole about
+  once a minute, and at 1440 buckets the field names would cost more than the
+  numbers. They are validated on the way back in, so a truncated value costs a
+  short chart rather than an invented one, and a backfill's rebuilt buckets are
+  merged into the series with the ones already in hand winning every collision:
+  a backfill re-reads blocks the feed has counted before and resolves no venues,
+  so replacing the series with it would double-count the volume and trade real
+  readings for unread ones.
+- **And the snapshot had outgrown the box it is stored in.** Chasing the chart
+  through production logs turned up an error nobody had seen, because it never
+  reached a viewer as one: `Error: string or blob too big: SQLITE_TOOBIG`, thrown
+  from the world save, eleven times in a three-minute tail — three pairs of them
+  one second apart on the minute, which is the cron failing every single time it
+  ran. A Durable Object stores a value up to 2 MB, so the thrown error is itself
+  the measurement: the serialized world had grown past it. What grows is one map
+  — `eaters`, keyed by transaction hash and appended to every time a creature ate
+  food that fell from a transfer, with no bound at all. A local world running the
+  same code against the same chain carried 156,158 of those keys: 11.98 MiB of a
+  13.63 MiB snapshot, 88% of one world spent on a map whose only reader renders
+  the twelve newest meteors and asks for exactly those hashes. Every key past the
+  last few was unreachable and still had to be stored, serialized, and parsed on
+  each boot. The save is awaited on the request path, which is what turned a
+  storage problem into a visible one: `/observe` returned HTTP 500 for 7 of 24
+  requests in one window and 1 of 12 in another. And once the world passed the
+  limit nothing was ever written again, so from then on an eviction could only be
+  survived as whatever the last successful save happened to hold, however long
+  ago that was. Every unbounded collection is now capped against what
+  its reader actually asks for — 64 eater hashes, 500 cull records, and a tick log
+  whose trim leaves more history than the deepest `/history` window will serve —
+  an oversized snapshot shrinks on load rather than on the next tick, the worst
+  case a world can reach is asserted to fit, and a failed save is logged with its
+  byte count instead of taking the response down with it.
 - **And the signal itself was measuring the wrong thing.** With the feed durable
   and resolving, production reported a machine-payment share of 85%. That number
   was wrong by roughly ninetyfold, and it was wrong in the direction that flatters.

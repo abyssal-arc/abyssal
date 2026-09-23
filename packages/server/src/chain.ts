@@ -39,12 +39,27 @@ export interface MeterState {
 }
 
 /**
- * What a feed needs to survive an eviction. Deliberately tiny — the block it
- * reached and the numbers its temperatures are computed from — because the
- * things left out are the things that are cheap to observe again: the flow
- * history and the pulse buckets both refill within a few polls, whereas a lost
- * `lastBlock` costs a 3600-block backfill and a lost window costs ~90 polls of
- * readings that cannot rank themselves.
+ * One persisted 15s pulse bucket, as a tuple rather than an object: `[t, count,
+ * volume, x402, resolved]`, with `t` in *seconds*. The ledger is rewritten whole
+ * on every save and the series runs into the thousands of buckets, so the field
+ * names would cost more than the numbers do.
+ */
+export type PulseRow = [t: number, count: number, volume: number, x402: number, resolved: number];
+
+/**
+ * What a feed needs to survive an eviction. The block it reached, the numbers
+ * its temperatures are computed from, and the pulse series behind the volume
+ * chart.
+ *
+ * The pulse used to be left out on the reasoning that it refills within a few
+ * polls, and that reasoning was wrong in a way production made visible. A bucket
+ * is one per 15 seconds of *wall clock*, so refilling takes as long as it
+ * records: the object was collected every minute or two, and every eviction
+ * restarted the chart at one bar. The 1h and 24h ranges — 60 and 96 columns —
+ * each came back with a single nonzero column in them. `flows` still stays in
+ * memory, because a flow ring really does refill from the next backfill and a
+ * stale copy of it would be indistinguishable from a live one; a pulse bucket
+ * carries its own timestamp, so an old one is old in a way the chart can show.
  */
 export interface FeedState {
   /** Highest block already accounted for; `-1` means the feed has never landed one. */
@@ -55,6 +70,8 @@ export interface FeedState {
   marketTemp: number;
   prevVolume: number;
   prevTemp: number;
+  /** Oldest first. Absent in ledgers written before the chart was durable. */
+  pulse?: PulseRow[];
 }
 
 export interface ChainFeed {

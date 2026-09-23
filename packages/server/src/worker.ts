@@ -113,7 +113,31 @@ export class AbyssalWorld {
     const now = Date.now();
     if (now - this.lastSave < SAVE_EVERY_MS) return;
     this.lastSave = now;
-    await this.ctx.storage.put(SNAP_KEY, toJSON(app.world));
+    const snapshot = toJSON(app.world);
+    try {
+      await this.ctx.storage.put(SNAP_KEY, snapshot);
+    } catch (err) {
+      // A failed save must not take the response down with it. The caller asked
+      // to look at the tank, not to write it, and this is awaited on the request
+      // path — so an oversized snapshot turned every save into an HTTP 500 and
+      // the cron into an exception, once a minute, for as long as the value
+      // stayed too big. Logged rather than swallowed: the quiet version of this
+      // failure is a tank that stops being saved altogether, comes back from
+      // whatever its last successful write happened to hold, and says so
+      // nowhere.
+      //
+      // The size is encoded rather than taking `snapshot.length`, because the
+      // limit this number gets compared against is in bytes and a string length
+      // is in UTF-16 code units. Nearly all of a snapshot is hex and digits,
+      // where the two agree — but creature names are bought by users, and the
+      // sanitizer caps them at 24 characters without restricting them to ASCII,
+      // so an emoji is four bytes under a length of two. The one job of this
+      // line is to say how far over 2 MB the write was, and it should not be
+      // the thing that under-reports. Encoding runs only in here, on the path
+      // where the save has already failed.
+      const bytes = new TextEncoder().encode(snapshot).byteLength;
+      console.error(`world snapshot not saved: ${bytes} bytes`, err);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {

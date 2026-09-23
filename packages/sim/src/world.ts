@@ -322,10 +322,86 @@ export interface World {
   totalPredations: number;
 }
 
-const STATS_LOG_CAP = 5000;
+/**
+ * The whole world is serialized into *one* Durable Object storage value, and a
+ * value cannot exceed 2 MB: past it `storage.put` throws `SQLITE_TOOBIG`. That
+ * is not a degraded mode, it is a total loss — the put is awaited on the request
+ * path, so every save attempt turned into an HTTP 500, and once the world grew
+ * past the limit nothing was ever stored again. From then on an eviction could
+ * only ever be survived as whatever the last successful save happened to hold,
+ * however long ago that was. So every collection below is capped against what
+ * its readers actually ask for, and the caps are the reason the snapshot fits
+ * rather than an expectation that it will.
+ */
+/**
+ * How many ticks of history to keep, and how many to drop once that is
+ * exceeded. The trim is a hysteresis so the log is not spliced on every single
+ * tick, which means the length sawtooths between `CAP - TRIM` and `CAP` — and
+ * the *bottom* of that sawtooth is the real guarantee, because it is the
+ * shortest the log ever gets while still claiming to serve history. It has to
+ * stay at or above the deepest window the server will hand out
+ * (`HISTORY_WINDOW_MAX`), or `/history` quietly returns a short chart. Both
+ * constants are exported so that relationship is asserted by a test instead of
+ * being a number two packages apart that happens to line up.
+ */
+export const STATS_LOG_CAP = 3200;
+export const STATS_LOG_TRIM = 1000;
 const EVENT_LOG_CAP = 200;
+/**
+ * How many transaction hashes' worth of eaters the world remembers. The only
+ * reader is the meteor trail, which renders the twelve newest meteors and asks
+ * for exactly those hashes — so twelve keys are reachable and every older one
+ * is garbage that still has to be stored, serialized, and parsed on each boot.
+ * A local world running this same code against the same chain accumulated
+ * 156,158 of them: 11.98 MiB of a 13.63 MiB snapshot, or 88% of the world spent
+ * on one map whose reader asks for twelve keys, one entry per transaction that
+ * had ever rained food since the tank started. The cap sits well above twelve
+ * because a hash stays reachable while its plankton is still on the floor
+ * waiting to be eaten, which can outlast the meteor's own slot in the rain; 64
+ * covers that without being a round number that pretends to be derived.
+ */
+const EATERS_CAP = 64;
+/**
+ * Cull records kept. Unlike the two above, no reader bounds this — `/judgments`
+ * serves the whole array — so the cap is a judgement call about how much
+ * history a list is worth, taken so the snapshot keeps headroom: at ~300 bytes
+ * a record, 500 is roughly three weeks of hourly harvests and daily judgments
+ * and about 150 KB.
+ */
+const CULLS_CAP = 500;
 /** Below this fraction of max energy a creature hunts plankton by instinct. */
 const HUNGER_LINE = 0.55;
+
+/** Keep the last `cap` entries; the ones dropped are the oldest, which is the
+ * end of every one of these lists that no reader asks about. */
+function keepNewest<T>(list: T[], cap: number): void {
+  if (list.length > cap) list.splice(0, list.length - cap);
+}
+
+/**
+ * Drop the oldest transaction hashes once the map outgrows `EATERS_CAP`.
+ * Non-integer string keys keep insertion order in a JS object, so `Object.keys`
+ * is already oldest-first and the newest hashes — the only ones a meteor trail
+ * can still ask about — are the ones that survive.
+ */
+function pruneEaters(world: { eaters: Record<string, number[]> }): void {
+  const keys = Object.keys(world.eaters);
+  if (keys.length <= EATERS_CAP) return;
+  for (const k of keys.slice(0, keys.length - EATERS_CAP)) delete world.eaters[k];
+}
+
+/**
+ * The two trims a loaded snapshot needs, so an oversized one shrinks on the way
+ * in. The tick log lands at the bottom of its sawtooth rather than at the cap:
+ * a stored log that long is already past the point where the push-side trim
+ * would have fired, and bringing it back to the cap one row at a time is the
+ * behaviour the hysteresis exists to avoid.
+ */
+function trimHistory(world: { culls: unknown[]; statsLog: unknown[] }): void {
+  keepNewest(world.culls, CULLS_CAP);
+  if (world.statsLog.length > STATS_LOG_CAP) keepNewest(world.statsLog, STATS_LOG_CAP - STATS_LOG_TRIM);
+}
+
 /**
  * A whale transfer only becomes a *boom* (a pull that turns nearby heads)
  * from this size up, where the 3 * size^2 yield guarantees at least one pellet
@@ -709,6 +785,7 @@ function cullWeakest(
     populationAfter: world.creatures.length,
   };
   world.culls.push(record);
+  keepNewest(world.culls, CULLS_CAP);
   pushEvent(world, {
     type,
     count: doomed.length,
@@ -953,8 +1030,15 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
         c.maxMealTx = nearestFood.src ?? null;
         c.maxMealUsd = nearestFood.srcUsd ?? 0;
       }
-      if (nearestFood.src) {
-        const list = (world.eaters[nearestFood.src] ??= []);
+      const src = nearestFood.src;
+      if (src) {
+        // A hash nobody has eaten from yet is the only thing that can grow the
+        // map, so that is the only moment worth checking the cap against.
+        if (world.eaters[src] === undefined) {
+          world.eaters[src] = [];
+          pruneEaters(world);
+        }
+        const list = world.eaters[src];
         if (list.length < 8 && !list.includes(c.id)) list.push(c.id);
       }
       world.foods.splice(world.foods.indexOf(nearestFood), 1);
@@ -1127,7 +1211,7 @@ export function tick(world: World, senses: Senses, txs: TxMeteor[] = []): TickSt
     events,
   };
   world.statsLog.push(stats);
-  if (world.statsLog.length > STATS_LOG_CAP) world.statsLog.splice(0, 1000);
+  if (world.statsLog.length > STATS_LOG_CAP) world.statsLog.splice(0, STATS_LOG_TRIM);
   world.lastEvents = events;
   return stats;
 }
@@ -1422,6 +1506,15 @@ export function fromJSON(json: string): World {
   rest.nextEventSeq ??= 1;
   rest.eaters ??= {};
   rest.obituaries ??= [];
+  rest.culls ??= [];
+  rest.statsLog ??= [];
+  // Snapshots written before these were capped arrive oversized, and the value
+  // they came out of is the value that has to go back in — so trim on load
+  // instead of leaving the next save to fail on a size this boot could have
+  // fixed. The maps and arrays are already normalized above, which is what
+  // makes the two trims safe to call unconditionally.
+  pruneEaters(rest);
+  trimHistory(rest);
   for (const c of rest.creatures ?? []) {
     c.offspring ??= 0;
     c.maxMeal ??= 0;

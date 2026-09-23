@@ -41,7 +41,7 @@
  * handler degrade to the synthetic feed.
  */
 import { Rng } from '@abyssal/sim';
-import type { ChainFeed, ChainSample, ChainTx, FeedState, MeterState } from './chain.js';
+import type { ChainFeed, ChainSample, ChainTx, FeedState, MeterState, PulseRow } from './chain.js';
 import type { MarketSample } from './market.js';
 import {
   classifyVenue,
@@ -106,6 +106,17 @@ const MAX_LIVE_SPAN = 300;
 const RPC_TIMEOUT_MS = 10_000;
 /** Pulse chart + window stats aggregate into fixed 15s time buckets. */
 const PULSE_BUCKET_MS = 15_000;
+/**
+ * How many buckets ride in the persisted ledger, which is a smaller number than
+ * `maxPulse` on purpose. The ledger is rewritten whole on every save and a save
+ * happens about once a minute, so the stored copy is capped at a day of
+ * cron-spaced polls — the pace an unwatched feed actually runs at — rather than
+ * at a day of 15s slots, which only a feed somebody is polling continuously
+ * would ever fill. The in-memory series still runs to `maxPulse`, so a
+ * long-lived object serves more history than a restored one; a restored one
+ * serves a day instead of the single bar it used to.
+ */
+const PERSIST_PULSE = 1440;
 /** Stats / endpoint ranking / address drawer all share this observation window. */
 const STATS_WINDOW_MS = 5 * 60 * 1000;
 
@@ -161,6 +172,45 @@ interface PulseSample {
 
 function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/**
+ * Turn persisted tuples back into buckets, dropping whatever cannot be trusted.
+ * Defensive to the same degree the meters are, because these bytes come back out
+ * of Durable Object storage: a truncated value should cost a short chart, not a
+ * boot, and certainly not a chart that draws invented columns.
+ *
+ * Three rules do the work. A bucket older than the series can hold is dropped
+ * rather than kept, so a ledger restored days later does not present stale
+ * history as recent. A bucket dated in the future is dropped, for the same
+ * reason in the other direction — the right-hand axis label is the last bucket's
+ * timestamp, and one from tomorrow would put the whole chart in the future. And
+ * a bucket that is not later than the one before it is dropped rather than
+ * sorted into place, because the series is only ever appended to at its tail:
+ * a row that belongs in the middle would be overwritten by the next poll's
+ * merge-or-push, silently, and the chart would keep two accounts of one minute.
+ */
+function restorePulse(rows: unknown[], maxPulse: number): PulseSample[] {
+  const now = Date.now();
+  const floor = now - maxPulse * PULSE_BUCKET_MS;
+  const out: PulseSample[] = [];
+  let prev = -Infinity;
+  for (const r of rows.slice(-maxPulse)) {
+    if (!Array.isArray(r) || r.length < 5) continue;
+    const [ts, count, volume, x402, resolved] = r as unknown as number[];
+    if (!Number.isFinite(ts) || !Number.isFinite(count) || !Number.isFinite(volume)) continue;
+    const t = Math.round(ts) * 1000;
+    if (t < floor || t <= prev || t > now + PULSE_BUCKET_MS) continue;
+    out.push({
+      t,
+      count: Math.max(0, Math.round(count)),
+      volume: Math.max(0, volume),
+      x402: Number.isFinite(x402) ? Math.max(0, Math.round(x402)) : 0,
+      resolved: Number.isFinite(resolved) ? Math.max(0, Math.round(resolved)) : 0,
+    });
+    prev = t;
+  }
+  return out;
 }
 
 /**
@@ -439,16 +489,20 @@ export class ArcUsdcFeed implements ChainFeed {
    * Carry-over for a runtime whose object does not outlive its invocation.
    * `lastBlock` is the part that matters most: without it every cold boot is a
    * 3600-block backfill, and a backfill resolves no venues (so every flow it
-   * produces is unattributed), rebuilds the pulse history wholesale, and pushes
-   * thousands of flows through the ring — enough on a busy chain to evict the
-   * live readings a viewer actually came for, every single minute. The meters
-   * ride along so the temperatures resume as ranks against their own history
-   * instead of restarting at 0.5 and spending ~90 polls earning a scale back.
+   * produces is unattributed) and pushes thousands of flows through the ring —
+   * enough on a busy chain to evict the live readings a viewer actually came
+   * for, every single minute. The meters ride along so the temperatures resume
+   * as ranks against their own history instead of restarting at 0.5 and spending
+   * ~90 polls earning a scale back.
    *
-   * `flows` and `pulse` deliberately do not. They are the two large structures
-   * in here, both refill within a few polls, and a restored copy of either
-   * would be indistinguishable from a fresh one — the worst kind of state to
-   * carry across an eviction.
+   * The pulse series rides along too, and it took a production chart to show
+   * why: a bucket is one per 15 seconds of wall clock, so it does not refill
+   * within a few polls — it refills at exactly the rate it records. Left in
+   * memory alone, an object collected every minute or two served a chart of one
+   * bar, and the 1h and 24h ranges each came back with a single nonzero column.
+   * `flows` still does not ride along: a ring really does refill from the
+   * next backfill, and a stale copy would be indistinguishable from a fresh one,
+   * whereas every bucket here carries the timestamp that says how old it is.
    */
   exportState(): FeedState {
     return {
@@ -459,6 +513,13 @@ export class ArcUsdcFeed implements ChainFeed {
       marketTemp: this.marketTemp,
       prevVolume: this.prevVolume,
       prevTemp: this.prevTemp,
+      pulse: this.pulse.slice(-PERSIST_PULSE).map((p) => [
+        Math.round(p.t / 1000),
+        p.count,
+        Math.round(p.volume * 100) / 100,
+        p.x402,
+        p.resolved,
+      ] as PulseRow),
     };
   }
 
@@ -474,6 +535,13 @@ export class ArcUsdcFeed implements ChainFeed {
     if (Number.isFinite(s.marketTemp)) this.marketTemp = clamp01(s.marketTemp);
     if (Number.isFinite(s.prevVolume)) this.prevVolume = s.prevVolume;
     if (Number.isFinite(s.prevTemp)) this.prevTemp = clamp01(s.prevTemp);
+    if (Array.isArray(s.pulse)) {
+      // Only on a series that survived. Assigning unconditionally would let a
+      // ledger written before the chart was durable — or one whose buckets all
+      // failed validation — wipe a series this object had already accumulated.
+      const restored = restorePulse(s.pulse, this.maxPulse);
+      if (restored.length) this.pulse = restored;
+    }
   }
 
   /** Start a poll if one is due; returns the promise in flight, or null. */
@@ -931,19 +999,31 @@ export class ArcUsdcFeed implements ChainFeed {
       if (isBackfill) {
         // Rebuild the pulse history from the backfilled flows: fixed 15s
         // time buckets so backfill and live bars stay comparable.
-        const buckets = new Map<number, PulseSample>();
+        const rebuilt = new Map<number, PulseSample>();
         for (const f of this.flows) {
           const key = Math.floor(f.t / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
-          let b = buckets.get(key);
+          let b = rebuilt.get(key);
           if (!b) {
             b = { t: key, count: 0, volume: 0, x402: 0, resolved: 0 };
-            buckets.set(key, b);
+            rebuilt.set(key, b);
           }
           b.count++;
           b.volume += f.amount;
           if (f.x402) b.x402++;
           if (f.venue) b.resolved++;
         }
+        // Merged into the series already in hand rather than replacing it, and
+        // the one already in hand wins every collision. A backfill re-reads
+        // blocks the feed has counted before — that is what makes it a backfill
+        // — so for any stretch a persisted series also covers, these buckets are
+        // a second opinion, and a worse one on two counts: adding them would
+        // count those transfers twice, and a backfill resolves no venues, so
+        // every bucket it builds arrives with `resolved: 0` and would trade a
+        // reading the feed actually took for one it did not. What the rebuild
+        // contributes is the stretch nobody had polled yet, which is the gap
+        // that made this a backfill in the first place.
+        const buckets = new Map<number, PulseSample>(this.pulse.map((p) => [p.t, p]));
+        for (const [k, v] of rebuilt) if (!buckets.has(k)) buckets.set(k, v);
         this.pulse = [...buckets.keys()]
           .sort((a, b) => a - b)
           .map((k) => buckets.get(k)!)

@@ -306,8 +306,15 @@ function round1(v: number): number {
   return Math.round(v * 10) / 10;
 }
 
-/** Deepest /history window we will serve; matches the pre-`?window=` behaviour. */
-const HISTORY_WINDOW_MAX = 2000;
+/**
+ * Deepest /history window we will serve; matches the pre-`?window=` behaviour.
+ * Exported because it is one half of a promise the sim keeps: the world trims
+ * its tick log in one bite rather than a row at a time, so the log sawtooths,
+ * and the bottom of that sawtooth has to stay at or above this. A test asserts
+ * it, since the two numbers live in different packages and nothing else ties
+ * them together.
+ */
+export const HISTORY_WINDOW_MAX = 2000;
 
 /**
  * Stride-downsample to at most `slots` rows, mirroring the chart's own

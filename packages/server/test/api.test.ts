@@ -2,7 +2,7 @@ import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { applyIntervention, tick, toJSON } from '@abyssal/sim';
 import { createApp, type LedgerSnapshot, type WorldStore } from '../src/handler.js';
-import type { ChainFeed, FeedState } from '../src/chain.js';
+import type { ChainFeed, FeedState, PulseRow } from '../src/chain.js';
 import type { MarketFeed } from '../src/market.js';
 import { serveStatic } from '../src/static.js';
 import {
@@ -1908,5 +1908,280 @@ test('the leaderboard ranks a rail by how often it is used, not by what one call
   assert.ok(
     obs.venueRows.every((r) => r.count > 0),
     'every row names a count, which is the figure the rows are ordered by and the one that makes a large amount beside ×1 readable as a single event',
+  );
+});
+
+/* ---------- the volume chart outliving the object that drew it ---------- */
+
+/** The RPC is never dialled here: these tests move state, not blocks. */
+const UNUSED_RPC = 'http://127.0.0.1:1';
+
+/**
+ * A persisted series shaped like the one that comes back out of the ledger:
+ * tuples, seconds, oldest first. Spaced a minute apart on purpose — that is the
+ * pace an unwatched feed runs at, one poll per cron fire and one bucket per poll,
+ * and it is the spacing production actually had.
+ */
+const pulseRows = (n: number, stepSec = 60): PulseRow[] => {
+  const last = Math.floor(Date.now() / 15_000) * 15;
+  return Array.from({ length: n }, (_, i) => {
+    const back = n - 1 - i;
+    return [last - back * stepSec, 10 + i, 100 + i, i % 3 === 0 ? 1 : 0, 10 + i] as PulseRow;
+  });
+};
+
+test('the volume chart resumes instead of restarting at one bar', async () => {
+  // Measured in production rather than hypothesized: eight probes of /observe
+  // across two minutes returned series of 1, 3, 3, 6, 7 and 8 buckets, resetting
+  // whenever the object was collected, while `lastBlock` climbed monotonically
+  // across the same probes. That pair is the diagnosis — the block was in the
+  // ledger and the chart was not. A bucket is one per 15 seconds of wall clock,
+  // so the series refills at exactly the rate it records, and the 1h and 24h
+  // ranges came back as 60 and 96 columns with one nonzero column between them.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const rows = pulseRows(8);
+  const first = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  first.importState({ ...feedStateAt(1024), pulse: rows });
+  const carried = first.exportState().pulse;
+  assert.deepEqual(carried, rows, 'what went into the ledger is byte-for-byte what comes back out of it');
+
+  // The next object: cold memory, warm storage.
+  const second = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  second.importState({ ...feedStateAt(1024), pulse: carried! });
+  assert.deepEqual(
+    second.observePayload().pulse.map((b) => b.t),
+    rows.map((r) => r[0] * 1000),
+    'every stored bucket reaches /observe in order, rather than only the one the next poll happens to land',
+  );
+
+  // And the ranges that were empty. Eight buckets a minute apart are eight
+  // distinct 60s columns, so the 1h view has eight real columns instead of one.
+  const hist = second.historyPulse(3_600_000, 60_000);
+  assert.equal(hist.length, 60, 'the range stays dense: every slot in the window is served, quiet ones zeroed');
+  assert.equal(
+    hist.filter((b) => b.count > 0).length,
+    8,
+    'and eight of them carry something, which is the difference between a time-travel control and a decoration',
+  );
+  assert.ok(
+    hist.every((b) => b.count === 0 || b.resolvedVolume > 0),
+    'a bucket that was resolved keeps its denominator through the round trip, so its share is not restated as unknown',
+  );
+});
+
+test('a ledger that cannot be trusted costs a short chart, not an invented one', async () => {
+  // These bytes come back out of Durable Object storage, where a truncated value
+  // is a real possibility and not a hypothetical. Every way a row can be wrong has
+  // to cost one bar rather than a column nobody measured — and the failure that
+  // would be worst is a timestamp from the future, because the chart's right-hand
+  // axis label is the last bucket's, so one bad row moves the whole window.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const now = Date.now();
+  const slot = Math.floor(now / 15_000) * 15_000;
+  const good = (t: number, count: number): PulseRow => [t / 1000, count, count * 10, 0, count];
+  const rows = [
+    good(slot - 60_000, 1),                                  // kept
+    [(slot - 45_000) / 1000, 5] as unknown as PulseRow,      // truncated
+    null as unknown as PulseRow,                             // not a row at all
+    good(slot - 90_000, 2),                                  // older than the one before it
+    [NaN, 1, 1, 0, 1] as unknown as PulseRow,                // no usable timestamp
+    good(slot + 3_600_000, 3),                               // an hour from now
+    good(slot - 30_000, 4),                                  // kept
+    good(now - 25 * 3_600_000, 5),                           // older than the series can hold
+  ];
+  const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  feed.importState({ ...feedStateAt(1024), pulse: rows });
+  const p = feed.observePayload().pulse;
+  assert.deepEqual(
+    p.map((b) => b.t),
+    [slot - 60_000, slot - 30_000],
+    'the two rows that are real, ordered, in range and dated in the past are the only two drawn',
+  );
+  assert.deepEqual(p.map((b) => b.count), [1, 4], 'and each carries its own count, not a neighbour’s');
+
+  // The out-of-order row is dropped rather than sorted into place: the series is
+  // appended to at its tail, so a bucket in the middle would be silently
+  // overwritten by the next poll's merge-or-push and the chart would end up
+  // keeping two accounts of the same minute.
+  const warm = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  warm.importState({ ...feedStateAt(1024), pulse: pulseRows(3) });
+  warm.importState({ ...feedStateAt(1024), pulse: [[NaN, 1, 1, 0, 1] as unknown as PulseRow] });
+  assert.equal(
+    warm.observePayload().pulse.length,
+    3,
+    'a ledger with nothing usable in it leaves the series alone rather than emptying it',
+  );
+});
+
+test('a backfill fills the gap it was called for and leaves the chart it resumed from alone', async () => {
+  // Restoring the series only helps if the next poll does not undo it, and the
+  // poll that can is a backfill. A backfill re-reads blocks the feed has already
+  // counted — that is what makes it a backfill — and it resolves no venues, so
+  // every bucket it rebuilds arrives with `resolved: 0`. Replacing the series
+  // with them, which is what the rebuild used to do, would trade a reading the
+  // feed actually took for one it did not, and count the same transfers twice
+  // wherever the two overlapped.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 8192;
+  const { server: rpc } = chainRpcStub(HEAD, 2, 0);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  // Two blocks of backfill is a second of chain, which lands the flows beside
+  // `now`; `restorePulse` admits a bucket up to one slot ahead of it, so the
+  // seeded band brackets the present on both sides. Whichever slot the poll's
+  // own `Date.now()` puts those flows in — a boundary can pass between this line
+  // and that one — it collides with a seeded bucket rather than adding a fourth.
+  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 2, pollEveryMs: 0 });
+  try {
+    const slot = Math.floor(Date.now() / 15_000) * 15_000;
+    const rows = [-15_000, 0, 15_000].map(
+      (off, i) => [(slot + off) / 1000, 776 + i, 8_000 + i, 0, 776 + i] as PulseRow,
+    );
+    // `importState` refuses `-1` as a block number, so `lastBlock` stays cold and
+    // the poll this triggers is a backfill no matter how narrow the head is.
+    feed.importState({ ...feedStateAt(-1), pulse: rows });
+    await feed.settle();
+    const p = feed.observePayload().pulse;
+    assert.ok(p.length > 0, 'the backfill ran');
+    assert.deepEqual(
+      p.map((b) => [b.t, b.count, b.resolved]),
+      rows.map((r) => [r[0] * 1000, r[1], r[4]]),
+      'every restored bucket kept its own count and its own denominator, and the rebuild added nothing over them',
+    );
+    assert.ok(
+      feed.observePayload().flows.length > 0,
+      'the backfill still landed its flows — this is a merge, not a refusal to read',
+    );
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the ledger carries a day of chart, and it is the newest day', async () => {
+  // The in-memory series runs to 24h of 15s slots and the ledger is rewritten
+  // whole on every save, which is about once a minute. Carrying all of it would
+  // put a six-figure byte count behind that write to store a chart. Which end the
+  // cap keeps is the part worth pinning down: dropping the newest buckets would
+  // leave a chart that ends in the past and never catches up.
+  //
+  // 1440 is written out rather than read from the module, for the usual reason —
+  // a test that consults the same constant the code does can only agree with
+  // itself, and it is the number itself that has to stay affordable.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  const rows = pulseRows(2000, 15);
+  feed.importState({ ...feedStateAt(1024), pulse: rows });
+  const carried = feed.exportState().pulse!;
+  assert.equal(carried.length, 1440, 'the stored copy is capped');
+  assert.deepEqual(carried[carried.length - 1], rows[rows.length - 1], 'the newest bucket survives');
+  // This is also what proves memory kept all 2000: had the restore capped at the
+  // same 1440, the first row carried would be the first row stored.
+  assert.deepEqual(carried[0], rows[2000 - 1440], 'and the oldest 560 are what the cap drops');
+});
+
+test('the ledger stays a fraction of the value limit it has to fit in', async () => {
+  // The world snapshot is not the only state riding in a single Durable Object
+  // value with a 2 MB ceiling, and this is the change that put a day of chart in
+  // the other one. Measured rather than assumed: "it is only a few numbers" is
+  // the reasoning that let the world snapshot grow past the same ceiling — a
+  // local world on the same code and the same chain reached 13.63 MiB, and
+  // production logs showed `storage.put` throwing SQLITE_TOOBIG on every save.
+  // Fed more buckets than the cap will carry, so the number here is the stored
+  // size and not the in-memory one — a series that is capped on the way out is
+  // the whole point.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
+  feed.importState({ ...feedStateAt(1024), pulse: pulseRows(5000, 15) });
+  const bytes = Buffer.byteLength(JSON.stringify(feed.exportState()), 'utf8');
+  assert.ok(
+    bytes < 256 * 1024,
+    `the ledger is ${(bytes / 1024).toFixed(0)} KB; it shares a 2 MB value limit with nothing, but a chart that costs megabytes to store is a chart that will one day fail to`,
+  );
+});
+
+test('the sim keeps more tick history than the deepest window the API serves', async () => {
+  // `/history` answers with `statsLog.slice(-window)` for a window up to
+  // HISTORY_WINDOW_MAX, and the sim trims that log in one bite rather than a row
+  // at a time — so its length sawtooths, and the *bottom* of the sawtooth is
+  // what has to still cover the deepest window. The two numbers live in
+  // different packages and nothing else ties them together: lowering the sim's
+  // cap would not break a build or throw at runtime, it would quietly hand back
+  // a shorter chart than the one asked for.
+  const { STATS_LOG_CAP, STATS_LOG_TRIM } = await import('@abyssal/sim');
+  const { HISTORY_WINDOW_MAX } = await import('../src/handler.js');
+  assert.ok(
+    STATS_LOG_CAP - STATS_LOG_TRIM >= HISTORY_WINDOW_MAX,
+    `the sim can trim its log down to ${STATS_LOG_CAP - STATS_LOG_TRIM} rows, short of the ${HISTORY_WINDOW_MAX} this API promises to serve`,
+  );
+});
+
+test('a snapshot too big to store costs a log line, not the response', async () => {
+  // The production failure, reproduced end to end through the Durable Object
+  // rather than through createApp: the world outgrew the 2 MB ceiling on a
+  // single storage value, `storage.put` started throwing SQLITE_TOOBIG, and
+  // because `persist()` is awaited on the request path every /observe became a
+  // 500 — seven of twenty-four requests in one window — while the cron threw
+  // once a minute on top of it.
+  //
+  // The caps in the sim are what stop the snapshot growing. This guards the
+  // other half, the part no size budget can promise: whatever makes a save fail
+  // next, a reader who asked to look at the tank still gets their answer. It is
+  // worth a test because the regression is invisible — removing the try/catch
+  // breaks nothing until storage breaks, and by then the symptom is a tank that
+  // stopped being saved, comes back as whatever its last good save held, and
+  // answers 500 while doing it.
+  const { AbyssalWorld } = await import('../src/worker.js');
+  const stored = new Map<string, unknown>();
+  const attempted: string[] = [];
+  const obj = new AbyssalWorld(
+    {
+      storage: {
+        // The interface's `get` is generic in a way no map can honour — it
+        // promises whatever type the caller names — so the stand-in asserts it.
+        get: async <T = unknown>(key: string): Promise<T | undefined> => stored.get(key) as T | undefined,
+        put: async (key: string, value: unknown) => {
+          attempted.push(key);
+          // Only the snapshot fails, which is what made the incident so hard to
+          // see: the instance id and the burn receipts kept storing fine, so the
+          // object looked healthy from every other angle.
+          if (key === 'world') throw new Error('string or blob too big: SQLITE_TOOBIG');
+          stored.set(key, value);
+        },
+      },
+      waitUntil: (promise: Promise<unknown>) => {
+        void promise.catch(() => {});
+      },
+    },
+    {
+      WORLD: {
+        idFromName: () => ({}),
+        get: () => ({ fetch: async () => new Response(null) }),
+      },
+    },
+  );
+
+  // Captured rather than left to print: an error and a stack trace in the middle
+  // of a green suite reads like a failure, and the log is itself part of what is
+  // being asserted. A save that fails silently is how the tank came to reset for
+  // days with nothing anywhere saying so.
+  const logged: unknown[][] = [];
+  const realError = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  let res: Response;
+  try {
+    res = await obj.fetch(new Request('https://abyssal.internal/api'));
+  } finally {
+    console.error = realError;
+  }
+
+  assert.ok(attempted.includes('world'), 'the snapshot save was attempted');
+  assert.equal(res.status, 200, 'and its failure did not become the caller\u2019s problem');
+  assert.equal(logged.length, 1, 'it was logged, exactly once, not swallowed');
+  assert.match(
+    String(logged[0][0]),
+    /world snapshot not saved: [1-9]\d* bytes/,
+    'with the size it tried to write, which is the number that decides whether the caps still hold',
   );
 });

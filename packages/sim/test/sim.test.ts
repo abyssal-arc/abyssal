@@ -10,6 +10,8 @@ import {
   creatureName,
   toJSON,
   fromJSON,
+  STATS_LOG_CAP,
+  STATS_LOG_TRIM,
   DEFAULT_CONFIG,
   ARCHETYPES,
   archetypeOf,
@@ -31,6 +33,7 @@ import {
   type WorldConfig,
   type Archetype,
   type Creature,
+  type CullRecord,
   type Genome,
 } from '../src/index.js';
 import { Rng } from '../src/prng.js';
@@ -887,6 +890,173 @@ test('eaters: a tx pellet is traceable to the creature that ate it', () => {
   assert.equal(world.eaters[hash].length, 1, 'one bite is logged once');
   const survivor = world.creatures.find((x) => x.id === c.id);
   assert.ok(survivor && survivor.maxMeal > 0, 'the biggest meal is remembered');
+});
+
+/* ---------- the snapshot has to fit the one storage value it lives in ---------- */
+
+/**
+ * The whole tank is serialized into a single Durable Object value, and a value
+ * over 2 MB is refused outright. Measured worst case — every capped collection
+ * at its cap, each entry copied from a real one — comes to about 1.1 MiB, so
+ * this sits above that with room for the world to grow and well under the limit
+ * that breaks it. Written as a literal rather than derived from the caps: a
+ * budget computed from the same numbers the code uses can only ever agree with
+ * itself.
+ */
+const SNAPSHOT_BUDGET = 1.5 * 1024 * 1024;
+
+/** A 32-byte hex hash that is distinct per index, the shape `eaters` is keyed by. */
+function fakeHash(i: number): string {
+  return '0x' + i.toString(16).padStart(4, '0').repeat(16);
+}
+
+/**
+ * A cull record at the size production actually carries — about 300 bytes, two
+ * victims. Culls accrue on an hourly and a daily cadence, so a test cannot tick
+ * its way to the cap and still finish; the shape has to be built instead.
+ */
+function cullRecordAt(i: number): CullRecord {
+  return {
+    type: 'harvest',
+    tick: i,
+    day: Math.floor(i / 1000),
+    culled: [0, 1].map((k) => ({
+      id: i * 2 + k,
+      name: creatureName('INSIDER', i * 2 + k),
+      generation: 4,
+      energy: 12.5 - k,
+      archetype: 'INSIDER' as Archetype,
+      age: 900 - k * 20,
+    })),
+    saved: [],
+    populationBefore: 120,
+    populationAfter: 118,
+  };
+}
+
+test('the eater map stops at the meteor trail it exists to serve', () => {
+  // A local world running this same code against the same chain carried 156,158
+  // keys here — one per transaction that had ever rained food since the tank
+  // started, and 11.98 MiB of a 13.63 MiB snapshot.
+  // The only reader is the meteor trail, which renders the twelve newest falls
+  // and asks for exactly those hashes, so every older key was unreachable and
+  // still had to be stored, serialized and parsed on each boot.
+  const world = createWorld(167, { ...DEFAULT_CONFIG, ...NO_FOOD, populationFloor: 0 });
+  world.creatures = world.creatures.slice(0, 1);
+  const c = world.creatures[0];
+  c.x = 200; c.y = 700;
+  // Seeded past the cap the way a long-lived tank would be, oldest first. One
+  // real bite is then taken, because pruning runs on the insert of a new hash —
+  // the only moment the map can grow — and that is the path worth exercising.
+  const stale = Array.from({ length: 200 }, (_, i) => fakeHash(i));
+  for (const h of stale) world.eaters[h] = [1];
+  const fresh = '0x' + 'ff'.repeat(32);
+  for (let i = 0; i < 40 && !(world.eaters[fresh]?.length > 0); i++) {
+    c.energy = 60; // kept hungry, so it swims for the fall instead of ignoring it
+    tick(world, { chain: 0.5, market: 0 }, i === 0 ? [{ hash: fresh, size: 1, at: { x: 200, y: 700 } }] : []);
+  }
+  assert.ok(world.eaters[fresh]?.length > 0, 'the test needs the bite to actually happen');
+  const keys = Object.keys(world.eaters);
+  assert.ok(keys.length <= 64, `the map is capped, got ${keys.length} keys`);
+  assert.equal(world.eaters[stale[0]], undefined, 'the oldest hash is what gets dropped');
+  assert.ok(world.eaters[stale[199]], 'a hash inside the cap survives');
+  assert.ok(world.eaters[fresh], 'and the fall just eaten is still traceable');
+});
+
+test('the tick log sawtooths inside its cap instead of growing forever', () => {
+  const world = createWorld(169);
+  // Past the cap and through one trim, so this covers the splice and not only
+  // the approach to it.
+  runTicks(world, STATS_LOG_CAP + STATS_LOG_TRIM + 10);
+  assert.ok(world.statsLog.length <= STATS_LOG_CAP, `capped, got ${world.statsLog.length}`);
+  assert.ok(
+    world.statsLog.length >= STATS_LOG_CAP - STATS_LOG_TRIM,
+    `the trim takes a bounded bite rather than emptying the log, got ${world.statsLog.length}`,
+  );
+  assert.equal(
+    world.statsLog.at(-1)?.tick,
+    STATS_LOG_CAP + STATS_LOG_TRIM + 10,
+    'and it is the newest history that is kept',
+  );
+});
+
+test('a snapshot written before the caps shrinks on load', () => {
+  // The stored value is the one that has to go back in, so an oversized
+  // snapshot has to be trimmed on the way through rather than on the next tick.
+  const world = createWorld(170);
+  runTicks(world, 5);
+  const raw = JSON.parse(toJSON(world)) as Record<string, unknown> & {
+    eaters: Record<string, number[]>;
+    culls: CullRecord[];
+    statsLog: Record<string, unknown>[];
+  };
+  for (let i = 0; i < 5000; i++) raw.eaters[fakeHash(i)] = [1, 2];
+  raw.culls = Array.from({ length: 2000 }, (_, i) => cullRecordAt(i));
+  raw.statsLog = Array.from({ length: 6000 }, (_, i) => ({ ...raw.statsLog[0], tick: i }));
+  const revived = fromJSON(JSON.stringify(raw));
+  assert.ok(Object.keys(revived.eaters).length <= 64, `eaters trimmed, got ${Object.keys(revived.eaters).length}`);
+  assert.ok(revived.culls.length <= 500, `culls trimmed, got ${revived.culls.length}`);
+  assert.ok(revived.statsLog.length <= STATS_LOG_CAP, `statsLog trimmed, got ${revived.statsLog.length}`);
+  // Trimmed from the old end: these three are what a viewer can still ask about.
+  assert.ok(revived.eaters[fakeHash(4999)], 'the newest hash survives');
+  assert.equal(revived.culls.at(-1)?.tick, 1999, 'the newest cull survives');
+  assert.equal(revived.statsLog.at(-1)?.tick, 5999, 'the newest tick survives');
+});
+
+test('the cull history stops growing at the cap', () => {
+  const config: WorldConfig = {
+    ...DEFAULT_CONFIG,
+    initialPopulation: 20,
+    populationFloor: 5,
+    judgmentInterval: 10,
+    judgmentCullRatio: 0.1,
+  };
+  const world = createWorld(172, config);
+  // Stuffed past the cap the way a months-old tank would be, then one real cull
+  // is run. The trim lives on the push, which is the only thing that can grow
+  // the array — a test that only ever stuffed it would pass with no trim at all,
+  // and culls accrue daily, so ticking to the cap is not an option.
+  for (let i = 0; i < 900; i++) world.culls.push(cullRecordAt(i));
+  runTicks(world, 10);
+  assert.ok(world.culls.length <= 500, `capped at 500, got ${world.culls.length}`);
+  assert.equal(
+    world.culls.at(-1)?.type,
+    'judgment',
+    'the cull that just ran is the newest record, and the newest is what survives',
+  );
+});
+
+test('a world at every one of its caps still fits the value it has to live in', () => {
+  // This is the assertion that would have caught SQLITE_TOOBIG before it reached
+  // production. The put is awaited on the request path, so an oversized snapshot
+  // did not degrade the site — it turned every save into an HTTP 500 and the
+  // once-a-minute cron into an exception, and once the world passed the limit
+  // nothing was ever stored again, so an eviction could only be survived as
+  // whatever the last successful save happened to hold.
+  const world = createWorld(171);
+  runTicks(world, 20);
+  const cfg = world.config;
+  const stat = world.statsLog[world.statsLog.length - 1];
+  const creature = world.creatures[0];
+  const food = world.foods[0];
+  // Filled to the caps with copies of real entries, so every byte counted here
+  // is a byte of the shape the sim actually writes rather than an invented one.
+  // The split in how the caps are named is deliberate: 500 and 64 are written
+  // out because the two tests above already pin them, whereas the tick log is
+  // read from the module so that raising its cap raises this fill with it —
+  // which is what makes the budget bite on the one collection big enough to
+  // breach the limit on its own.
+  world.statsLog = Array.from({ length: STATS_LOG_CAP }, (_, i) => ({ ...stat, tick: i }));
+  world.creatures = Array.from({ length: cfg.maxPopulation }, (_, i) => ({ ...creature, id: i + 1 }));
+  world.foods = Array.from({ length: cfg.maxFood }, (_, i) => ({ ...food, id: i + 1 }));
+  world.culls = Array.from({ length: 500 }, (_, i) => cullRecordAt(i));
+  world.eaters = {};
+  for (let i = 0; i < 64; i++) world.eaters[fakeHash(i)] = [1, 2, 3, 4, 5, 6, 7, 8];
+  const bytes = Buffer.byteLength(toJSON(world), 'utf8');
+  assert.ok(
+    bytes < SNAPSHOT_BUDGET,
+    `snapshot is ${(bytes / 1048576).toFixed(2)} MiB, over the ${(SNAPSHOT_BUDGET / 1048576).toFixed(2)} MiB budget and heading for the 2 MB limit`,
+  );
 });
 
 test('offspring: a birth credits the parent and the child carries the line', () => {

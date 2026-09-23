@@ -1109,7 +1109,18 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 .obs-flowmap-card { flex: 3 1 0; }
 .obs-pulse-card { flex: 2 1 0; }
 .obs-stats-card { flex: 0 0 auto; }
-.obs-endpoints-card { flex: 1 1 0; }
+/* The two side lists split what is left of the column instead of one sizing to
+   its content: the rails card holds up to twelve rows plus a chip per rail, and
+   left to `flex: 0 1 auto` it took all of it and squeezed Top endpoints — a
+   `flex: 1 1 0` sibling with `min-height: 0` — down to zero height, which reads
+   as the panel having vanished rather than as the panel being short. Both lists
+   scroll internally, so a weighted split costs a scrollbar and nothing else. */
+.obs-venues-card { flex: 1.15 1 0; min-height: 0; }
+/* A floor rather than a share, because a share can still be outvoted by the
+   card above it growing. This is the height of the header plus three rows: enough
+   that the panel is legibly a list, and small enough that a short viewport
+   spends the squeeze on the rails card, which has more to give. */
+.obs-endpoints-card { flex: 1 1 0; min-height: calc(var(--sp) * 34); }
 .obs-head {
   position: relative;
   display: flex; align-items: baseline; justify-content: space-between; gap: calc(var(--sp) * 2);

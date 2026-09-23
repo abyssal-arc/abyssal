@@ -29,6 +29,8 @@ export {
   txLanding,
   toJSON,
   fromJSON,
+  STATS_LOG_CAP,
+  STATS_LOG_TRIM,
   WHALE_BOOM_SIZE,
   WISH_METEOR_SIZE,
   WISH_PELLETS,

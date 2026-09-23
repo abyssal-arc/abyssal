@@ -130,3 +130,101 @@ test('the prices in the markup are the prices the server charges', () => {
     assert.equal(amount, prices.get(type), `the ${type} button advertises ${amount} ABYS but the server charges ${prices.get(type)}`);
   }
 });
+
+test('every observe card in the markup has a desktop flex rule of its own', () => {
+  // The rails card shipped without one. In a flex column a card with no rule
+  // falls back to `flex: 0 1 auto`, sizes itself to its content — twelve rows
+  // plus a chip per rail — and leaves nothing for the `flex: 1 1 0` sibling below
+  // it, whose `min-height: 0` then lets it collapse to zero. Top endpoints did
+  // not look short, it looked deleted. Nothing else could have caught it: jsdom
+  // does no layout, so every clientHeight in the render smoke test is 0, and the
+  // payload was fine — the rows were in the response, just drawn nowhere.
+  const html = readFileSync(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
+  const css = readFileSync(fileURLToPath(new URL('../style.css', import.meta.url)), 'utf8');
+  const used = [...new Set([...html.matchAll(/obs-card\s+(obs-[a-z-]+-card)/g)].map((m) => m[1]))];
+  assert.equal(used.length, 5, `the markup names five observe cards, read ${used.join(', ')}`);
+
+  // Only the desktop section counts. The phone media query resets all of them to
+  // `flex: 0 0 auto`, so reading the whole file would let an override satisfy a
+  // test about the rule it overrides.
+  const from = css.indexOf('/* ---------- observe view layout ---------- */');
+  assert.ok(from >= 0, 'the observe layout section is where these rules live');
+  const desktop = css.slice(from, css.indexOf('@media', from));
+  const missing = used.filter((c) => !new RegExp(`\\.${c}\\s*\\{[^}]*flex:`).test(desktop));
+  assert.deepEqual(missing, [], 'a card with no flex rule sizes to its content and starves its siblings');
+
+  // And the panel a viewer would notice going missing holds a floor rather than
+  // only a share, because a share can still be outvoted by the card above it
+  // growing.
+  assert.match(
+    desktop,
+    /\.obs-endpoints-card\s*\{[^}]*min-height:\s*calc/,
+    'top endpoints keeps a minimum height so a taller neighbour cannot squeeze it out',
+  );
+});
+
+test('a pulse bar names the time it covers, not the number of buckets in it', () => {
+  // Lifted out of app.js and evaluated on its own: app.js touches `document` at
+  // module scope, and this is a pure function of an array, so the honest way to
+  // test it is to cut it out rather than to boot a DOM for it.
+  const src = readFileSync(fileURLToPath(new URL('../app.js', import.meta.url)), 'utf8');
+  const at = src.indexOf('function computePulseBars');
+  assert.ok(at >= 0, 'the grouping function is where this test expects it');
+  const body = src.slice(at, src.indexOf('\n}', at) + 2);
+  const computePulseBars = new Function(`${body}; return computePulseBars;`)();
+
+  // 192 buckets a minute apart: the shape a feed only its cron is polling
+  // produces, one bucket per fire, keyed to a 15s boundary but 60s from its
+  // neighbour. Grouped two to a bar, a bar covers 75 seconds — the minute
+  // between the two buckets plus the last one's own width.
+  const pts = Array.from({ length: 192 }, (_, i) => ({
+    t: i * 60_000, volume: 1, count: 1, x402: 0, resolved: 1,
+  }));
+  const bars = computePulseBars(pts);
+  assert.equal(bars.length, 96, 'grouped down to the display resolution');
+  assert.equal(
+    bars[0].span,
+    75,
+    'counting slots would have said 30, and the right-hand axis label — which is `t + span` — is the one place that number is ever read out loud',
+  );
+  const last = bars[bars.length - 1];
+  assert.equal(
+    last.t + last.span * 1000,
+    pts[pts.length - 1].t + 15_000,
+    'the window the chart claims to end at is where the last bucket actually ends',
+  );
+});
+
+test('pulse columns keep their rhythm on a short series and never become slabs', () => {
+  // The width formula sits inside drawPulse, which needs a canvas, so it is read
+  // out of the source and evaluated on its own two inputs rather than booted up.
+  const src = readFileSync(fileURLToPath(new URL('../app.js', import.meta.url)), 'utf8');
+  const m = src.match(/const barW = ([^\n]+);/);
+  assert.ok(m, 'the bar width is computed once, on a line of its own');
+  const barW = new Function('bw', 'w', `return ${m[1]};`);
+
+  // The bug this guards is that a ceiling in absolute pixels cannot express a
+  // rhythm that is proportional. A flat 12px binds whenever a column gets more
+  // than about 12 / 0.62 = 19px of slot, so the fill it leaves depends on the
+  // canvas as much as on the series: eight columns is a 16% fill on a 600px
+  // canvas and a 6% one on a 1600px canvas, where the same bars are still 12px
+  // and only the gaps grew. Asserted at both widths, because a single width
+  // would pass a ceiling that merely happened to be tuned for it.
+  for (const W of [600, 1600]) {
+    const fill = (n) => barW(W / n, W) / (W / n);
+    assert.ok(
+      fill(8) > 0.55,
+      `eight columns in a ${W}px canvas must still fill their slots; got ${(fill(8) * 100).toFixed(0)}%`,
+    );
+    // The ceiling earns its place at the counts where 62% would be absurd.
+    assert.ok(
+      barW(W, W) < W * 0.2,
+      `a single bucket in a ${W}px canvas is a column, not the whole canvas`,
+    );
+    // Hairline floor: a day of 15s slots downsamples to hundreds of columns, and
+    // a sub-pixel bar disappears against the grid rather than reading as quiet.
+    for (const n of [1, 8, 96, 420]) {
+      assert.ok(barW(W / n, W) >= 2, `${n} columns in a ${W}px canvas still draw something visible`);
+    }
+  }
+});
