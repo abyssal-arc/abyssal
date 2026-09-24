@@ -27,7 +27,7 @@ import {
 } from '@abyssal/sim';
 import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import {
-  addDecimalUnits, anchorEconProblem, anchorRunway, hexToDecimalUnits, newAnchorEcon,
+  addDecimalUnits, anchorEconProblem, anchorRunway, hexDataToDecimalUnits, hexToDecimalUnits, newAnchorEcon,
   RUNWAY_ALARM_ANCHORS, txFeeUnits, unitScaleProblem, ARC_FEE_DECIMALS, USDC_TOKEN_DECIMALS,
   type AnchorCost, type AnchorEcon,
 } from './econ.js';
@@ -472,11 +472,11 @@ function usdcAddressFromEnv(): string {
   return readEnv('ARC_USDC_ADDRESS') ?? ARC_USDC_ADDRESS;
 }
 
-function defaultChainFeedFromEnv(rpc?: string): ChainFeed {
+function defaultChainFeedFromEnv(rpc?: string, health?: Health): ChainFeed {
   // Arc is the product; the offline rain is an explicit opt-out for working
   // without network (and for hermetic tests), not the default.
   if (readEnv('CHAIN_FEED') === 'synthetic') return new SyntheticFeed();
-  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, usdcAddressFromEnv());
+  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, usdcAddressFromEnv(), { health });
 }
 
 function round1(v: number): number {
@@ -527,7 +527,8 @@ export function createApp(options: AppOptions = {}) {
   const world: World = options.snapshot
     ? resumeWorld(options.snapshot)
     : createWorld(options.seed ?? 1337);
-  const chainFeed: ChainFeed = options.chainFeed ?? defaultChainFeedFromEnv(options.rpc ?? readEnv('ARC_RPC_URL'));
+  const chainFeed: ChainFeed =
+    options.chainFeed ?? defaultChainFeedFromEnv(options.rpc ?? readEnv('ARC_RPC_URL'), options.health);
   /** Non-null when running against Arc: powers /observe and the market feed. */
   const arcFeed = chainFeed instanceof ArcUsdcFeed ? chainFeed : null;
   const marketFeed: MarketFeed =
@@ -667,13 +668,18 @@ export function createApp(options: AppOptions = {}) {
     // tank once a minute.
     const day = Math.floor(world.tick / world.config.ticksPerDay);
     if (day > 0) {
-      void pumpDigest(day - 1).catch((err: unknown) => {
+      // Not awaited for the reason in the comment below; the promise is kept only
+      // so `settleDigest()` can answer "is the pump finished" as a fact rather
+      // than as a wait of some guessed length.
+      digestPumpPromise = pumpDigest(day - 1).catch((err: unknown) => {
         // `advance()` is on the viewer's request path, so the pump cannot be
         // awaited without letting a stalled chain RPC hold up a page load. Not
         // awaiting is fine; not answering for it is not — the record itself
         // records the attempt, this line is only for what escapes it.
         console.error('day digest pump failed: the anchor may be stuck on the previous day', err);
         options.health?.note('digest_pump_failed', err);
+      }).finally(() => {
+        digestPumpPromise = null;
       });
     }
 
@@ -937,6 +943,13 @@ export function createApp(options: AppOptions = {}) {
         salesThisIsolate: dataSales,
         spentPayments: settledNonces.size,
       },
+      // How much of the chain the numbers above are computed from, and how far
+      // that is from what the node offered. Published even when the gap is zero:
+      // a reader cannot see a number they are not given, and `arc_finality_
+      // unavailable` in `signals` is only interpretable beside the height the feed
+      // actually indexed. Null when running on the offline rain, where there is no
+      // chain to have a position on.
+      feed: arcFeed?.finalityStatus() ?? null,
       // What committing a day costs, what pays for it, and for how long that lasts.
       //
       // Every quantity is an integer count of base units plus the scale it is
@@ -1067,6 +1080,13 @@ export function createApp(options: AppOptions = {}) {
    * durable while this flag is not, which is the point of keeping them apart.
    */
   let digestPumpInFlight = false;
+  /**
+   * The pump run currently outstanding, or null when the pump is idle. Kept
+   * beside the re-entry guard rather than instead of it: the guard exists so a
+   * tick never starts a second pump, and this exists so something can wait for
+   * the one already going. Both are needed, and neither is the other.
+   */
+  let digestPumpPromise: Promise<void> | null = null;
 
   /**
    * The day book, oldest first. Written where the commitment is made — see
@@ -1388,8 +1408,25 @@ export function createApp(options: AppOptions = {}) {
     return `${BALANCE_OF_SELECTOR}${bare.padStart(64, '0')}`;
   }
 
-  /** One JSON-RPC call whose answer is a hex quantity, returned as decimal units. */
-  async function rpcDecimalUnits(rpc: string, method: string, params: unknown[]): Promise<string | null> {
+  /**
+   * One JSON-RPC call whose answer is a hex number, returned as decimal units.
+   *
+   * `shape` is required rather than defaulted because the wire has two kinds of
+   * hex number and they disagree about leading zeros: a quantity is written
+   * minimally, a `DATA` word is padded to 32 bytes. Reading one as the other is
+   * silent — the reader answers `null`, which is the shape of "the node had no
+   * number" — which is how the token balance below stayed unreadable while every
+   * node on both endpoints was answering it. The silence is why an answer this
+   * reader will not believe is counted below: `bothRead: false` is a fact a
+   * reader has to think to look for, and a counter is the one thing that arrives
+   * on its own.
+   */
+  async function rpcDecimalUnits(
+    rpc: string,
+    method: string,
+    params: unknown[],
+    shape: 'quantity' | 'data',
+  ): Promise<string | null> {
     const res = await globalThis.fetch(rpc, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1400,7 +1437,18 @@ export function createApp(options: AppOptions = {}) {
     // "method not found" and a node that says "0x0" are different news, and the
     // counted reason below wants to know which of them happened.
     if (j.error) throw new Error(`${method}: ${j.error.message ?? 'rpc error'}`);
-    return hexToDecimalUnits(j.result ?? null);
+    const raw = j.result ?? null;
+    const units = shape === 'data' ? hexDataToDecimalUnits(raw) : hexToDecimalUnits(raw);
+    if (units === null) {
+      // Not a refusal, and not a balance: an answer that arrived in a shape this
+      // reader was not willing to believe. The bytes go into the reason because
+      // "who padded what" is the only question a reader of `/health` can then
+      // ask, and because the previous version of this line had no answer for it.
+      const seen = typeof raw === 'string' ? `${raw.slice(0, 14)}${raw.length > 16 ? '…' : ''} (${raw.length - 2} hex digits)` : String(raw);
+      console.error(`anchor economics: ${method} answered ${seen}, which does not read as ${shape}`);
+      options.health?.note('anchor_econ_unreadable', `${method} answered ${seen}, which does not read as ${shape}`);
+    }
+    return units;
   }
 
   /**
@@ -1452,8 +1500,11 @@ export function createApp(options: AppOptions = {}) {
     let tokenUnits: string | null;
     try {
       [balanceUnits, tokenUnits] = await Promise.all([
-        rpcDecimalUnits(rpc, 'eth_getBalance', [signer, 'latest']),
-        rpcDecimalUnits(rpc, 'eth_call', [{ to: usdcAddressFromEnv(), data: balanceOfCalldata(signer) }, 'latest']),
+        rpcDecimalUnits(rpc, 'eth_getBalance', [signer, 'latest'], 'quantity'),
+        // `data`, because a contract call's return is a padded word and not a
+        // minimal quantity. The two differ here by one leading zero and the
+        // difference is whether this account's USDC balance is ever published.
+        rpcDecimalUnits(rpc, 'eth_call', [{ to: usdcAddressFromEnv(), data: balanceOfCalldata(signer) }, 'latest'], 'data'),
       ]);
     } catch (err) {
       console.error('anchor economics not read: /health keeps reporting the last figures it has, with their age', err);
@@ -2745,6 +2796,50 @@ export function createApp(options: AppOptions = {}) {
       return fetch(req);
     },
     world,
+    /**
+     * Wait until the anchor pump has nothing outstanding.
+     *
+     * The pump's last act after a day confirms is the economics read: two RPC
+     * calls that land *after* the record already says `confirmed`, because nothing
+     * on a viewer's request path may block on the chain. So "the day is confirmed,
+     * therefore `/health` has the balances" is not a valid inference — an assertion
+     * built on it passes while a local stub answers in microseconds and fails when
+     * the machine is busy, which is how the anchor figures came to be read
+     * intermittently. This waits on the pump rather than on a guessed length of
+     * time, so it cannot be too short, and it reports a pump that never settles
+     * instead of hanging forever.
+     *
+     * That last clause is why the wait is raced against a timer instead of
+     * awaited: a pump parked on a chain call that never answers would sit out an
+     * `await` indefinitely, and a deadline checked afterwards could only ever
+     * describe a pump that had already finished.
+     */
+    async settleDigest(ms = 3_000): Promise<void> {
+      const deadline = Date.now() + ms;
+      while (digestPumpPromise) {
+        // The run this pass is waiting on, held separately: by the time it
+        // resolves the field has been cleared, so a field that still names this
+        // exact promise afterwards means nothing released it.
+        const outstanding = digestPumpPromise;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const stalled = new Promise<true>((resolve) => {
+          timer = setTimeout(() => resolve(true), Math.max(0, deadline - Date.now()));
+        });
+        try {
+          const settled = await Promise.race([outstanding.then(() => false), stalled]);
+          // Two ways to be stuck, and the second is the one that would otherwise
+          // hang: a pump that never answers (the timer wins), and a pump that did
+          // answer but was never marked as finished. Waiting on the latter again
+          // would re-await an already-resolved promise forever, so it is reported
+          // rather than looped on.
+          if (settled || digestPumpPromise === outstanding) {
+            throw new Error(`the anchor pump never settled within ${ms}ms`);
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    },
     /**
      * Advance the world to wall-clock now for runtimes that cannot hold a
      * 250ms interval (a Worker isolate sleeps between requests). The chain is

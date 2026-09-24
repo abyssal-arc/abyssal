@@ -42,6 +42,7 @@
  */
 import { Rng } from '@abyssal/sim';
 import type { ChainFeed, ChainSample, ChainTx, FeedState, MeterState, PulseRow } from './chain.js';
+import type { Health } from './health.js';
 import type { MarketSample } from './market.js';
 import {
   classifyVenue,
@@ -66,8 +67,37 @@ const NON_ACTORS = new Set([
   '0x000000000000000000000000000000000000dead',
 ]);
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-/** Arc produces a block roughly every 500ms. */
+/**
+ * Arc produces a block roughly every 500ms.
+ *
+ * Re-measured rather than taken on trust: 13 consecutive blocks spanned 6s (mean
+ * 0.5s, median 1s) on the configured endpoint and the same shape on the public
+ * one, and the head moved 18 blocks in the ~12.5s between batched samples.
+ */
 const BLOCK_MS = 500;
+/**
+ * The block tag whose height is the edge of what this feed will count as fact.
+ *
+ * Asked in a single JSON-RPC batch, because asking between calls measures the
+ * script instead of the chain: the first version of this probe read `latest`,
+ * then ten seconds later read `finalized`, and reported finality as sitting 17
+ * blocks *ahead* of the head on a chain that produces a block every 0.5s.
+ * Batched, over six rounds:
+ *
+ *   latest=22509608  safe=22509608  finalized=22509608
+ *   latest=22509612  safe=22509612  finalized=22509612
+ *   …
+ *   latest=22509626  safe=22509626  finalized=22509626
+ *
+ * Lag zero in every round, with `pending` answering null — the shape of a chain
+ * with instant finality, where a node will not show you a block it has not
+ * already agreed to. So indexing against `finalized` instead of `latest` changes
+ * nothing observable today, and that is the point: it is the difference between a
+ * feed that happens to read confirmed blocks and one that will not read anything
+ * else. Should a node start lagging, the lag appears as `finalityLagBlocks` and
+ * the head stops being counted with no code in between to reconsider.
+ */
+const FINALITY_TAG = 'finalized';
 const LOG_CHUNK_BLOCKS = 400;
 /**
  * Blocks per batch when resolving transaction venues. Keeps the per-request
@@ -438,6 +468,13 @@ export interface ArcFeedOptions {
   maxFlows?: number;
   maxPulse?: number;
   maxPending?: number;
+  /**
+   * Where to record that the node refused the finality tag. Optional because the
+   * feed is also built in tests and against endpoints nobody is monitoring; a
+   * feed with nowhere to report still refuses to index past what it was told is
+   * final, which is the part that protects the reader.
+   */
+  health?: Health;
 }
 
 export class ArcUsdcFeed implements ChainFeed {
@@ -459,6 +496,12 @@ export class ArcUsdcFeed implements ChainFeed {
   private readonly maxPending: number;
 
   private lastBlock = -1;
+  /**
+   * The head as of the last completed poll, kept only to be subtracted from
+   * `lastBlock`. -1 until a poll has run, which is reported as unknown.
+   */
+  private headBlock = -1;
+  private readonly health: Health | null;
   private lastPollAt = 0;
   private inflight: Promise<void> | null = null;
   private flows: UsdcFlow[] = [];
@@ -482,6 +525,7 @@ export class ArcUsdcFeed implements ChainFeed {
     this.maxFlows = opts.maxFlows ?? 6000;
     this.maxPulse = opts.maxPulse ?? 5760; // 24h of 15s buckets, for /history/pulse
     this.maxPending = opts.maxPending ?? 2000;
+    this.health = opts.health ?? null;
   }
 
   /** Market-feed view: turbulence of the USDC flow (0..1). */
@@ -550,6 +594,7 @@ export class ArcUsdcFeed implements ChainFeed {
   exportState(): FeedState {
     return {
       lastBlock: this.lastBlock,
+      headBlock: this.headBlock,
       level: this.level.exportState(),
       turbulence: this.turbulence.exportState(),
       chainTemp: this.chainTemp,
@@ -572,6 +617,16 @@ export class ArcUsdcFeed implements ChainFeed {
     // compute `from = lastBlock + 1` off garbage and read a range nobody chose.
     // Leaving it at -1 costs a backfill, which is the cold-start path anyway.
     if (Number.isInteger(s.lastBlock) && s.lastBlock >= 0) this.lastBlock = s.lastBlock;
+    // The same test for the same reason: a height that is not one is worth less
+    // than no height at all, which reports unknown instead of guessing.
+    if (Number.isInteger(s.headBlock) && (s.headBlock as number) >= 0)
+      this.headBlock = s.headBlock as number;
+    // And a rule neither height can carry on its own. A poll records the two
+    // together and the head is never below what it indexed to, so a stored head
+    // behind the cursor means the halves did not come from one poll. It cannot be
+    // clamped to a lag of zero — that is the reassuring reading of a ledger that
+    // has stopped meaning anything — so the head goes and the gap reports unknown.
+    if (this.headBlock < this.lastBlock) this.headBlock = -1;
     if (s.level) this.level.importState(s.level);
     if (s.turbulence) this.turbulence.importState(s.turbulence);
     if (Number.isFinite(s.chainTemp)) this.chainTemp = clamp01(s.chainTemp);
@@ -838,6 +893,8 @@ export class ArcUsdcFeed implements ChainFeed {
       chainId: ARC_CHAIN_ID,
       usdc: this.usdc,
       lastBlock: this.lastBlock,
+      headBlock: this.headBlock,
+      finalityLagBlocks: this.finalityLag,
       windowSeconds,
       stats: {
         transfers,
@@ -983,14 +1040,26 @@ export class ArcUsdcFeed implements ChainFeed {
     try {
       const latest = parseInt((await this.rpc('eth_blockNumber', [])) as string, 16);
       if (!Number.isFinite(latest)) throw new Error('bad block number');
+      // Everything below walks to `upTo` rather than to the head: the height the
+      // node itself calls final, never more than the head it just reported (see
+      // FINALITY_TAG). Today those are the same number on the deployed endpoint,
+      // so this is not a behaviour change — it is the reason a future one would
+      // not need to be.
+      const finality = await this.finalizedBlock();
+      const upTo = finality === null ? latest : Math.min(finality, latest);
       // A restored `lastBlock` can be arbitrarily old: the state outlives the
       // object, but the cron that kept it fresh may not have run for an hour.
       // See MAX_LIVE_SPAN for why that resumes as a backfill and not as one
-      // very wide live poll.
-      const isBackfill = this.lastBlock < 0 || latest - this.lastBlock > MAX_LIVE_SPAN;
-      const from = isBackfill ? Math.max(0, latest - this.backfillBlocks) : this.lastBlock + 1;
-      if (from > latest) {
-        this.lastBlock = latest;
+      // very wide live poll. Judged against `upTo`, since `upTo` is the span this
+      // poll is about to walk.
+      const isBackfill = this.lastBlock < 0 || upTo - this.lastBlock > MAX_LIVE_SPAN;
+      const from = isBackfill ? Math.max(0, upTo - this.backfillBlocks) : this.lastBlock + 1;
+      if (from > upTo) {
+        // Nothing new to read. Both heights still move, because "the head is 12
+        // blocks past everything we have counted" is the sentence a lagging node
+        // produces on a poll that indexes nothing.
+        this.lastBlock = upTo;
+        this.headBlock = latest;
         return;
       }
 
@@ -1006,10 +1075,10 @@ export class ArcUsdcFeed implements ChainFeed {
       // concurrency that ceiling was protecting.
       const txVenue = new Map<string, { kind: VenueKind; addr: string | null }>();
       if (!isBackfill) {
-        const venueFrom = Math.max(from, latest - MAX_VENUE_BLOCKS + 1);
-        for (let start = venueFrom; start <= latest; start += VENUE_BATCH) {
+        const venueFrom = Math.max(from, upTo - MAX_VENUE_BLOCKS + 1);
+        for (let start = venueFrom; start <= upTo; start += VENUE_BATCH) {
           const numbers: number[] = [];
-          for (let n = start; n <= Math.min(start + VENUE_BATCH - 1, latest); n++) numbers.push(n);
+          for (let n = start; n <= Math.min(start + VENUE_BATCH - 1, upTo); n++) numbers.push(n);
           try {
             const blocks = (await Promise.all(
               numbers.map((n) => this.rpc('eth_getBlockByNumber', [hex(n), true])),
@@ -1043,8 +1112,8 @@ export class ArcUsdcFeed implements ChainFeed {
       // round-trips — comfortably longer than the isolate that started them
       // stays alive, which is how a feed ends up never completing a single poll.
       const ranges: [number, number][] = [];
-      for (let start = from; start <= latest; start += LOG_CHUNK_BLOCKS) {
-        ranges.push([start, Math.min(start + LOG_CHUNK_BLOCKS - 1, latest)]);
+      for (let start = from; start <= upTo; start += LOG_CHUNK_BLOCKS) {
+        ranges.push([start, Math.min(start + LOG_CHUNK_BLOCKS - 1, upTo)]);
       }
       const chunks = (await Promise.all(
         ranges.map(([s, e]) =>
@@ -1061,7 +1130,13 @@ export class ArcUsdcFeed implements ChainFeed {
       // Promise.all preserves order, so the flows stay block-ascending.
       const logs: RpcLog[] = chunks.flat();
       this.consecutiveFailures = 0;
-      this.lastBlock = latest;
+      // Paired deliberately: `headBlock` is recorded only where `lastBlock` is
+      // committed, so the gap between them always describes a poll that finished.
+      // Setting it at the top of this function would let a poll that threw report
+      // a head it never indexed to, which inflates the one number meant to be
+      // read as "how much of the chain we are declining to count".
+      this.lastBlock = upTo;
+      this.headBlock = latest;
 
       let count = 0;
       let volume = 0;
@@ -1181,6 +1256,77 @@ export class ArcUsdcFeed implements ChainFeed {
       // putting two pulse buckets on the same minute.
       this.lastPollAt = Date.now();
     }
+  }
+
+  /**
+   * Head minus the edge we have indexed, or null while either height is unknown.
+   *
+   * "Unknown" and "caught up" are different answers and only one of them is
+   * reassuring, so this refuses to resolve a missing reading to 0.
+   */
+  private get finalityLag(): number | null {
+    return this.headBlock >= 0 && this.lastBlock >= 0 ? this.headBlock - this.lastBlock : null;
+  }
+
+  /**
+   * How much of the chain this feed has counted, and how far that sits from what
+   * it was offered. Kept apart from `observePayload()` because `/health` wants
+   * those two heights and nothing else: the gap between them is a statement about
+   * trust rather than a chart.
+   */
+  finalityStatus() {
+    return {
+      /** Highest block counted as fact. */
+      indexedUpTo: this.lastBlock,
+      /** Chain head as of the poll that last finished. */
+      head: this.headBlock,
+      lagBlocks: this.finalityLag,
+      /**
+       * Which tag bounds `indexedUpTo`. Constant today, and published anyway: a
+       * reader can only tell "we refuse to index past finality" apart from "we
+       * happen to be reading final blocks" if the rule is named in the answer.
+       */
+      tag: FINALITY_TAG,
+    };
+  }
+
+  /**
+   * The height this node calls final, or null when it will not say.
+   *
+   * Null is not worth throwing over. A node that has never heard of the tag would
+   * otherwise stop the feed dead, and the choice is between "index the head" and
+   * "index nothing at all", which is not close: on a chain with the measured
+   * shape, the head *is* confirmed blocks. So the poll proceeds to the head and
+   * records that it had to — the counter is the whole difference between a feed
+   * that lost a guarantee and one that quietly never had it.
+   */
+  private async finalizedBlock(): Promise<number | null> {
+    let answered: unknown;
+    try {
+      const b = (await this.rpc('eth_getBlockByNumber', [FINALITY_TAG, false])) as
+        | { number?: unknown }
+        | null;
+      answered = b?.number;
+    } catch (err) {
+      this.health?.note('arc_finality_unavailable', err);
+      return null;
+    }
+    // A quantity, not a word that happens to begin with one. `parseInt('finalized',
+    // 16)` is **15** — the leading `f` is a hex digit — so an endpoint that echoed
+    // the tag back instead of answering with a block would be believed as height
+    // 15, and the feed would then refuse to index anything above it. The stub in
+    // api.test.ts did precisely that on the first run of this code, which is
+    // better evidence for checking the shape of an answer than any amount of
+    // trusting the method name. The refused value is carried into the detail for
+    // the same reason: "not a number" does not say what arrived.
+    const height = typeof answered === 'string' && /^0x[0-9a-f]{1,16}$/i.test(answered)
+      ? parseInt(answered, 16)
+      : NaN;
+    if (!Number.isFinite(height)) {
+      this.health?.note('arc_finality_unavailable', `${FINALITY_TAG} answered ${JSON.stringify(answered)} as a block number`);
+      return null;
+    }
+    return height;
   }
 
   private async rpc(method: string, params: unknown[]): Promise<unknown> {

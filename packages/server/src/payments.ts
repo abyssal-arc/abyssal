@@ -224,8 +224,22 @@ export async function verifyBurnReceipt(
   }
   if (!receipt) return { ok: false, reason: 'receipt not found' };
   if (receipt.status !== '0x1') return { ok: false, reason: 'transaction reverted' };
-  // A receipt that is not final yet must not be spendable: wait for at least
-  // one confirmation so a reorged payment can never buy an intervention.
+  // The payment must already sit in a block the node has moved past.
+  //
+  // Stated precisely because the comment here used to claim more than the code
+  // buys: it said "at least one confirmation, so a reorged payment can never buy
+  // an intervention". Arc produces a block roughly every 0.5s (measured: 13
+  // consecutive blocks spanning 6s), so one block of depth is about half a second
+  // — not a defence against a reorg on a chain that ever had one. What the check
+  // does prove is that the transaction is in a block that is not the current head,
+  // which is a real and smaller claim: the node has built at least one block since
+  // it landed. Measured on the same endpoint, `eth_getBlockByNumber` for `pending`
+  // answers null on one node and `-32014 requested data not available` on the
+  // other, which is the shape of a chain that does not keep an unfinalised tip to
+  // be moved past in the first place.
+  //
+  // The indexing rule that does bound itself by finality is in arc.ts
+  // (`FINALITY_TAG`); this is not that rule and must not be read as if it were.
   const head = await rpcCall(rpcUrl, 'eth_blockNumber', []);
   const latest = typeof head === 'string' ? parseInt(head, 16) : NaN;
   const at = typeof receipt.blockNumber === 'string' ? parseInt(receipt.blockNumber, 16) : NaN;

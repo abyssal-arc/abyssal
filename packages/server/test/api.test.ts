@@ -1418,7 +1418,11 @@ type StubTxAt = StubTx | ((block: number) => StubTx | null | undefined);
  * `stats.x402Count`; pass `tx` to put it on a different one.
  * `calls` counts polls and block fetches so a test can tell one round of RPC
  * from two, `setHead` moves the chain forward between polls to widen a span,
- * and `delayMs` makes a poll slow enough to outlast the feed's own throttle —
+ * `setFinalityLag` holds the named finality tags that many blocks behind the head
+ * (0, as the deployed endpoint answers today), `setFinalityRefused` makes the node
+ * answer `finalized` with an error instead, `setFinalityEcho` makes it repeat the
+ * tag back where the height belongs, and `delayMs` makes a poll slow enough to
+ * outlast the feed's own throttle —
  * without it a local stub answers in under a millisecond and the throttle can
  * never be observed expiring.
  */
@@ -1448,8 +1452,26 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?:
    * venue lookup can actually hit.
    */
   const txHash = (n: number) => `0x${(n * 100).toString(16).padStart(64, '0')}`;
-  const calls = { heads: 0, blocks: 0 };
+  const calls = { heads: 0, blocks: 0, tags: 0 };
+  /** Every `[fromBlock, toBlock]` the feed asked for, as heights. */
+  const logRanges: [number, number][] = [];
   let currentHead = head;
+  let finalityLag = 0;
+  let refuseFinality = false;
+  let echoTags = false;
+  /**
+   * The height a named tag refers to, the way a node resolves it. Hex answers
+   * itself. The point of doing this in the stub rather than letting it echo the
+   * parameter is that an echo is what the real code mistook for block 15 on the
+   * first run: `parseInt('finalized', 16)` is 15 because `f` is a hex digit.
+   */
+  const askedHeight = (asked: string): number => {
+    if (/^0x[0-9a-f]+$/i.test(asked)) return parseInt(asked, 16);
+    if (asked === 'finalized' && refuseFinality) return NaN;
+    if (asked === 'latest' || asked === 'pending') return currentHead;
+    if (asked === 'finalized' || asked === 'safe') return currentHead - finalityLag;
+    return NaN;
+  };
   const server = createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
@@ -1458,16 +1480,36 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?:
     // asynchronously, and counting it only when answered would let an assertion
     // run before the extra request had shown up.
     if (call.method === 'eth_blockNumber') calls.heads++;
-    if (call.method === 'eth_getBlockByNumber') calls.blocks++;
+    if (call.method === 'eth_getBlockByNumber') {
+      // Counted by what was asked for, not just by the method. `calls.blocks` is
+      // the venue path's full-block fetches, which is what the assertions about
+      // "a backfill fetches no blocks" mean; the finality probe asks the same
+      // method for a named tag and would otherwise be mistaken for venue work.
+      const asked = String(call.params?.[0] ?? '');
+      if (/^0x[0-9a-f]+$/i.test(asked)) calls.blocks++;
+      else calls.tags++;
+    }
     if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     let result: unknown = { transactions: [] };
     if (call.method === 'eth_blockNumber') {
       result = `0x${currentHead.toString(16)}`;
     } else if (call.method === 'eth_getBlockByNumber') {
-      const n = parseInt(call.params?.[0] as string, 16);
+      const n = askedHeight(String(call.params?.[0] ?? ''));
+      if (!Number.isFinite(n)) {
+        // A tag this stub does not know is reported the way an unsupported tag is
+        // reported by a node that has never heard of it, so a test can tell "the
+        // feed asked for something odd" apart from "the feed asked and was told a
+        // height".
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32602, message: `unknown block tag: ${String(call.params?.[0])}` } }));
+        return;
+      }
       const b = txAt(n);
+      const asked = String(call.params?.[0] ?? '');
       result = {
-        number: call.params?.[0],
+        // An endpoint that echoes the tag back in the place a block height goes,
+        // for callers stubborn enough to keep asking it that way.
+        number: echoTags && !/^0x/i.test(asked) ? asked : `0x${n.toString(16)}`,
         transactions: [{
           hash: txHash(n),
           from: relayer,
@@ -1478,6 +1520,12 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?:
     } else if (call.method === 'eth_getLogs') {
       const p = (call.params?.[0] ?? {}) as Record<string, string>;
       const start = parseInt(p.fromBlock, 16);
+      const end = parseInt(p.toBlock, 16);
+      // Recorded so a test can assert on what the feed *asked for* and not only on
+      // what it got back: this stub answers any range with the same handful of
+      // transfers, so a poll that walked past the height it meant to count is
+      // invisible in the logs it receives and plain in the request it sent.
+      logRanges.push([start, end]);
       result = Array.from({ length: transfersPerChunk }, (_, i) => {
         // The amount is per block for the same reason the body is: ranking two
         // venues against each other needs one to carry more value and the other
@@ -1496,7 +1544,17 @@ function chainRpcStub(head: number, transfersPerChunk: number, delayMs = 0, tx?:
     res.setHeader('content-type', 'application/json');
     res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
   });
-  return { server, calls, setHead: (n: number) => { currentHead = n; } };
+  return {
+    server,
+    calls,
+    logRanges,
+    setHead: (n: number) => { currentHead = n; },
+    setFinalityLag: (n: number) => { finalityLag = n; },
+    /** Answer the finality tag with `unknown block tag`, like a node that never heard of it. */
+    setFinalityRefused: (on: boolean) => { refuseFinality = on; },
+    /** Put the tag itself where the block height belongs, for every named tag. */
+    setFinalityEcho: (on: boolean) => { echoTags = on; },
+  };
 }
 
 test("a feed that has not landed a poll cannot claim 'live'", async () => {
@@ -1828,6 +1886,279 @@ test('a stored block too far behind re-backfills instead of reporting the gap as
     );
   } finally {
     rpc.close();
+  }
+});
+
+/* ---------- which blocks a poll is willing to count as fact ---------- */
+
+test('the feed counts what the node calls final, not whatever it last offered', async () => {
+  // Every number this observatory publishes — the temperature, the pulse, which
+  // rail a transfer travelled on — is computed over the blocks one poll walked,
+  // so "which blocks" is not chain plumbing: it is the scope of every claim on
+  // the page. Measured against the deployed endpoint, that scope is currently the
+  // whole chain — asked inside one JSON-RPC batch, `latest`, `safe` and
+  // `finalized` name the same height in every round, and `FINALITY_TAG` in arc.ts
+  // carries the sample. So the rule below has no visible effect in production
+  // today, which is exactly why it needs a test: the alternative is discovering
+  // what the feed indexes on the day a node starts lagging and something
+  // unmeasured starts reaching the page.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, calls, logRanges, setFinalityLag } = chainRpcStub(HEAD, 2);
+  setFinalityLag(500);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    await feed.settle();
+    assert.ok(calls.tags > 0, 'the poll asked the node which block it calls final');
+    assert.equal(feed.finalityStatus().indexedUpTo, HEAD - 500, 'and indexed to that height and no further');
+    const status = feed.finalityStatus();
+    assert.equal(status.head, HEAD, 'the head it declined is recorded beside what it counted');
+    assert.equal(status.lagBlocks, 500, 'so the gap is a number a reader can watch rather than a property of the code');
+    assert.equal(status.tag, 'finalized', 'the answer names which rule bounds the height');
+    const obs = feed.observePayload();
+    assert.equal(obs.lastBlock, HEAD - 500, 'the published window ends at finality, not at the tip');
+    assert.equal(obs.finalityLagBlocks, 500);
+    assert.ok(logRanges.length > 0, 'the walk did ask for logs');
+    assert.ok(
+      logRanges.every(([, end]) => end <= HEAD - 500),
+      `no chunk it asked for reaches above the ceiling (asked: ${JSON.stringify(logRanges)})`,
+    );
+    assert.ok(
+      obs.flows.every((f) => f.block <= HEAD - 500),
+      'and no flow in it came from a block above the height the poll claims to have counted',
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('a finality answer ahead of the head is clamped to the head, not believed', async () => {
+  // Not a hypothetical ordering: the first probe of this measured `latest`, waited
+  // ten seconds, then measured `finalized` — and got a finality 17 blocks *ahead*
+  // of the head on a chain that produces a block every half second. That was the
+  // probe measuring its own sleep rather than the chain, and it is also exactly the
+  // shape a node produces whenever the two answers come from different moments.
+  // Trusting the higher of the two would index blocks this feed has never been
+  // told exist, and publish a negative lag while doing it.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, setFinalityLag } = chainRpcStub(HEAD, 2);
+  setFinalityLag(-200);   // a node whose `finalized` sits 200 blocks above its head
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    await feed.settle();
+    const status = feed.finalityStatus();
+    assert.equal(status.indexedUpTo, HEAD, 'the head it reported is the ceiling, whichever answer is higher');
+    assert.equal(status.lagBlocks, 0, 'and the gap is zero rather than the -200 the two answers imply');
+    const obs = feed.observePayload();
+    assert.equal(obs.finalityLagBlocks, 0);
+    assert.ok(
+      obs.flows.every((f) => f.block <= HEAD),
+      'no flow was invented from a block above the head',
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('a node that will not name a final block says so, and so does the feed', async () => {
+  // A tag an endpoint has never heard of is not a reason to stop observing the
+  // chain: the choice is between indexing the head and indexing nothing at all,
+  // and on a chain whose head *is* confirmed blocks that is not close. What the
+  // feed must not do is fall back silently, because "we only index final blocks"
+  // would then be a sentence about some other node's answer. So the degradation
+  // is counted, and the count is what separates a guarantee that lapsed from one
+  // that was never in play.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, calls, setFinalityRefused } = chainRpcStub(HEAD, 2);
+  setFinalityRefused(true);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const health = createHealth();
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0, health });
+    await feed.settle();
+    const status = feed.finalityStatus();
+    assert.equal(status.indexedUpTo, HEAD, 'the poll went on to the head it was offered');
+    assert.equal(status.lagBlocks, 0, 'and says plainly that it is not holding anything back');
+    assert.ok(calls.tags > 0, 'it asked anyway — the fallback is the answer to the question, not a refusal to ask');
+    assert.equal(health.view().counts.arc_finality_unavailable, 1, 'one poll, one record of having had to fall back');
+    assert.match(
+      health.view().last.arc_finality_unavailable.detail,
+      /unknown block tag: finalized/,
+      'with the node\'s own reason, not just the fact of it',
+    );
+    assert.ok(feed.observePayload().stats.transfers > 0, 'and the degradation is a footnote to a poll that still worked');
+  } finally {
+    server.close();
+  }
+});
+
+test('an answer that repeats the question is not a block height', async () => {
+  // `parseInt('finalized', 16)` is 15: the leading `f` is a hex digit. So an
+  // endpoint that echoes the requested tag back where the height belongs is read
+  // as block 15 by any parser that only parses, and a feed that believed it would
+  // stop indexing 4,081 blocks short of the head while reporting a lag it had
+  // invented. This is not a hypothetical shape — the stub in this file answered
+  // that way on the first run of the code above, and the twelve failures it
+  // produced are the evidence for checking an answer's shape rather than trusting
+  // the name of the method that produced it.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, setFinalityEcho } = chainRpcStub(HEAD, 2);
+  setFinalityEcho(true);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const health = createHealth();
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0, health });
+    await feed.settle();
+    const status = feed.finalityStatus();
+    assert.equal(status.indexedUpTo, HEAD, 'the tag was refused, so the head stands — instead of 15, which is what reading it as a height gives');
+    assert.equal(health.view().counts.arc_finality_unavailable, 1);
+    assert.match(
+      health.view().last.arc_finality_unavailable.detail,
+      /finalized answered "finalized" as a block number/,
+      'and the detail carries what actually arrived, because "not a number" does not say',
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('the two heights a finality reading needs survive the isolate that took them', async () => {
+  // `lastBlock` on its own is half a claim: it says where the feed stopped, not
+  // how far that was from what it was offered. A lag of zero read from a ledger
+  // that never stored a head would be the reassuring answer and the wrong one,
+  // so both heights are persisted together, and a ledger written before either
+  // existed reports unknown rather than a gap nobody measured.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, calls } = chainRpcStub(HEAD, 2);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const first = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    await first.settle();
+    const exported = first.exportState();
+    assert.equal(exported.headBlock, HEAD, 'the head is part of what goes into the ledger');
+    const pollsBefore = calls.heads;
+    const second = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    second.importState(exported);
+    assert.deepEqual(second.finalityStatus(), first.finalityStatus(), 'and comes back with the same reading');
+    assert.equal(calls.heads, pollsBefore, 'which it did not have to ask the chain for');
+
+    const legacy = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, {});
+    legacy.importState({ ...feedStateAt(2000), headBlock: undefined });
+    assert.equal(legacy.finalityStatus().indexedUpTo, 2000, 'the cursor a pre-finality ledger does carry');
+    assert.equal(legacy.finalityStatus().lagBlocks, null, 'and not the gap it never measured');
+
+    // A head behind the cursor cannot be a lag, and clamping it to one would turn
+    // a ledger whose two halves came apart into a chain that looks fully indexed.
+    const backwards = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, {});
+    backwards.importState({ ...feedStateAt(2000), headBlock: 1500 });
+    assert.equal(backwards.finalityStatus().head, -1, 'the unusable head was dropped rather than believed');
+    assert.equal(backwards.finalityStatus().lagBlocks, null, 'and the gap it would have produced is not published as zero');
+    assert.equal(backwards.finalityStatus().indexedUpTo, 2000, 'while the half that can still be used is kept');
+  } finally {
+    server.close();
+  }
+});
+
+test('a live poll under a lagging node resolves its rails without reaching past the ceiling', async () => {
+  // A backfill reads no transaction bodies at all, so the tests above cannot see
+  // the venue walk — and that walk is the part of a live poll that costs RPC
+  // calls. Bounding it at the same height as everything else is not decoration:
+  // an unbounded one would buy block bodies for transfers the log walk was told
+  // not to count, and the rails panel would be drawing a window nobody agreed on.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, calls, setFinalityLag } = chainRpcStub(HEAD, 2);
+  setFinalityLag(500);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    // 100 blocks behind the finality edge, which is a missed beat rather than
+    // history: a live poll, the only kind that resolves venues.
+    feed.importState(feedStateAt(HEAD - 500 - 100));
+    await feed.settle();
+    const obs = feed.observePayload();
+    assert.equal(calls.blocks, 100, 'one block body per block in the counted span, and none above it');
+    assert.ok(obs.stats.resolved > 0, 'the rails were read, lagging node notwithstanding');
+    assert.equal(obs.lastBlock, HEAD - 500);
+    assert.ok(obs.flows.every((f) => f.block <= HEAD - 500));
+  } finally {
+    server.close();
+  }
+});
+
+test('a poll with nothing new to count still reports how far the head moved', async () => {
+  // The other half of publishing two heights: a poll that indexes nothing is
+  // exactly when the gap between them changes, because "the node is falling
+  // behind" arrives as a head that outruns a ceiling that does not. Writing both
+  // heights only where work was done would freeze the one number an operator
+  // watches, and freeze it at the reassuring value.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 4096;
+  const { server, calls, setFinalityLag, setHead } = chainRpcStub(HEAD, 2);
+  setFinalityLag(500);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    await feed.settle();
+    const before = feed.finalityStatus();
+    assert.equal(before.indexedUpTo, HEAD - 500);
+    const polls = calls.heads;
+    // 200 blocks of new chain, none of it final: the ceiling does not move, the
+    // head does, and the poll has nothing to walk.
+    setHead(HEAD + 200);
+    setFinalityLag(700);
+    await feed.settle();
+    const after = feed.finalityStatus();
+    assert.ok(calls.heads > polls, 'a poll did run');
+    assert.equal(after.indexedUpTo, before.indexedUpTo, 'and counted nothing, as it should');
+    assert.equal(after.head, HEAD + 200, 'while still recording what it was offered');
+    assert.equal(after.lagBlocks, 700, 'which is the only way the lag it is now holding is visible');
+  } finally {
+    server.close();
+  }
+});
+
+test('a feed the handler builds for itself reports to the counters the handler owns', async () => {
+  // Every other finality test names the health view when constructing the feed.
+  // Production does not: the tank asks `createApp` for a feed and never sees the
+  // one it got. That wiring is where the digest key went missing in September —
+  // configured, read by the code that had a counter, and never handed to the one
+  // that did the work — so the app-built feed gets its own test rather than
+  // inheriting confidence from a constructor call in a file that ships nothing.
+  const HEAD = 4096;
+  const { server, setFinalityRefused } = chainRpcStub(HEAD, 2);
+  setFinalityRefused(true);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const had = process.env.CHAIN_FEED;
+  delete process.env.CHAIN_FEED;   // the suite pins the offline rain; this test is about the other branch
+  try {
+    const health = createHealth();
+    const app = createApp({ seed: 1, store: memStore().store, rpc: url, health, marketFeed: quietMarket });
+    await app.warmFeed();
+    const body = await readHealth(app);
+    assert.ok(body.feed, 'the app made an Arc feed, and says so instead of publishing nothing');
+    assert.equal(body.feed?.indexedUpTo, HEAD, 'a refused tag did not stop the poll');
+    assert.equal(health.view().counts.arc_finality_unavailable, 1, 'and the refusal landed in the counters the reader is shown');
+    assert.match(healthDetail(body, 'arc_finality_unavailable'), /unknown block tag/);
+    assert.equal(body.data.arcFeed, true, 'and `data` agrees that this tank is on Arc, which is what the feed block is a claim about');
+  } finally {
+    if (had !== undefined) process.env.CHAIN_FEED = had;
+    else process.env.CHAIN_FEED = 'synthetic';
+    server.close();
   }
 });
 
@@ -2501,9 +2832,21 @@ const DIGEST_GAS_USED = '0x7738';
 const DIGEST_GAS_PRICE = '0x4a817c800';
 const DIGEST_COST_UNITS = 30520n * 20000000000n;
 
+/**
+ * A contract's answer, in the shape a contract actually sends it: one 32-byte word,
+ * zero-padded on the left.
+ *
+ * `eth_getBalance` is not written this way — a quantity is minimal — and this stub
+ * used to answer both calls minimally, which is how a reader that refused leading
+ * zeros passed every test in this file while refusing every answer the real chain
+ * sent. A fixture that records the value it concluded with, instead of the bytes it
+ * observed, cannot catch that class of mistake at all.
+ */
+const dataWord = (units: bigint): string => `0x${units.toString(16).padStart(64, '0')}`;
+
 /** The two balances the stub reports by default: the same 1 USDC at each scale. */
 const STUB_FEE_BALANCE = `0x${(10n ** 18n).toString(16)}`;
-const STUB_USDC_BALANCE = `0x${(10n ** 6n).toString(16)}`;
+const STUB_USDC_BALANCE = dataWord(10n ** 6n);
 
 type DigestRpc = {
   url: string;
@@ -2517,6 +2860,13 @@ type DigestRpc = {
   setBalances: (feeUnits: string, tokenUnits: string) => void;
   /** Make the next `eth_call` fail the way a node fails: an error answer, not a null. */
   setCallError: (message: string | null) => void;
+  /**
+   * Hold up the two balance reads by `ms`. The day is already `confirmed` when
+   * they go out — they are the pump's tail — so this is the knob that turns "an
+   * assertion that races the tail" from an occasional failure on a busy machine
+   * into a certain one in CI.
+   */
+  setBalanceLatency: (ms: number) => void;
   close: () => void;
 };
 
@@ -2539,11 +2889,17 @@ async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
   let feeBalance = STUB_FEE_BALANCE;
   let tokenBalance = STUB_USDC_BALANCE;
   let callError: string | null = null;
+  let balanceLatencyMs = 0;
   const server = createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
     const call = JSON.parse(body || '{}') as { method?: string; params?: unknown[] };
     methods.push(call.method ?? '');
+    // Delayed after `methods.push` and before the answer, so a test can tell "the
+    // read was made and was slow" from "the read was never made".
+    if (balanceLatencyMs > 0 && (call.method === 'eth_getBalance' || call.method === 'eth_call')) {
+      await new Promise((r) => setTimeout(r, balanceLatencyMs));
+    }
     let result: unknown = null;
     switch (call.method) {
       case 'eth_blockNumber': result = '0x100'; break;
@@ -2597,6 +2953,7 @@ async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
     },
     setBalances: (fee, token) => { feeBalance = fee; tokenBalance = token; },
     setCallError: (message) => { callError = message; },
+    setBalanceLatency: (ms) => { balanceLatencyMs = ms; },
     close: () => server.close(),
   };
 }
@@ -3416,6 +3773,17 @@ type HealthBody = {
     salesThisIsolate: number;
     spentPayments: number;
   };
+  /**
+   * Which blocks the numbers above were computed from, and how far the chain had
+   * moved beyond them. Null on the offline rain, which has no chain to hold a
+   * position on.
+   */
+  feed: {
+    indexedUpTo: number;
+    head: number;
+    lagBlocks: number | null;
+    tag: string;
+  } | null;
   world: { tick: number; day: number; ticksPerDay: number; population: number };
   instance: string;
   isolateStartedAt: number | null;
@@ -3478,6 +3846,43 @@ test('/health says nothing at all when nobody is counting', async () => {
   assert.equal(body.signals, null);
   assert.equal(body.storage, null);
   assert.equal(body.problem, null);
+});
+
+test('/health publishes how much of the chain its own numbers were computed from', async () => {
+  // Every meter, flow and census row this endpoint reports is computed over the
+  // blocks one poll walked, and none of them say which. A reader checking the page
+  // against a block explorer wants the height the observatory stopped at, and the
+  // operator wants the gap between that and the head: whether "final" is currently
+  // the whole chain or something short of it is a reading, and a reading that
+  // cannot be looked up can only be argued about.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 8192;
+  const { server, setFinalityLag } = chainRpcStub(HEAD, 2);
+  setFinalityLag(64);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const m = memStore();
+  try {
+    const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+    const app = createApp({ seed: 1, chainFeed: feed, store: m.store, marketFeed: quietMarket });
+    await app.warmFeed();
+    const { value: body, errors } = await quiet(() => readHealth(app));
+    assert.deepEqual(
+      body.feed,
+      { indexedUpTo: HEAD - 64, head: HEAD, lagBlocks: 64, tag: 'finalized' },
+      'the two heights, the gap, and the rule that produced it — in one object',
+    );
+    assert.equal(body.data.arcFeed, true, 'the block agreeing on which feed this is agrees with this one');
+    assert.deepEqual(errors, [], 'publishing a lag is not an alarm: nothing failed here');
+
+    // The offline rain has no chain position to publish, and an invented one is
+    // the difference between `null` and a `0` a reader would take as "fully
+    // indexed" from a feed that never asked the question.
+    const bare = createApp({ seed: 1, ...offlineFeeds });
+    assert.equal((await readHealth(bare)).feed, null);
+  } finally {
+    server.close();
+  }
 });
 
 test('a burn that cannot be stored becomes a number a later isolate can still read', async () => {
@@ -5112,7 +5517,11 @@ test('the cost of a day is read from the receipt, in units that cannot round', (
   // converted across the difference between them, and the ratio is a measurement of
   // Arc (the same money named twice), not a preference.
   assert.equal(ARC_FEE_DECIMALS - USDC_TOKEN_DECIMALS, 12);
-  assert.equal(unitScaleProblem(feeHex(10n ** 18n), '0x' + (10n ** 6n).toString(16)), null);
+  // Hex in, nothing out. The comparison runs across *parsed* quantities, and an
+  // answer that has not become a decimal string is not a scale anybody can check.
+  // Asserted as a refusal on purpose: this line used to read like a passing scale
+  // check while both of its arguments were being discarded inside the function.
+  assert.equal(unitScaleProblem(feeHex(10n ** 18n), dataWord(10n ** 6n)), null, 'hex in is not a claim about the scale');
   assert.equal(unitScaleProblem('1000000000000000000', '1000000'), null, 'decimal strings work too');
   assert.match(unitScaleProblem('1000000000000000000', '5000000') ?? '', /is not .* at 1e12/);
   // Both directions, because a one-sided comparison passes for the other half of
@@ -5193,17 +5602,30 @@ test('a signal reddens the health light only while it is still happening', () =>
   assert.deepEqual(staleSignals(undefined), []);
 });
 
-/** Drive one already-broadcast day to confirmation and hand back what `/health` says. */
+/**
+ * Drive one already-broadcast day to confirmation and hand back what `/health`
+ * says. `balanceLatencyMs` holds up the pump's tail so a caller can tell waiting
+ * for it from getting lucky; the default of 0 leaves every other test in this
+ * family exactly as fast as it has always been.
+ */
 async function anchoredOnce(
   rpc: DigestRpc,
   m: ReturnType<typeof memStore>,
   health: ReturnType<typeof createHealth>,
   day = 0,
+  balanceLatencyMs = 0,
 ): Promise<HealthBody> {
   const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+  rpc.setBalanceLatency(balanceLatencyMs);
   shortenDay(app);
   await tickTimes(app, 4);
   await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === day, `day ${day} confirmed`);
+  // `confirmed` is not the end of the pump: the economics read that fills every
+  // number below is the pump's last act and does two RPC calls *after* the status
+  // flips, because a viewer's tick must never block on the chain. Reading `/health`
+  // without waiting for that tail is what made this family of assertions pass on an
+  // idle machine and fail on a busy one.
+  await app.settleDigest();
   return readHealth(app);
 }
 
@@ -5236,6 +5658,60 @@ test('/health reports a repaired defect as history, not as a present failure', a
   assert.equal(now.stale, null, 'a signal cannot be both current and out of window');
 });
 
+test('the reading beside a confirmed day is waited for, not raced', async () => {
+  // The status flips to `confirmed` and the pump then makes two more RPC calls for
+  // the balances every figure in this file's anchor assertions is computed from. A
+  // local stub answers those in microseconds, which is how those assertions came to
+  // be written as though confirming implied them: they pass on an idle machine,
+  // fail on a busy one, and a failure that only happens under load is one nobody
+  // can reproduce. So the slowness is installed deliberately — with it in place,
+  // deleting the wait in `anchoredOnce()` turns an occasional red into a permanent
+  // one, and the pair of reads below is the difference between waiting for the pump
+  // and guessing how long to sleep.
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      rpc.setBalanceLatency(120);
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 0, 'day 0 confirmed');
+      // Still outstanding at 10ms, which is what the 120ms delay buys: a budget that
+      // only ever expired on a pump that had already finished would be a sleep, and
+      // this is the assertion that says it is not.
+      await assert.rejects(
+        () => app.settleDigest(10),
+        /the anchor pump never settled within 10ms/,
+        'a pump that outruns the budget is reported rather than waited out',
+      );
+      await app.settleDigest();
+      const body = await readHealth(app);
+      assert.ok(rpc.methods.includes('eth_getBalance'), 'the fee balance was read, not assumed');
+      assert.equal(body.anchor.funded.bothRead, true, 'the tail landed before the reading was taken');
+      assert.equal(body.anchor.funded.feeUnits, (10n ** 18n).toString());
+      assert.equal(body.anchor.funded.scaleOk, true);
+      assert.equal(body.anchor.runway.anchors, 1638, 'a runway computed from balances that had arrived');
+      assert.equal(health.view().counts.digest_pump_failed, undefined, 'and nothing failed on the way');
+
+      // The same day through `anchoredOnce()`, the helper every other test in this
+      // family reads its numbers from. Its wait is the line that used to be a coin
+      // flip, so it is the one place the slowness has to be installed too: with it,
+      // deleting that wait fails here on every run rather than on a busy machine.
+      const m2 = memStore();
+      await seedPendingDay(m2, 0);
+      const viaHelper = await anchoredOnce(rpc, m2, createHealth(), 0, 120);
+      assert.equal(viaHelper.anchor.funded.bothRead, true, 'the helper returns after the tail, not after the status');
+      assert.equal(viaHelper.anchor.runway.low, false);
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
 test('a confirmed day says what it cost and how long the account funds', async () => {
   const rpc = await digestRpcStub();
   const m = memStore();
@@ -5259,6 +5735,7 @@ test('a confirmed day says what it cost and how long the account funds', async (
         'for the balance of the address that pays for the anchor',
       );
       assert.ok(errors.every((e) => !/anchor economics|runway/.test(e)), 'a clean read prints nothing');
+      assert.ok(!body.signals?.counts.anchor_econ_unreadable, 'and files no signal about it');
       assert.equal(body.healthy, true, `nothing went wrong: ${body.problem ?? ''}`);
       assert.equal(body.anchor.signer, body.digest?.signer, 'whose balance this is, named once');
       assert.ok(body.anchor.signer, 'with a key configured, there is a signer');
@@ -5302,7 +5779,7 @@ test('a low runway is one event, and falling again after recovering is two', asy
   const poor = 50n * DIGEST_COST_UNITS;
   const rich = 200n * DIGEST_COST_UNITS;
   const stage = async (day: number, feeUnits: bigint) => {
-    rpc.setBalances(feeHex(feeUnits), feeHex(feeUnits / feePerToken));
+    rpc.setBalances(feeHex(feeUnits), dataWord(feeUnits / feePerToken));
     await seedPendingDay(m, day);
     rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
     const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health, day));
@@ -5384,7 +5861,7 @@ test('a chain that stops naming one money with two units is reported, not absorb
       // 1e18 fee units against 5e6 token units: the same account, two incompatible
       // stories. Every conversion in `econ.ts` goes through that ratio, so the
       // runway below would still print — and mean nothing.
-      rpc.setBalances(feeHex(10n ** 18n), feeHex(5n * 10n ** 6n));
+      rpc.setBalances(feeHex(10n ** 18n), dataWord(5n * 10n ** 6n));
       await seedPendingDay(m, 0);
       rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
       const body = await anchoredOnce(rpc, m, health);
@@ -5410,11 +5887,13 @@ test('the account the chain actually reports has dust in it, and is still believ
   try {
     await withDigestKey(async () => {
       // Both figures are the ones the deployed anchor account answered on
-      // 2026-09-24: `0x1156fcae4bf3247f0` from `eth_getBalance` and `0x1310b7c`
-      // from `balanceOf`. The stub's default pair is exactly 1e12 apart, which is
+      // 2026-09-24: `0x1156fcae4bf3247f0` from `eth_getBalance`, and a `balanceOf`
+      // word whose low digits are `1310b7c` — sent padded to a full word, which is
+      // the form that used to be written here unpadded and therefore the form no
+      // test ever exercised. The stub's default pair is exactly 1e12 apart, which is
       // precisely why it was the wrong shape to test this with — a balance with no
       // dust under the six-decimal boundary is not a balance an account holds.
-      rpc.setBalances('0x1156fcae4bf3247f0', '0x1310b7c');
+      rpc.setBalances('0x1156fcae4bf3247f0', dataWord(0x1310b7cn));
       await seedPendingDay(m, 0);
       rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
       const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health));
@@ -5426,6 +5905,119 @@ test('the account the chain actually reports has dust in it, and is still believ
       assert.equal(body.anchor.runway.anchors, 32_751, 'the division is the same one, on the real balance');
       assert.equal(body.anchor.runway.low, false, 'and 32,751 days of commitment is not an alarm');
     });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a contract answers in a padded word, and the reader that knows the difference believes it', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // The stub's default pair is one USDC at each scale, and the token side is
+      // sent the way a node sends it: padded to a full word. Everything asserted
+      // below is the difference between that shape being recognised and the
+      // deployed reader never once having seen the balance it was asked for.
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const body = await anchoredOnce(rpc, m, health);
+      assert.equal(body.anchor.funded.usdcUnits, (10n ** 6n).toString(), 'the padded word is read as the number it is');
+      assert.equal(body.anchor.funded.bothRead, true, 'both halves of the pair are here');
+      assert.equal(body.anchor.funded.scaleOk, true,
+        'and the invariant the two readings exist to check has now actually been checked');
+      assert.equal(body.signals?.counts.arc_unit_scale_unexpected, undefined, 'a check that passes raises nothing');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the two hex shapes on the wire are not interchangeable, in either direction', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // The same 32-byte word sent to the two calls, and only one of them is a
+      // contract answer. A reader that gave up on the distinction — by accepting
+      // padding everywhere, which is the tempting way to fix the bug this test
+      // exists for — would then believe a node that had started padding its
+      // quantities, and the two balances would stop being comparable in silence.
+      rpc.setBalances(dataWord(10n ** 18n), dataWord(10n ** 6n));
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const body = await anchoredOnce(rpc, m, health);
+      assert.equal(body.anchor.funded.feeUnits, null, 'a quantity is minimal, and a padded one is not one');
+      assert.equal(body.anchor.funded.usdcUnits, (10n ** 6n).toString(), 'the call answer is still a balance');
+      assert.equal(body.anchor.funded.bothRead, false, 'half a pair is not a pair');
+      assert.equal(body.anchor.funded.scaleOk, null, 'which is reported as unknowable, not as broken');
+      assert.equal(body.anchor.runway.anchors, null, 'and the division that needs the missing half does not print');
+      assert.equal(body.anchor.runway.unknown, 'balance not read');
+      // Counted as well as published. `/health` saying `bothRead: false` is a fact
+      // only a reader who already suspects something will go and look at; the
+      // signal is the half that arrives on its own, and it names the call that
+      // was refused and the shape it was refused for.
+      assert.equal(body.signals?.counts.anchor_econ_unreadable, 1);
+      assert.match(
+        healthDetail(body, 'anchor_econ_unreadable'),
+        /eth_getBalance answered .*64 hex digits.* does not read as quantity/,
+        'the reason says which call was refused, in roughly what shape',
+      );
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a call that answers with more than one word is not a balance', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // 96 hex digits — the shape of a log topic blob or a list of addresses, which
+      // is what a wrong `to` or a wrong selector answers with. `BigInt` reads it
+      // happily, and the resulting "balance" would be a number nobody can question.
+      rpc.setBalances(STUB_FEE_BALANCE, `0x${'11'.repeat(48)}`);
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const body = await anchoredOnce(rpc, m, health);
+      assert.equal(body.anchor.funded.usdcUnits, null, 'too long to be a word is not a quantity');
+      assert.equal(body.anchor.funded.bothRead, false);
+      assert.equal(body.anchor.funded.feeUnits, (10n ** 18n).toString(), 'the half that answered normally still speaks');
+      assert.equal(body.signals?.counts.anchor_econ_unreadable, 1, 'and the half that did not is counted');
+      assert.match(
+        healthDetail(body, 'anchor_econ_unreadable'),
+        /eth_call answered .*96 hex digits.* does not read as data/,
+        'under the name of the call that was too long, not as a generic failure',
+      );
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the stub answers each hex type the way the chain answers that hex type', async () => {
+  // The fixture's own fidelity, asked directly. Every shape test above reads the
+  // chain through this stub, so a stub that padded both answers — or, worse, one
+  // that quietly went back to minimising both — would leave the reader's shape
+  // rules untested while every test here stayed green.
+  const rpc = await digestRpcStub();
+  const ask = async (method: string, params: unknown[]): Promise<string> => {
+    const res = await fetch(rpc.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    return String((await res.json() as { result?: unknown }).result);
+  };
+  try {
+    const word = await ask('eth_call', [{ to: ARC_USDC, data: '0x70a08231' }, 'latest']);
+    assert.match(word, /^0x[0-9a-f]{64}$/, `a contract answer is a full word, and the stub sent ${word}`);
+    const quantity = await ask('eth_getBalance', ['0x' + '22'.repeat(20), 'latest']);
+    assert.match(quantity, /^0x(0|[1-9a-f][0-9a-f]*)$/, `a quantity stays minimal, and the stub sent ${quantity}`);
   } finally {
     rpc.close();
   }

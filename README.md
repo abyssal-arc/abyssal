@@ -210,7 +210,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (263 total)
+npm test           # sim + server + web tests (277 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -403,6 +403,19 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   a backfill re-reads blocks the feed has counted before and resolves no venues,
   so replacing the series with it would double-count the volume and trade real
   readings for unread ones.
+- **Where the feed is willing to stop.** Every number the observatory publishes is
+  computed from blocks it counted up to some height, and that height used to be
+  whatever the node last offered. Asked on the deployed endpoint, in one JSON-RPC
+  batch so the answer describes the chain rather than the script, `latest`, `safe`
+  and `finalized` name the *same block* in every round of six — and `pending`
+  answers null — which is the shape of a chain with instant finality, where a node
+  will not show you a block it has not already agreed to. So the cursor now follows
+  `finalized` and nothing observable changes today; that is the whole point. It is
+  the difference between a feed that happens to be reading confirmed blocks and one
+  that will not read anything else. The gap between the indexed height and the head
+  is published beside the figures (`finalityLagBlocks`, `feed.lagBlocks`), with
+  "unknown" kept distinct from zero, and a node that stops naming a final block is
+  counted rather than silently followed back to the head.
 - **And the snapshot had outgrown the box it is stored in.** Chasing the chart
   through production logs turned up an error nobody had seen, because it never
   reached a viewer as one: `Error: string or blob too big: SQLITE_TOOBIG`, thrown
@@ -585,7 +598,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/lineage` | Family tree of one creature: `?id=<n>&depth=<n>` returns ancestors and descendants |
 | GET | `/hall-of-fame` | The fossil wall: all-time top five per category |
 | GET | `/who?addr=0x…` | One address in the tank: burns, badges, day pass, board rank, its own battle reports |
-| GET | `/observe` | Arc USDC flow observatory: window stats, venue breakdown (which rail each transfer settled on — x402, swap, ERC-4337, direct), endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
+| GET | `/observe` | Arc USDC flow observatory: window stats, venue breakdown (which rail each transfer settled on — x402, swap, ERC-4337, direct), endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc). The window is named by three heights beside the figures — `lastBlock` is the highest block counted, `headBlock` what the node last offered, `finalityLagBlocks` the gap, null when either height is unknown rather than when it is zero |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
 | GET | `/data/flows` | The paid tier: the flow ring in depth and filtered, `0.001` USDC per query settled through the Facilitator. 402 without a payment header, 503 until the seller key is configured |
 | GET | `/export?pass=0x…&kind=` | Day-pass download of the observation window: `csv`, `replay` or `digest` |
@@ -596,7 +609,7 @@ reading says nothing about whether the digest commit is configured — check
 | DELETE | `/adopt` | Release an adoption: `{addr, creatureId}` |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | Debug only: 404 unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
-| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs and how long the account funds it) and of the data tier. Never cached |
+| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs and how long the account funds it), of the data tier, and of the feed (`feed.indexedUpTo`, `feed.head`, `feed.lagBlocks`, `feed.tag` — the tag that bounds the indexed height is named in the answer, and the whole block is null when running on the offline rain). Never cached |
 | GET | `/ui` | Redirects to `/` |
 
 `OPTIONS` on any path answers 204 with permissive CORS headers; the write routes
@@ -732,12 +745,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-263 tests on `node:test`, no test framework dependency:
+277 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 152 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings that must name one money, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
+| `@abyssal/server` | 166 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings that must name one money, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
 | `@abyssal/web` | 52 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the preview card against the file it names, the run list against the test files on disk, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
@@ -770,18 +783,35 @@ outstanding transaction moved into the ledger, because an eviction between two d
 boundaries used to be able to commit the same day twice.
 
 Whether the account that pays for it can keep paying is measured rather than
-assumed. Each confirmed day is priced from its own receipt — 30,440 gas on day 15's
-transaction and 30,560 on day 28's, roughly `0.00062` of the money each time — and
-the same read asks both `eth_getBalance` and the token contract's `balanceOf` for
-the signing address, so `/health` can publish the division as anchors remaining:
-32,386 of them at the time of writing, which is around five years of closing a day
-every 86.6 minutes. Those two balances are the same money at two different scales,
-so the relationship is re-checked on every read rather than trusted after the
-first: the token figure has to be the fee figure truncated at six decimals, and it
-is a *truncation* because the deployed account carries 355,000,000,000 fee units of
-dust below that boundary — an exact-equality check would have alarmed on the day it
-shipped. Below 90 anchors remaining that becomes a counted alarm, raised once per
-fall rather than once per process.
+assumed. Each confirmed day is priced from its own receipt, read off the chain:
+30,440 gas for day 15's transaction (`0xcc60e690…`), 30,600 for day 35's
+(`0xa2c292fe…`), 30,560 for day 36's (`0x15f88c4b…`) and 30,560 again for day 37's —
+the gas price that moved between them was 20.1 gwei on days 15 and 37 and 20 on the
+other two, so a day costs 611,200,000,000,000 to 614,256,000,000,000 fee units,
+`0.0006` of the money. The newest of those measured costs is what the balance gets
+divided by: at the day-36
+confirmation the account held 19,986,521,442,730,018,800 fee units, which is 32,700
+anchors, five years at the ~82 minutes a day is taking (the last two rows of the
+book are 81.4 and 82.0 minutes apart). Both balances are read at the moment a day
+confirms — two RPC calls a day, not one per page view — and the age of the reading is
+published beside the figures, so a reader can see how stale the arithmetic is
+rather than assume it is current. The same read also asks the token contract
+`balanceOf` for the signing address, not to divide anything with it but to
+check the property every figure in the block depends on: across the 1e12 between the
+chain's two decimal layers, the token balance has to be the fee balance *truncated*
+at six decimals. Truncated, because the account carries dust under that boundary and
+the dust does not hold still: the day-35 read above left 642,730,018,800 fee units
+under the boundary and the day-36 read left 442,730,018,800, while the balance
+between them moved by 611,200,000,000,000 — exactly one day's fee, and nothing about
+either tail divisible by it. An exact-equality check would not have been a one-off
+alarm on the day it shipped; it would have alarmed on every read since. Either half
+missing is published as `scaleOk: null` rather than as a pass, and counted as
+`anchor_econ_unreadable` with the bytes that caused it, because a missing answer is
+exactly what this check spent its first weeks producing: a contract's padded word
+was being read by a parser written for bare quantities, so the account said its
+balance and the reader reported that it had not.
+Below 90 anchors remaining the runway becomes a counted alarm, raised once per fall
+rather than once per process.
 
 Three edges are where they are on purpose:
 

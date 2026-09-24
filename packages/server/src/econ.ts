@@ -67,8 +67,34 @@ export interface AnchorCost {
   gasPrice: string;
 }
 
-/** A `0x`-prefixed hex quantity, as an RPC returns for every gas and value field. */
+/**
+ * A `0x`-prefixed hex quantity: the minimal form the JSON-RPC spec asks a number
+ * to arrive in, which is the form every gas and balance field does arrive in —
+ * `0x1156fcae4bf3247f0`.
+ *
+ * "Minimal" is the entire content of this rule, and it is a rule about
+ * *quantities*. A contract call's return is a different type on the wire — `DATA`,
+ * below — and applying this one to that reads a live answer as absent.
+ */
 const HEX_QUANTITY = /^0x(0|[1-9a-fA-F][0-9a-fA-F]*)$/;
+
+/**
+ * `DATA`: what `eth_call` answers with, a word zero-padded to 64 hex digits.
+ *
+ * The leading zeros are the format, not a defect: the deployed account's
+ * `balanceOf` came back as `0x000000000000000000000000000000000000000000000000000000000130fabc`
+ * on 2026-09-24, which is 19,987,132 and which `HEX_QUANTITY` refuses.
+ *
+ * The length cap is the only strictness, and it is there because the answer is a
+ * number as far as this file is concerned: 64 digits is one word, and longer is
+ * something else that walked into the reader — a topic blob, a list of addresses —
+ * rather than a balance. Zero digits is legal *here* because an empty return is a
+ * well-formed `DATA` value; whether it means anything is the reader's question, and
+ * `hexDataToDecimalUnits` below is where it is answered. Parity is deliberately not
+ * required, because refusing an odd-length word would be making this file's rules
+ * stricter than the wire again, which is the mistake this function exists to undo.
+ */
+const HEX_DATA = /^0x[0-9a-fA-F]{0,64}$/;
 
 /** An integer in decimal, which is how every quantity below is stored. */
 const DECIMAL_INTEGER = /^(0|[1-9][0-9]*)$/;
@@ -103,6 +129,22 @@ export function decimalUnits(value: unknown): string | null {
 /** An RPC hex quantity as a decimal string, or null when it is not one. */
 export function hexToDecimalUnits(hex: unknown): string | null {
   if (typeof hex !== 'string' || !HEX_QUANTITY.test(hex)) return null;
+  return BigInt(hex).toString();
+}
+
+/**
+ * An RPC `DATA` word as decimal units, or null when it is not one.
+ *
+ * Separate from `hexToDecimalUnits` on purpose: the two wire types disagree about
+ * leading zeros, so a single reader cannot be right about both, and every call
+ * site has to say which one it is holding.
+ */
+export function hexDataToDecimalUnits(hex: unknown): string | null {
+  // A bare `0x` is "the call returned nothing", which is a fact about the address
+  // — a call to an account with no contract answers that way — and not a balance
+  // of zero. Folding the two together would turn a wrong `to` into a poor account,
+  // which is why the type above allows the empty word and this line refuses it.
+  if (typeof hex !== 'string' || hex === '0x' || !HEX_DATA.test(hex)) return null;
   return BigInt(hex).toString();
 }
 

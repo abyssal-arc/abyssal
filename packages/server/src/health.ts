@@ -94,6 +94,17 @@ export const SIGNAL_KINDS = [
    */
   'anchor_econ_rejected',
   /**
+   * The `finalized` block tag was refused or answered with something that is not
+   * a number, so that poll indexed the chain's head instead. Measured against the
+   * configured endpoint, `latest`, `safe` and `finalized` name the same block in
+   * every round of an atomic batch (`FINALITY_TAG` in arc.ts carries the sample),
+   * so falling back costs nothing today. It is counted because that equivalence is
+   * a property of the node's answer rather than of the code, and the day the node
+   * starts lagging is the day the feed would otherwise be reporting blocks that
+   * can still move — the kind of change a projection never notices from inside.
+   */
+  'arc_finality_unavailable',
+  /**
    * A stored day-book row no longer means what it claims — usually a headcount
    * that does not add up to the population beside it. Counted for the same reason
    * as the digest record above: the row was read out of storage, so whatever wrote

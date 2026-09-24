@@ -64,6 +64,18 @@ export type PulseRow = [t: number, count: number, volume: number, x402: number, 
 export interface FeedState {
   /** Highest block already accounted for; `-1` means the feed has never landed one. */
   lastBlock: number;
+  /**
+   * The chain head as of the poll that last finished. It rides along with
+   * `lastBlock` because the two together are the claim and `lastBlock` alone is
+   * not: the gap between them is how much of the chain the feed is currently
+   * declining to count as fact, and measured against the deployed node that gap
+   * is zero — `finalized` and `latest` name the same block there. This field is
+   * what makes "zero" a reading instead of an assumption, and it has to survive
+   * the object being evicted for the reading to stay comparable over time.
+   * Absent in ledgers written before the feed indexed against finality, which is
+   * reported as unknown rather than as a lag of zero.
+   */
+  headBlock?: number;
   level: MeterState;
   turbulence: MeterState;
   chainTemp: number;
