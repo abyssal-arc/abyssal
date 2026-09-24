@@ -80,7 +80,11 @@ export const snapshot = {
     day: 4,
     population: 6,
     ticksPerDay: 19200,
-    explorerTxUrl: 'https://explorer.arc.io/tx/',
+    // Deliberately not the value `app.js` initialises with. A fixture that
+    // repeats the default cannot tell whether the page used the server's base or
+    // its own, and "every link in the tank points where the API said to" is a
+    // rule that has to be checkable from the outside.
+    explorerTxUrl: 'https://arc-exp.test/tx/',
     activeEffects: [],
     leaderboards: { predators: [], richest: [], elders: [] },
   },
@@ -89,14 +93,17 @@ export const snapshot = {
 };
 
 /**
- * The day book as `/history/census` publishes it. Two details are load-bearing:
- * day 3 is absent, which the chart must leave blank rather than bridge, and day 4
+ * The day book as `/history/census` publishes it. Three details are load-bearing:
+ * day 3 is absent, which the chart must leave blank rather than bridge; day 4
  * counts a species the browser's archetype list has never heard of, which is what
- * the grey band exists for. `changes` is what the server derives from these rows;
- * the numbers below are that derivation, written out rather than recomputed here
- * so a mistake in the fixture cannot agree with a mistake in the code under test.
+ * the grey band exists for; and only some rows carry a `txHash`, because the
+ * difference between "this day was confirmed on chain" and "this day was not" is
+ * the one thing the pinned-day sentence has to get right. `changes` is what the
+ * server derives from these rows; the numbers below are that derivation, written
+ * out rather than recomputed here so a mistake in the fixture cannot agree with a
+ * mistake in the code under test.
  */
-export const censusRow = (day, byArchetype) => ({
+export const censusRow = (day, byArchetype, txHash) => ({
   day,
   tick: day * 19200,
   population: Object.values(byArchetype).reduce((s, n) => s + n, 0),
@@ -108,18 +115,24 @@ export const censusRow = (day, byArchetype) => ({
   byArchetype,
   hash: 'ab'.repeat(32),
   ts: 1700000000000 + day * 86400000,
+  // Distinct per day on purpose: a link built from the wrong row's hash still
+  // looks like a link.
+  ...(txHash ? { txHash } : {}),
 });
 
 export const census = {
-  cap: 400,
+  // Mirrors the server's derived cap (128 KiB over a measured row width). Written
+  // out rather than imported because the browser has no access to the module that
+  // computes it, and nothing on this side reads it.
+  cap: 386,
   book: 4,
   coverage: { first: 0, last: 4, days: 4 },
   hashed: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
   rows: [
-    censusRow(0, { APE: 2, WHALE: 1, ALGO: 1, INSIDER: 1 }),
+    censusRow(0, { APE: 2, WHALE: 1, ALGO: 1, INSIDER: 1 }, `0x${'cc'.repeat(32)}`),
     censusRow(1, { APE: 3, WHALE: 1, ALGO: 1, INSIDER: 1 }),
     censusRow(2, { APE: 3, WHALE: 2, ALGO: 1 }),
-    censusRow(4, { APE: 2, WHALE: 2, ALGO: 1, CRAB: 1 }),
+    censusRow(4, { APE: 2, WHALE: 2, ALGO: 1, CRAB: 1 }, `0x${'dd'.repeat(32)}`),
   ],
   changes: [
     { day: 1, tick: 19200, population: 6, populationDelta: 1, born: 7, died: 5, predations: 3, lost: [], gained: [] },

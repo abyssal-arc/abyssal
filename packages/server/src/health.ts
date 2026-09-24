@@ -51,19 +51,38 @@ export const SIGNAL_KINDS = [
   'digest_reverted',
   'digest_record_rejected',
   /**
+   * A day's transaction confirmed on chain and the day book could not be told
+   * which one — the row for that day was gone (trimmed, or refused on load) or
+   * publishes a different hash than the payload that was broadcast. Counted
+   * because the failure is invisible from the outside: the day still shows its
+   * numbers and its digest, and only the absent explorer link says that the
+   * claim "this census is checkable against the chain" stopped holding for it.
+   */
+  'digest_anchor_unstamped',
+  /**
    * A stored day-book row no longer means what it claims — usually a headcount
    * that does not add up to the population beside it. Counted for the same reason
    * as the digest record above: the row was read out of storage, so whatever wrote
    * it is already gone, and without a number the only evidence that the tank's
-   * history is being discarded on every cold start is a console line.
+   * history is being discarded on every cold start is a console line that is never
+   * delivered. Its `detail` carries the reason for the same reason.
    */
   'census_row_rejected',
+  /**
+   * A day that just closed could not be filed because its own numbers disagree.
+   * This is `census_row_rejected` caught at the source: the row never reaches
+   * storage, so the book stops growing rather than silently shrinking on the next
+   * cold start. Counted because both halves are quiet — the anchor goes on working
+   * and `/health` stays green while `census.days` simply stops advancing.
+   */
+  'census_row_unsound',
   /**
    * The day book reached its cap and a day fell out of the front of it. A warning
    * in the `*_past_budget` sense: nothing failed, the write worked, and the point
    * of counting it is that history silently stops being complete from here on.
-   * 400 days is more than a year of tank, so a growing count is a long-running
-   * world and a signal to go publish the part about to be forgotten.
+   * The cap is what three weeks of a busy tank measures out (see `CENSUS_CAP`),
+   * so a growing count is a world that has been running a while and a signal to
+   * go publish the part about to be forgotten.
    */
   'census_days_dropped',
   /**

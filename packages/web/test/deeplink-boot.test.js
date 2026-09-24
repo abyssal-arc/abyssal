@@ -63,6 +63,11 @@ test('every key the link named is the screen it names', () => {
   const pin = document.getElementById('census-pin');
   assert.equal(pin.hidden, false, 'a linked day is pinned, not just hovered');
   assert.equal(pin.textContent, 'pinned day 2 · 6 alive · committed abababababab');
+  // Day 2 is the fixture's unstamped row, so this exact string is also the
+  // negative half of `test/anchor-boot.test.js`: a day with no confirming
+  // transaction shows the digest it has and grows no link to a chain it never
+  // reached.
+  assert.equal(pin.querySelector('a'), null, 'an unanchored day must not offer a transaction');
 
   const card = document.getElementById('creature-card');
   assert.equal(card.hidden, false, 'the creature the link named has its card open');

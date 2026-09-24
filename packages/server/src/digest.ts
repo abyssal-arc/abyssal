@@ -78,8 +78,24 @@ export interface DigestWorldView {
   totalPredations: number;
 }
 
+/** The two numbers a day is made of, taken from one look at the world. */
+export interface CensusReading {
+  stats: DigestStats;
+  byArchetype: Record<string, number>;
+}
+
 /**
- * The day's numbers, read off the world.
+ * The day's numbers and its headcount, from ONE read of `w.creatures`.
+ *
+ * One read is the whole point. `population` and `byArchetype` used to be computed
+ * by two functions over the live world, and the day book wrote its row after an
+ * `await` — so a viewer request that ticked the world while the anchor was hashing
+ * produced a row whose headcount belonged to a later moment than its population.
+ * `censusProblem` was right to refuse those rows, hydrate was right to drop them,
+ * and the published book has been empty in production since the day it was first
+ * written while every local test passed: with no concurrent traffic there is
+ * nothing to interleave. Counting both in one loop makes the split unrepresentable
+ * rather than unlikely.
  *
  * Both the live preview in `/state` and the value that gets anchored call this
  * and then `digestHash`. They used to be two separate expressions over two
@@ -92,20 +108,35 @@ export interface DigestWorldView {
  * settled by who spawned first — a fact about our array, not about the day, and
  * not something a verifier holding only the payload could reproduce.
  */
-export function digestStats(day: number, w: DigestWorldView): DigestStats {
+export function censusReading(day: number, w: DigestWorldView): CensusReading {
+  const creatures = w.creatures;
   const killsBy: Record<string, number> = {};
-  for (const c of w.creatures) killsBy[c.archetype] = (killsBy[c.archetype] ?? 0) + c.kills;
+  const byArchetype: Record<string, number> = {};
+  let energy = 0;
+  for (const c of creatures) {
+    killsBy[c.archetype] = (killsBy[c.archetype] ?? 0) + c.kills;
+    byArchetype[c.archetype] = (byArchetype[c.archetype] ?? 0) + 1;
+    energy += c.energy;
+  }
   const winner = Object.entries(killsBy).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0];
   return {
-    day,
-    tick: w.tick,
-    population: w.creatures.length,
-    totalEnergy: Math.round(w.creatures.reduce((s, c) => s + c.energy, 0)),
-    born: w.totalBorn,
-    died: w.totalDied,
-    predations: w.totalPredations,
-    topPredator: winner ? `${winner[0]}:${winner[1]}` : null,
+    stats: {
+      day,
+      tick: w.tick,
+      population: creatures.length,
+      totalEnergy: Math.round(energy),
+      born: w.totalBorn,
+      died: w.totalDied,
+      predations: w.totalPredations,
+      topPredator: winner ? `${winner[0]}:${winner[1]}` : null,
+    },
+    byArchetype,
   };
+}
+
+/** The anchored half of a reading. See `censusReading` for why it is one pass. */
+export function digestStats(day: number, w: DigestWorldView): DigestStats {
+  return censusReading(day, w).stats;
 }
 
 /**
@@ -195,31 +226,65 @@ export interface CensusDay extends DigestStats {
   byArchetype: Record<string, number>;
   /** Wall clock of the reading. Outside the hash, like the payload's `ts`. */
   ts: number;
+  /**
+   * Which transaction carried this day's commitment, once it mined. Also outside
+   * the hash, and for the same reason: the digest covers the numbers, and this is
+   * a pointer into a block explorer, so writing it cannot change what a row
+   * commits.
+   *
+   * Absent means "there is no confirmation to point at", which covers four real
+   * cases without pretending to distinguish them — the row predates this field,
+   * the day never went on chain (no key, no endpoint, an exhausted retry
+   * budget), a broadcast still in flight, and an attempt the chain rejected. The
+   * last one is worth naming separately, because it is the only case where a
+   * transaction hash does exist: it stays on the digest record as evidence of an
+   * attempt, but a link beside a day's population would read as "here are the
+   * numbers, on chain" about a transaction the chain says did nothing.
+   */
+  txHash?: string;
 }
 
 /**
- * Heads per archetype, counted off the world a reading was taken from.
+ * A transaction hash, as opposed to a digest.
  *
- * One rule, exported, used both by the day book (`censusRow`) and by the live
- * answer in `/history/census` — so the bar a viewer watches grow today is made of
- * the same count as the bars for the days behind it. Two expressions for one
- * number is how the tank ended up with a preview that did not match its anchor.
+ * One expression for one shape: the digest is 64 bare hex characters and a
+ * transaction hash is 66 with the `0x`. The two are one regex apart from being
+ * confused, and the confusion is not loud — a `0x` demanded of a digest empties
+ * the day book on every cold start (see `censusProblem`), and a digest accepted
+ * as a transaction hash prints a block explorer link that leads nowhere.
+ */
+export const TX_HASH_SHAPE = /^0x[0-9a-fA-F]{64}$/;
+
+/**
+ * Heads per archetype, counted off a live world.
+ *
+ * The live answer in `/history/census` uses this; the day book does not, because a
+ * row is filed after an await and needs its headcount already in hand — see
+ * `censusReading`. One rule either way, so the bar a viewer watches grow today is
+ * made of the same count as the bars for the days behind it. Two expressions for
+ * one number is how the tank ended up with a preview that did not match its
+ * anchor.
  */
 export function headcountByArchetype(w: DigestWorldView): Record<string, number> {
-  const byArchetype: Record<string, number> = {};
-  for (const c of w.creatures) byArchetype[c.archetype] = (byArchetype[c.archetype] ?? 0) + 1;
-  return byArchetype;
+  return censusReading(0, w).byArchetype;
 }
 
 /**
  * The row for a day, from the numbers that were anchored with it.
  *
- * Takes the stats rather than recomputing them on purpose: the alternative is a
- * second expression over the world, and a second expression is how two honest
- * functions end up disagreeing about one population.
+ * Takes a finished reading rather than the world: the day book is written after
+ * the payload has been hashed, and a world still in reach at that point is a
+ * world that may have ticked since the numbers were taken. Handing over
+ * `censusReading`'s two values is what keeps "the same reading" true in the code
+ * rather than in a comment.
  */
-export function censusRow(stats: DigestStats, w: DigestWorldView, hash: string, ts: number): CensusDay {
-  return { ...stats, byArchetype: headcountByArchetype(w), hash, ts };
+export function censusRow(
+  stats: DigestStats,
+  byArchetype: Record<string, number>,
+  hash: string,
+  ts: number,
+): CensusDay {
+  return { ...stats, byArchetype, hash, ts };
 }
 
 /**
@@ -303,19 +368,90 @@ export function censusChanges(rows: readonly CensusDay[]): CensusChange[] {
 }
 
 /**
- * Days kept in the book. Sized against what a row costs rather than against
- * optimism: a row measured 263 bytes of JSON — a real one, written by the pump,
- * four archetypes, a 64-character hash, thirteen digits of wall clock; the
- * `a day book row is as small as its comment claims` test re-measures it — so
- * the whole cap is ~103 KiB. 400 days is more history than any chart asks for
- * and more than a year of tank.
+ * What one row costs in the storage value, measured rather than estimated.
+ *
+ * The `a day book row is as small as its comment claims` test re-measures this
+ * on a real row from a real day — four archetypes alive, a 64-character digest,
+ * thirteen digits of wall clock, and the 78 bytes of `,"txHash":"0x…"` that a
+ * confirmed day carries — and asserts equality, so a row that grows anywhere
+ * fails there instead of quietly overspending the cap below.
+ */
+export const CENSUS_ROW_BYTES = 339;
+
+/**
+ * The share of the ledger value the day book is allowed to take.
+ *
+ * The limit that actually bites is the Durable Object's per-value ceiling, which
+ * the whole ledger shares with the day passes, the burners and the feed cursor —
+ * this is a slice of that, not a platform number. It used to live only inside an
+ * assertion, which made the budget invisible to the code it was budgeting.
+ */
+export const CENSUS_BUDGET_BYTES = 128 * 1024;
+
+/**
+ * Days kept in the book, derived from the two numbers above rather than picked:
+ * 386 rows inside 128 KiB. That is not the long run of history it sounds like —
+ * the tank advances on wall clock, four ticks a second, so a day is about 81
+ * minutes and the whole book is just over three weeks of a busy world. The rate
+ * is measured against the deployed tank rather than read off the interval: 3.97
+ * ticks/s over a 90-second window while this was written.
  *
  * There is no byte alarm on this array, on purpose: the ledger is stored as an
  * object, so its encoded size is not a number this code can produce honestly —
  * see the note in `worker.ts` about why the ledger reports no byte count. The cap
  * and the `census_days_dropped` counter are what stand in for one.
  */
-export const CENSUS_CAP = 400;
+export const CENSUS_CAP = Math.floor(CENSUS_BUDGET_BYTES / CENSUS_ROW_BYTES);
+
+/** What `stampAnchor` did, and the reason it says it did nothing. */
+export interface AnchorStamp {
+  /** The book to keep. A fresh array always, so a caller cannot half-apply a stamp. */
+  rows: CensusDay[];
+  stamped: boolean;
+  problem: string | null;
+}
+
+/**
+ * Tell a day where its commitment ended up.
+ *
+ * The transaction is found by day number rather than by appending: this runs long
+ * after the row was written, on a clock the day book does not control.
+ *
+ * Refusing is the point of the `commitment` argument. A stamp is a claim that
+ * *this* row's numbers are in *that* transaction, and the only way to know is to
+ * compare the row's own hash against the payload that was broadcast — records
+ * outlive isolates, days get rebuilt, and a link that survives either of those
+ * pointing at the wrong row is worse than no link, because it will be believed.
+ * Nothing is invented here and nothing is overwritten: an existing stamp is
+ * kept, so a second confirmation of a day cannot quietly re-point the first one.
+ */
+export function stampAnchor(
+  book: readonly CensusDay[],
+  day: number,
+  txHash: string,
+  commitment: string,
+): AnchorStamp {
+  const rows = [...book];
+  const i = rows.findIndex((r) => r.day === day);
+  if (i < 0) return { rows, stamped: false, problem: `day ${day} is not in the book` };
+  if (!TX_HASH_SHAPE.test(txHash)) {
+    return { rows, stamped: false, problem: `${txHash} is not a transaction hash` };
+  }
+  const row = rows[i];
+  if (row.hash !== commitment) {
+    return {
+      rows,
+      stamped: false,
+      problem: `day ${day} publishes ${row.hash}, which is not the ${commitment} that was broadcast`,
+    };
+  }
+  if (row.txHash && row.txHash !== txHash) {
+    return { rows, stamped: false, problem: `day ${day} already points at ${row.txHash}` };
+  }
+  if (row.txHash === txHash) return { rows, stamped: true, problem: null };
+  rows[i] = { ...row, txHash };
+  return { rows, stamped: true, problem: null };
+}
 
 /**
  * What a "reset" between two rows means for the counters: the cumulative fields
@@ -466,6 +602,6 @@ export function coherenceProblem(r: DigestRecord): string | null {
   if (r.status === 'confirmed' && r.confirmedAt === null) return 'confirmed without a confirmation time';
   if (r.status === 'queued' && r.attempts !== 0) return 'a fresh record cannot have attempted anything';
   if (r.attempts < 0) return 'negative attempt count';
-  if (r.txHash && !/^0x[0-9a-fA-F]{64}$/.test(r.txHash)) return 'txHash is not a tx hash';
+  if (r.txHash && !TX_HASH_SHAPE.test(r.txHash)) return 'txHash is not a tx hash';
   return null;
 }

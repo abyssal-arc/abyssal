@@ -3758,6 +3758,12 @@ function renderCensusText() {
  * rather than leaving it as a pixel a viewer has to hover to discover. When the
  * day is real but outside the window we fetched, it says that too: an absent row
  * is a fact about our request, not a claim that the day was never lived.
+ *
+ * A row that carries a confirming transaction also carries the way to check it.
+ * The absence of that link is not a gap to fill with a placeholder: it means
+ * exactly one of "this day never went on chain", "it is still on its way" and
+ * "this row predates the book keeping tx hashes", and the sentence stays quiet
+ * about which.
  */
 function pinCensus(day, row) {
   const el = document.getElementById('census-pin');
@@ -3767,9 +3773,15 @@ function pinCensus(day, row) {
     return;
   }
   el.hidden = false;
-  el.textContent = row
-    ? t('censusPin', { day: row.day, pop: row.population, hash: row.hash.slice(0, 12) })
-    : t('censusPinAbsent', { day });
+  if (!row) {
+    el.textContent = t('censusPinAbsent', { day });
+    return;
+  }
+  const words = t('censusPin', { day: row.day, pop: row.population, hash: row.hash.slice(0, 12) });
+  el.innerHTML = row.txHash
+    ? `${esc(words)} · <a href="${esc(explorerTxUrl + row.txHash)}" title="${esc(row.txHash)}" `
+      + `target="_blank" rel="noopener">${esc(t('txVerify'))}</a>`
+    : esc(words);
 }
 
 /**

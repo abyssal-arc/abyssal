@@ -941,6 +941,11 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
   color: var(--fg-1);
   font-variant-numeric: tabular-nums;
 }
+/* The pointer to the transaction that carried this day's commitment. Present only
+   on days that have one, which is the whole point of styling it as a link rather
+   than as a sentence: no link is the answer to "is this on chain yet?". */
+#census-pin a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
+#census-pin a:hover { border-bottom-color: var(--accent); }
 
 /* ---------- obituaries ---------- */
 #death-stats { font-size: 10px; color: var(--fg-3); margin-bottom: calc(var(--sp)); }

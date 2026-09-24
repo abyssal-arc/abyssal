@@ -29,10 +29,10 @@ import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
-  buildPayload, censusChanges, censusProblem, censusRow, coherenceProblem, digestHash, digestStats,
-  encodeDigest, headcountByArchetype, isSettled,
+  buildPayload, censusChanges, censusProblem, censusReading, censusRow, coherenceProblem,
+  digestHash, digestStats, encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
-  newDigestRecord, nextDigestAction, verifyPayload,
+  newDigestRecord, nextDigestAction, stampAnchor, verifyPayload,
   CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS,
   type CensusDay, type DigestRecord,
 } from './digest.js';
@@ -1099,26 +1099,37 @@ export function createApp(options: AppOptions = {}) {
       let rec = digest;
       if (!rec || (rec.day !== prevDay && isSettled(rec))) {
         // A day has closed and the previous record is finished with, so take the
-        // snapshot now. `digestStats` is the same call the `/state` preview
-        // makes, which is what keeps the number viewers watched all day equal to
-        // the number that gets committed rather than merely similar to it — they
-        // used to be two expressions over two field lists, and never matched.
+        // snapshot now. `censusReading` is a single pass over the world, and the
+        // `/state` preview's numbers come from the same function, which is what
+        // keeps the number viewers watched all day equal to the number that gets
+        // committed rather than merely similar to it — they used to be two
+        // expressions over two field lists, and never matched.
         //
         // An unsettled record is deliberately *not* replaced. Dropping a day
         // that still has retries left would lose its anchor silently the first
         // time an RPC hiccuped across a day boundary.
-        const stats = digestStats(prevDay, world);
+        const reading = censusReading(prevDay, world);
         const ts = Date.now();
-        const payload = await buildPayload(stats, ts);
+        // Everything the row is made of is in `reading` before this await.
+        // `advance()` does not wait for the pump, so the next viewer request can
+        // tick the world while the payload is being hashed, and a world re-read
+        // after that gives up a row whose headcount is a later moment than its
+        // population — which `censusProblem` then refuses on every cold start.
+        const payload = await buildPayload(reading.stats, ts);
         rec = newDigestRecord(prevDay, payload);
         digest = rec;
-        // The book row is written from the same `stats` and the same `world` as
-        // the payload two lines above, so the population it publishes cannot
-        // disagree with the population that just went on chain. Written whether
-        // or not the broadcast succeeds: the day happened, and a book that only
-        // recorded the days the RPC co-operated with would be an uptime log with
-        // creatures in it.
-        noteDayBook(censusRow(stats, world, payload.hash, ts));
+        // Filed whether or not the broadcast succeeds: the day happened, and a
+        // book that only recorded the days the RPC co-operated with would be an
+        // uptime log with creatures in it. A row that fails its own check is not
+        // filed and is counted instead: writing a self-contradictory day and
+        // letting hydrate drop it later is how the history goes missing with
+        // nobody the wiser, and this way the number says when it starts.
+        const row = censusRow(reading.stats, reading.byArchetype, payload.hash, ts);
+        const unsound = censusProblem(row);
+        if (unsound) {
+          console.error(`day ${prevDay} was not filed: ${unsound}`);
+          options.health?.note('census_row_unsound', unsound);
+        } else noteDayBook(row);
         saveStore();
       }
       const action = nextDigestAction(rec, Date.now());
@@ -1231,6 +1242,22 @@ export function createApp(options: AppOptions = {}) {
       const j = (await res.json()) as { result?: { status?: string } | null };
       if (j.result?.status === '0x1') {
         digest = markConfirmed(current, Date.now());
+        // The row for the day is told where its commitment landed, from the
+        // record's own payload hash rather than from whatever the book happens to
+        // say: a link is a claim about two artifacts matching, and this is the one
+        // moment in the day that both are in hand and known to agree. Reverted
+        // transactions are deliberately not stamped, two branches below.
+        const stamp = stampAnchor(dayBook, current.day, r.txHash, current.payload.hash);
+        dayBook = stamp.rows;
+        if (!stamp.stamped) {
+          // A day is on chain and the book cannot say which transaction carried
+          // it. Nothing the viewer sees is wrong — the absence of a link is the
+          // honest answer — but the promise that every anchored day is
+          // checkable has quietly stopped being true, and only a counter left
+          // here would say so.
+          console.error(`anchored day could not be stamped: day ${current.day} — ${stamp.problem}`);
+          options.health?.note('digest_anchor_unstamped', stamp.problem);
+        }
         saveStore();
       } else if (j.result?.status === '0x0') {
         // Broadcast and reverted: the hash stays, because it is evidence of a
@@ -1680,7 +1707,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
-        'GET /history/census': `the day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows; ?days=<n> for the newest n; see .hashed for what the commitment covers`,
+        'GET /history/census': `the day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; ?days=<n> for the newest n; see .hashed for what the commitment covers`,
         'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the Arc USDC flow ring this isolate has polled so far, filtered by ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; the answer carries retained/oldest/newest so the coverage bought is visible rather than implied; 503 until the SELLER_PRIVATE_KEY binding is set`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
@@ -1803,6 +1830,10 @@ export function createApp(options: AppOptions = {}) {
         // Which fields of a row travelled to the chain. The headcounts did not,
         // and a reader who assumes otherwise is trusting the wrong artifact.
         hashed: [...DIGEST_HASH_FIELDS],
+        // A row's `txHash`, when it carries one, is the transaction that brought
+        // the commitment above to the chain: outside the hash, so verifiable
+        // against it rather than guaranteed by it. Its absence is also an answer
+        // — no confirmation to point at — which is why nothing is filled in here.
         rows,
         changes,
         today: {
@@ -2415,8 +2446,10 @@ export function createApp(options: AppOptions = {}) {
           // Counted per hydrate, not per event: a record that cannot be read
           // back fails this check on every cold start until something writes a
           // new one, so a growing count is the sound of anchoring restarting
-          // from scratch each time the isolate moves.
-          options.health?.note('digest_record_rejected');
+          // from scratch each time the isolate moves. The problem text rides
+          // along because console output has never once arrived at the edge: a
+          // count without its reason says the book is broken and not how.
+          options.health?.note('digest_record_rejected', problem);
         } else digest = s.digest;
       }
       // Every stored row is asked whether it still means what it claims, for the
@@ -2432,7 +2465,9 @@ export function createApp(options: AppOptions = {}) {
             // Counted per hydrate, like the digest record: a row that cannot be
             // read back fails on every cold start until a new day replaces it, so
             // a growing count is the sound of the book being rewritten from zero.
-            options.health?.note('census_row_rejected');
+            // The reason travels with the count for the same reason it does next
+            // door — the console line this would have been is never delivered.
+            options.health?.note('census_row_rejected', problem);
           } else rows.push(row);
         }
         dayBook = rows.length > CENSUS_CAP ? rows.slice(rows.length - CENSUS_CAP) : rows;

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   mulberry32, hashSeed, mixSeed, unitNoise,
@@ -322,4 +322,22 @@ test('the preview card the tags promise is the file on disk', () => {
   // `summary_large_image` wants roughly 1.91:1; the canonical 1200x630 is 1.905.
   assert.ok(Math.abs(width / height - 1.91) < 0.02, `${width}x${height} is not a large-card ratio`);
   assert.ok(png.length > 20_000, `og.png is ${png.length} bytes, which is a placeholder, not a card`);
+});
+
+test('every test file on disk is in the list the runner is told to run', () => {
+  // `npm test -w @abyssal/web` names its files instead of globbing, because a bare
+  // `node --test` treats everything under `test/` as a case — including
+  // `harness.js`, which is the stage the render tests stand on and not a test of
+  // its own. That is the right trade, and it has exactly one cost: a file that is
+  // never named is never run, and nothing in the build says so. A test written and
+  // never executed is worse than no test, because it reads like coverage.
+  const root = new URL('..', import.meta.url);
+  const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('package.json', root)), 'utf8'));
+  const named = new Set(String(pkg.scripts.test).split(/\s+/).filter((a) => a.endsWith('.test.js')));
+  const onDisk = readdirSync(fileURLToPath(new URL('test', root))).filter((f) => f.endsWith('.test.js'));
+  assert.ok(onDisk.length > 5, `${onDisk.length} test files found, which says the scan is looking in the wrong place`);
+  for (const file of onDisk) assert.ok(named.has(`test/${file}`), `${file} exists and is never run`);
+  for (const entry of named) {
+    assert.ok(onDisk.includes(entry.replace('test/', '')), `${entry} is in the run list and not on disk`);
+  }
 });
