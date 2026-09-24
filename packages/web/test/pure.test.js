@@ -284,7 +284,42 @@ test('the asset filter hides the development files and nothing the client loads'
 
   // And the filter has to actually be doing something: an emptied file passes
   // every assertion above by ignoring nothing.
-  for (const dev of ['test/pure.test.js', 'test/render.test.js', 'package.json']) {
+  for (const dev of ['test/pure.test.js', 'test/render.test.js', 'test/harness.js', 'package.json']) {
     assert.ok(ignored(dev), `${dev} is development-only and should not be served`);
   }
+});
+
+test('the preview card the tags promise is the file on disk', () => {
+  // Crawlers do not run JavaScript, so `og:image` is the only thing a visitor who
+  // has not opened the site ever sees. Two independent failures hide here: the tags
+  // can name a file that is not there, and the file can stop being what the tags
+  // describe — a resized export, a placeholder, or a PNG whose declared dimensions
+  // were left at the old numbers. Nothing else in the suite looks at a byte of it,
+  // because no test asks the asset router what `/` is serving.
+  const root = new URL('../', import.meta.url);
+  const html = readFileSync(fileURLToPath(new URL('index.html', root)), 'utf8');
+  const tag = (prop) => html.match(new RegExp(`<meta (?:property|name)="${prop}" content="([^"]*)"`))?.[1];
+
+  const image = tag('og:image');
+  assert.ok(image, 'index.html declares no og:image');
+  // Absolute, because a relative one is silently dropped by some crawlers — and
+  // pinned to the canonical host, since a link-local URL would be a preview card
+  // that only works on the machine that rendered it.
+  const url = new URL(image);
+  assert.equal(url.origin, 'https://www.abyssal-arc.com', `og:image points at ${url.origin}`);
+  assert.equal(url.pathname, '/assets/og.png');
+  assert.equal(tag('og:url'), 'https://www.abyssal-arc.com/');
+  assert.equal(tag('twitter:card'), 'summary_large_image');
+
+  const png = readFileSync(fileURLToPath(new URL(`.${url.pathname}`, root)));
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 'og.png is not a PNG');
+  // IHDR is the first chunk: 4 length, 4 type, then width and height as big-endian.
+  assert.equal(png.subarray(12, 16).toString(), 'IHDR', 'the PNG does not open with its header');
+  const width = png.readUInt32BE(16);
+  const height = png.readUInt32BE(20);
+  assert.equal(tag('og:image:width'), String(width), 'the tag declares a width the file does not have');
+  assert.equal(tag('og:image:height'), String(height), 'the tag declares a height the file does not have');
+  // `summary_large_image` wants roughly 1.91:1; the canonical 1200x630 is 1.905.
+  assert.ok(Math.abs(width / height - 1.91) < 0.02, `${width}x${height} is not a large-card ratio`);
+  assert.ok(png.length > 20_000, `og.png is ${png.length} bytes, which is a placeholder, not a card`);
 });

@@ -1,7 +1,11 @@
 /**
- * Render smoke test: boots the real app.js in jsdom with a node-canvas bridge,
- * feeds it a fixture snapshot from an in-process server, pumps a few animation
- * frames and fails if the render loop throws or paints an empty tank.
+ * Render smoke test: boots the real app.js in jsdom with a node-canvas bridge
+ * (both live in `test/harness.js`, which the link-boot test shares), feeds it a
+ * fixture snapshot from an in-process server, pumps a few animation frames and
+ * fails if the render loop throws or paints an empty tank.
+ *
+ * This boots the boring way: no query string, no Arc feed. The interesting
+ * opening — what does a link do? — is `test/deeplink-boot.test.js`.
  *
  * This is the guard for the class of bug a hidden tab cannot show: a missing
  * constant or a bad draw call blanks the whole tank while every endpoint stays
@@ -9,164 +13,26 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { boot, RENDER_DEPS_MISSING } from './harness.js';
 
-let jsdomMod;
-let canvasMod;
-try {
-  jsdomMod = await import('jsdom');
-  canvasMod = await import('@napi-rs/canvas');
-} catch {
+if (RENDER_DEPS_MISSING) {
   test('render smoke', { skip: 'jsdom / @napi-rs/canvas not installed' }, () => {});
   process.exit(0);
 }
-const { JSDOM, VirtualConsole } = jsdomMod;
-const { createCanvas } = canvasMod;
 
-const CREATURES = [0, 1, 2, 3, 4, 5].map((i) => ({
-  id: 100 + i,
-  name: `MOBY-${100 + i}`,
-  x: 200 + i * 90,
-  y: 180 + (i % 3) * 160,
-  energy: 60 + i * 12,
-  hue: (i * 0.13) % 1,
-  sat: 0.7,
-  light: 0.55,
-  archetype: ['WHALE', 'ALGO', 'APE', 'INSIDER'][i % 4],
-  radius: 6 + (i % 3) * 3,
-  kills: i,
-  devouredTotal: i * 30,
-  generation: 3,
-  bornTick: 10,
-  genes: [0.4, 0.8, 0.2, 0.6],
-  hungry: i % 2 === 0,
-  offspring: 1,
-  maxMeal: 30,
-  persona: 21,
-  parentId: null,
-}));
-
-const snapshot = {
-  world: {
-    tick: 4000,
-    t: Date.now(),
-    width: 1000,
-    height: 1000,
-    whales: [],
-    eaters: {},
-    obituaries: [],
-    tax: null,
-    propositions: [],
-    daily: null,
-    burners: [],
-    cheers: {},
-    chainTemp: 0.6,
-    marketTemp: 0.4,
-    creatures: CREATURES,
-    foods: [{ x: 300, y: 300 }, { x: 620, y: 520 }],
-  },
-  state: {
-    tick: 4000,
-    ticksPerDay: 19200,
-    explorerTxUrl: 'https://explorer.arc.io/tx/',
-    activeEffects: [],
-    leaderboards: { predators: [], richest: [], elders: [] },
-  },
-  events: [],
-  txRain: [],
-};
-
-const server = createServer((req, res) => {
-  const path = req.url?.split('?')[0] ?? '/';
-  res.setHeader('content-type', 'application/json');
-  if (path === '/snapshot') res.end(JSON.stringify(snapshot));
-  else if (path === '/history') res.end(JSON.stringify({ stats: [] }));
-  else if (path === '/judgments') res.end(JSON.stringify({ judgments: [] }));
-  else if (path === '/reports') res.end(JSON.stringify({ reports: [] }));
-  else if (path === '/observe') res.end(JSON.stringify({ available: false }));
-  else res.end(JSON.stringify({}));
-});
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const base = `http://127.0.0.1:${server.address().port}/`;
-
-const root = fileURLToPath(new URL('..', import.meta.url));
-const html = readFileSync(root + 'index.html', 'utf8');
-const vc = new VirtualConsole();
-const pageErrors = [];
-vc.on('jsdomError', (e) => pageErrors.push(String(e.stack ?? e)));
-const dom = new JSDOM(html, { url: base, virtualConsole: vc });
-const { window } = dom;
-
-const backing = new Map();
-const canvasFor = (el) => {
-  let c = backing.get(el);
-  if (!c) {
-    c = createCanvas(2400, 1600);
-    backing.set(el, c);
-  }
-  return c;
-};
-window.HTMLCanvasElement.prototype.getContext = function () {
-  return canvasFor(this).getContext('2d');
-};
-for (const prop of ['width', 'height']) {
-  Object.defineProperty(window.HTMLCanvasElement.prototype, prop, {
-    get() { return this['__' + prop] ?? 300; },
-    set(v) { this['__' + prop] = v; },
-    configurable: true,
-  });
-}
-const origCreate = window.document.createElement.bind(window.document);
-window.document.createElement = (tag, ...rest) =>
-  (tag === 'canvas' ? createCanvas(2, 2) : origCreate(tag, ...rest));
-
-const rafQ = [];
-window.requestAnimationFrame = (cb) => rafQ.push(cb);
-window.cancelAnimationFrame = () => {};
-const nodeFetch = globalThis.fetch;
-window.fetch = (u, o) => nodeFetch(new URL(u, base), o);
-
-// The app owns polling intervals on the node loop; remember them so the test
-// process can exit once the assertions are done.
-const timerIds = [];
-const origSetInterval = globalThis.setInterval;
-const origSetTimeout = globalThis.setTimeout;
-globalThis.setInterval = (...a) => {
-  const id = origSetInterval(...a);
-  timerIds.push(id);
-  return id;
-};
-globalThis.setTimeout = (...a) => {
-  const id = origSetTimeout(...a);
-  timerIds.push(id);
-  return id;
-};
-
-globalThis.window = window;
-globalThis.document = window.document;
-globalThis.localStorage = window.localStorage;
-globalThis.fetch = window.fetch;
-globalThis.requestAnimationFrame = window.requestAnimationFrame;
-globalThis.cancelAnimationFrame = window.cancelAnimationFrame;
-globalThis.CustomEvent = window.CustomEvent;
-globalThis.Event = window.Event;
-Object.defineProperty(window, 'innerWidth', { value: 1200, configurable: true });
-Object.defineProperty(window, 'innerHeight', { value: 700, configurable: true });
-
-const renderThrows = [];
-window.addEventListener('error', (e) => renderThrows.push(String(e.error?.stack ?? e.message)));
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-await import(root + 'app.js');
-await sleep(1200);
+const page = await boot();
+const { window, document } = page;
+const canvasFor = page.canvasFor;
 
 test('the render loop paints a living tank without throwing', (t) => {
+  // Clear the app's polling timers and the fixture server even when an assertion
+  // fails, or the test process never exits.
+  t.after(() => page.close());
+
   let frames = 0;
   let clock = 1000;
   for (let i = 0; i < 8; i++) {
-    const cbs = rafQ.splice(0, rafQ.length);
+    const cbs = page.rafQ.splice(0, page.rafQ.length);
     if (!cbs.length) break;
     clock += 16;
     for (const cb of cbs) {
@@ -174,23 +40,15 @@ test('the render loop paints a living tank without throwing', (t) => {
         cb(clock);
         frames++;
       } catch (err) {
-        renderThrows.push(String(err.stack ?? err));
+        page.renderThrows.push(String(err.stack ?? err));
       }
     }
   }
-  // Clear the app's polling timers even when an assertion fails, or the test
-  // process never exits.
-  t.after(() => {
-    for (const id of timerIds) {
-      clearInterval(id);
-      clearTimeout(id);
-    }
-  });
   assert.ok(frames >= 4, `expected several frames, got ${frames}`);
-  assert.deepEqual(renderThrows.slice(0, 1), [], 'the render loop threw');
-  assert.deepEqual(pageErrors.slice(0, 1), [], 'the page reported an error');
+  assert.deepEqual(page.renderThrows.slice(0, 1), [], 'the render loop threw');
+  assert.deepEqual(page.pageErrors.slice(0, 1), [], 'the page reported an error');
 
-  const world = window.document.getElementById('world');
+  const world = document.getElementById('world');
   const px = canvasFor(world).getContext('2d').getImageData(0, 0, 1200, 700).data;
   let lit = 0;
   for (let p = 0; p < px.length; p += 4) {
@@ -200,5 +58,102 @@ test('the render loop paints a living tank without throwing', (t) => {
   assert.ok(lit > 100_000, `the tank painted almost nothing (${lit} lit pixels)`);
 });
 
-server.close();
-server.closeAllConnections?.();
+test('the day book is drawn, spoken, and asked for once', () => {
+  // One wire request for the whole boot: the book is fetched at boot and the
+  // first aux poll then finds the day unchanged, so it must not ask again. An
+  // unpolled guard here would show up as 2+ requests, not as a wrong pixel.
+  assert.equal(page.reqs.census, 1, `the day book was fetched ${page.reqs.census} times`);
+
+  const cov = document.getElementById('census-coverage');
+  const trends = document.getElementById('census-trends');
+  const events = document.getElementById('census-events');
+  assert.equal(cov.textContent, '4 days kept · day 0 to day 4');
+  assert.equal(trends.querySelectorAll('.census-row').length, 4, 'one line per species');
+  // APE 2→2 over four days is steady, WHALE 1→2 expands, INSIDER 1→0 is a
+  // different sentence from "shrinking" and the text layer is where it is said.
+  assert.equal(trends.querySelectorAll('.cr-steady').length, 2, 'APE and ALGO hold');
+  assert.equal(trends.querySelectorAll('.cr-expanding').length, 1, 'WHALE grew');
+  assert.equal(trends.querySelectorAll('.cr-gone').length, 1, 'INSIDER went extinct');
+  assert.ok(!trends.textContent.includes('unknown'), 'a four-day book knows its trends');
+
+  assert.ok(
+    events.textContent.includes('INSIDER: no survivors as of day 2'),
+    `the extinction is not in the text: ${events.textContent}`,
+  );
+  assert.ok(events.textContent.includes('no reading between day 2 and day 4'), 'the gap is admitted');
+  assert.ok(!events.textContent.includes('reading the day book'), 'stuck on the loading line');
+
+  // The chart itself: bars, the population line and the grey unlisted band. Text
+  // can render while the canvas stays empty, which is the exact failure this
+  // file exists for.
+  const px = canvasFor(document.getElementById('census')).getContext('2d').getImageData(0, 0, 300, 300).data;
+  let lit = 0;
+  for (let p = 0; p < px.length; p += 4) {
+    if (px[p + 3] > 8 && px[p] + px[p + 1] + px[p + 2] > 60) lit++;
+  }
+  assert.ok(lit > 500, `the census chart painted almost nothing (${lit} lit pixels)`);
+});
+
+test('the address bar learns what the visitor is looking at', () => {
+  // Boot names the view even though nothing chose it, because a link with no view
+  // in it means "the site decides", and with the Arc feed live the site decides
+  // OBSERVE — which would quietly contradict the tab the link was copied from.
+  assert.equal(window.location.search, '?view=world');
+
+  document.getElementById('dock-analytics').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  assert.equal(window.location.search, '?view=world&drawer=analytics', 'the drawer is part of the screen');
+
+  // Geometry the app agrees with: a 300px canvas, padL 30, five day slots, so the
+  // middle of day 2 sits at x = 30 + 2.5 * (266 / 5).
+  const cv = document.getElementById('census');
+  const send = (type, x) => cv.dispatchEvent(new window.MouseEvent(type, { bubbles: true, clientX: x, clientY: 40 }));
+  const pin = document.getElementById('census-pin');
+  send('mousemove', 163);
+  assert.equal(pin.hidden, true, 'hovering alone pins nothing');
+  assert.equal(window.location.search, '?view=world&drawer=analytics', 'and a hover is not a state worth a link');
+
+  send('click', 163);
+  assert.equal(window.location.search, '?view=world&day=2&drawer=analytics', 'clicking is');
+  assert.equal(pin.hidden, false);
+  // The pinned day in words, from the row the server published: population and
+  // the commitment made for it, so a forwarded link says what it points at.
+  assert.equal(pin.textContent, 'pinned day 2 · 6 alive · committed abababababab');
+
+  send('click', 163);
+  assert.equal(window.location.search, '?view=world&drawer=analytics', 'the same click takes it back');
+  assert.equal(pin.hidden, true);
+
+  // None of the writes above was a navigation: every one replaced the entry the
+  // page was opened with, so Back still means "leave the site" rather than
+  // "unwind the last click".
+  assert.equal(window.history.length, 1, 'a write to the bar was pushed onto the history stack');
+});
+
+test('an open card names its creature in the link, and offers the link', async () => {
+  const list = document.getElementById('following');
+  const row = list.querySelector('[data-follow]');
+  assert.ok(row, 'the watched fixture should have given the following list a row');
+  row.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+
+  const card = document.getElementById('creature-card');
+  assert.equal(card.hidden, false, 'picking a followed animal opens its card');
+  const id = Number(row.dataset.follow);
+  assert.ok(
+    window.location.search.includes(`&creature=${id}`),
+    `the link does not name the card that is open: ${window.location.search}`,
+  );
+  // The copy button is part of the card, so a shared link is one click from the
+  // thing on screen rather than a trip to the address bar on a phone.
+  const link = card.querySelector('#link-btn');
+  assert.ok(link, 'the card offers a copy button');
+  link.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  await page.sleep(10);
+  // The one promise the button makes: the string on the clipboard is the string in
+  // the bar, character for character, and not a tidier summary of it.
+  assert.equal(page.copied.length, 1, 'the button put nothing on the clipboard');
+  assert.equal(page.copied[0], window.location.href, 'the copied link is not the address link');
+  assert.ok(
+    page.copied[0].includes(`creature=${id}`) && page.copied[0].includes('drawer=analytics'),
+    `the copied link lost what was on screen: ${page.copied[0]}`,
+  );
+});

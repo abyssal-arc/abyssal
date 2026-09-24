@@ -27,6 +27,9 @@
 import { t, initI18n } from './i18n.js';
 import { mulberry32, hashSeed, mixSeed, unitNoise } from './src/geom.js';
 import { hsla, shortAddr, fmtUsd } from './src/format.js';
+import { censusEvents, censusSeries, censusTrend } from './src/census.js';
+import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
+import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
 
 initI18n();
 
@@ -36,6 +39,8 @@ const chartCanvas = document.getElementById('chart');
 const cctx = chartCanvas.getContext('2d');
 const tempsCanvas = document.getElementById('temps');
 const tctx = tempsCanvas.getContext('2d');
+const censusCanvas = document.getElementById('census');
+const nctx = censusCanvas.getContext('2d');
 
 const POLL_MS = 500;
 const RENDER_DELAY = 700;     // ms behind the newest snapshot
@@ -107,8 +112,79 @@ let obsData = null;
 let observeAvailable = false;
 let chainCopyApplied = false;
 
+/* ---------- the address bar says what is on screen ---------- */
+
+/**
+ * The five keys from `src/deeplink.js`, read once from the link that opened this
+ * page and then kept in step with whatever the visitor is actually looking at.
+ *
+ * Declared here at the top of the module's action area because every writer below
+ * reaches it, and `const` has no mercy for a call made before its declaration —
+ * the census fetch learned that the hard way.
+ */
+const focus = parseFocus(window.location.search);
+/** Whether the link chose the view. The boot probe may fill a blank, but it may
+ * not overrule an intention: a link copied while looking at the tank must not be
+ * stolen by OBSERVE on the way in. */
+const urlNamedView = focus.view !== undefined;
+// A silent link means the default, so write it down: after one glance the bar
+// describes the screen whether the view was chosen by the visitor or by us.
+if (focus.view === undefined) focus.view = 'world';
+
+/**
+ * Record what is on screen in the address bar.
+ *
+ * `replaceState`, never `pushState`: none of these states is a page the visitor
+ * navigated *to*, and a Back button that unwinds one hover at a time is a trap.
+ */
+function setFocus(patch) {
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null || v === undefined) delete focus[k];
+    else focus[k] = k === 'addr' ? String(v).toLowerCase() : v;
+  }
+  const next = serializeFocus(focus);
+  if (next === window.location.search) return;
+  window.history.replaceState(null, '', next || window.location.pathname);
+}
+
+/** The link for what is on screen right now — the same string the bar holds. */
+function focusLink() {
+  return focusUrl(window.location.href, focus);
+}
+
+/**
+ * Put text on the clipboard, without assuming the Clipboard API is there: it is
+ * missing on a plain-HTTP origin and refused in a lot of embedded webviews, and
+ * the visitor who clicked the button wants the link either way.
+ */
+async function copyText(text) {
+  try {
+    await window.navigator.clipboard.writeText(text);
+    return true;
+  } catch { /* no permission, no secure context, or no API at all */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch { return false; }
+}
+
+/** Copy the current link and say whether it landed. */
+async function copyFocusLink() {
+  const ok = await copyText(focusLink());
+  toast(ok ? t('linkCopied') : t('linkNotCopied'), !ok);
+}
+
 function setView(v) {
   view = v;
+  setFocus({ view: v });
   document.body.classList.toggle('view-observe', v === 'observe');
   document.body.classList.toggle('view-world', v !== 'observe');
   document.querySelectorAll('.viewtabs button').forEach((b) => {
@@ -855,7 +931,7 @@ function resize() {
   cssH = window.innerHeight;
   worldCanvas.width = Math.round(cssW * DPR);
   worldCanvas.height = Math.round(cssH * DPR);
-  for (const c of [chartCanvas, tempsCanvas]) {
+  for (const c of [chartCanvas, tempsCanvas, censusCanvas]) {
     const cr = c.getBoundingClientRect();
     if (cr.width === 0) continue; // analytics drawer is closed
     c.width = Math.round(cr.width * DPR);
@@ -1320,6 +1396,11 @@ async function pollAux() {
     lastStats = hist.stats;
     lastCulls = culls.judgments;
     renderReports(rep?.reports);
+    // The book gains a row when a day closes, so that is the only event worth
+    // fetching it for (plus the boot call below). Comparing against the day the
+    // payload was read on rather than a timer keeps a long-lived tab honest about
+    // a curve that moves once every 19,200 ticks.
+    if (!censusData || (state && state.day !== censusData.today?.day)) refreshCensus().then(paintCensus);
     // Badges and rank move slower than the tank: refresh on the aux cadence.
     if (myAddr && Date.now() - meFetchedAt > 30_000) fetchMe();
     drawCharts();
@@ -1398,9 +1479,11 @@ document.addEventListener('visibilitychange', () => {
   pollAux();
   if (view === 'observe' && observeAvailable) pollObserve();
 });
-// Probe once at boot: when the Arc feed is live, land on OBSERVE.
+// Probe once at boot: when the Arc feed is live, land on OBSERVE — unless the
+// link already named a view, in which case the probe fills the panel and never
+// moves the visitor.
 pollObserve().then(() => {
-  if (observeAvailable) setView('observe');
+  if (observeAvailable && !urlNamedView) setView('observe');
 });
 
 function renderObsStats() {
@@ -1512,6 +1595,7 @@ let addrCardAddr = null;
 
 async function openAddrCard(address) {
   addrCardAddr = address;
+  setFocus({ addr: address });
   const card = document.getElementById('addr-card');
   const addr = address.toLowerCase();
   // The shared /observe snapshot only carries the last 160 flows, so a hot
@@ -1618,7 +1702,9 @@ document.getElementById('addr-world').addEventListener('click', () => {
 document.querySelector('#addr-card .tx-close').addEventListener('click', () => {
   addrCardAddr = null;
   document.getElementById('addr-card').hidden = true;
+  setFocus({ addr: null });
 });
+document.getElementById('addr-link').addEventListener('click', copyFocusLink);
 
 /** Seamless news-style ticker of the newest real flows, dual-track looping. */
 const TICKER_MAX = 20;
@@ -3166,6 +3252,29 @@ const MARKET_COLOR = '#ffd166';
 let chartPoints = [];   // downsampled stats shared by both charts
 let chartHover = -1;    // hovered point index, -1 = none (shared crosshair)
 
+/**
+ * The day book. Kept apart from `chartPoints` on purpose: those are decimated
+ * per-tick readings of one continuous clock, these are one row per closed day and
+ * a day either was measured or was not. The x axis here is the day number, so a
+ * day missing from the book shows up as the blank it is instead of as a line
+ * drawn straight over it.
+ */
+const CENSUS_WINDOW = 90;
+const CENSUS_TREND_KEYS = {
+  expanding: 'censusTrendExpanding',
+  shrinking: 'censusTrendShrinking',
+  steady: 'censusTrendSteady',
+  gone: 'censusTrendGone',
+  unknown: 'censusTrendUnknown',
+};
+let censusData = null;   // last /history/census payload
+let censusInFlight = false;
+let censusRows = [];     // the rows it sent, oldest first
+let censusStack = null;  // censusSeries() of those rows
+let censusHoverDay = null;
+/** The day a click (or a link) is pointing at. Outlives the cursor. */
+let censusPinnedDay = null;
+
 function gameTimeLabel(tick) {
   const ticksPerDay = state?.ticksPerDay ?? 19200;
   const ticksPerHour = ticksPerDay / 24;
@@ -3360,6 +3469,7 @@ function drawCharts() {
   computePoints(lastStats);
   drawPopChart();
   drawTempChart();
+  paintCensus();
 }
 
 function chartHoverHandler(canvas) {
@@ -3386,6 +3496,304 @@ for (const c of [chartCanvas, tempsCanvas]) {
     drawTempChart();
   });
 }
+
+/* ---------- the day book, drawn ---------- */
+
+/**
+ * Fetch the book. Called at boot and when the day rolls over — never on a timer:
+ * one row appears per day, so a 30-second poll would re-transfer up to 110 KiB of
+ * numbers that cannot have changed, on the route that is only written once a day.
+ */
+async function refreshCensus() {
+  // Boot and the first `pollAux` both ask for the book within a few hundred ms of
+  // each other; without this they would fetch it twice over the same wire.
+  if (censusInFlight) return;
+  censusInFlight = true;
+  try {
+    const d = await getJSON(`/history/census?days=${CENSUS_WINDOW}`);
+    if (!d || !Array.isArray(d.rows)) return; // a bad answer keeps the last book
+    censusData = d;
+    censusRows = d.rows;
+    censusStack = censusSeries(censusRows, ARCHETYPES);
+    censusHoverDay = null;
+    // A pin the new window no longer holds stops drawing a crosshair but stays in
+    // the link and in `censusPinnedDay`: the day exists, our window is simply not
+    // deep enough to point at it, and `censusPinAbsent` is where the card says so
+    // rather than pretending the visitor never asked.
+  } catch { /* keep stale census */ } finally {
+    censusInFlight = false;
+  }
+}
+
+/** Day-numbered x axis: one slot per day the tank has lived through in the window. */
+function censusGeom(canvas) {
+  const W = canvas.width;
+  const H = canvas.height;
+  const padL = 30 * DPR;
+  const padB = 14 * DPR;
+  const padT = 4 * DPR;
+  const plotW = W - padL - 4 * DPR;
+  const plotH = H - padT - padB;
+  const first = censusRows[0]?.day ?? 0;
+  const last = censusRows[censusRows.length - 1]?.day ?? first;
+  const slotW = plotW / (last - first + 1);
+  return {
+    W, H, padL, padB, padT, plotW, plotH, first, last,
+    slotW,
+    barW: Math.max(DPR, slotW * 0.72),
+    xAt: (day) => padL + (day - first + 0.5) * slotW,
+  };
+}
+
+function drawCensusChart() {
+  nctx.setTransform(1, 0, 0, 1, 0, 0);
+  nctx.clearRect(0, 0, censusCanvas.width, censusCanvas.height);
+  // A closed drawer has no width to draw into, and a tank younger than one day
+  // has no rows. Both stay a blank card with its title and hint, not a fake chart.
+  if (censusCanvas.width === 0 || censusRows.length === 0) return;
+  const g = censusGeom(censusCanvas);
+  const max = Math.max(...censusRows.map((r) => r.population), 1);
+  const yAt = (v) => g.padT + g.plotH - (v / max) * g.plotH;
+
+  nctx.font = `${9 * DPR}px monospace`;
+  nctx.textAlign = 'right';
+  nctx.textBaseline = 'middle';
+  for (let i = 0; i <= 3; i++) {
+    const v = (max * i) / 3;
+    const y = yAt(v);
+    nctx.fillStyle = 'rgba(201, 214, 232, 0.45)';
+    nctx.fillText(String(Math.round(v)), g.padL - 4 * DPR, y);
+    nctx.strokeStyle = 'rgba(30, 45, 75, 0.5)';
+    nctx.lineWidth = DPR * 0.5;
+    nctx.beginPath();
+    nctx.moveTo(g.padL, y);
+    nctx.lineTo(g.padL + g.plotW, y);
+    nctx.stroke();
+  }
+
+  // One stacked bar per closed day. Whatever the row counts beyond the species we
+  // know about is painted in grey on top instead of being dropped, so the top of
+  // every bar is the population the day committed to — never a shorter story.
+  censusRows.forEach((r, i) => {
+    const x = g.xAt(r.day) - g.barW / 2;
+    for (const band of censusStack.stacks) {
+      if (band.hi[i] <= band.lo[i]) continue;
+      nctx.globalAlpha = 0.85;
+      nctx.fillStyle = ARCHETYPE_COLORS[band.archetype] ?? '#8899aa';
+      nctx.fillRect(x, yAt(band.hi[i]), g.barW, yAt(band.lo[i]) - yAt(band.hi[i]));
+    }
+    if (censusStack.unlisted[i] > 0) {
+      nctx.globalAlpha = 0.5;
+      nctx.fillStyle = '#8899aa';
+      const top = censusStack.totals[i] + censusStack.unlisted[i];
+      nctx.fillRect(x, yAt(top), g.barW, yAt(censusStack.totals[i]) - yAt(top));
+    }
+    nctx.globalAlpha = 1;
+  });
+
+  // The committed total, joined only across days that were actually measured: one
+  // unmeasured day breaks the line rather than being drawn over.
+  nctx.strokeStyle = 'rgba(240, 246, 255, 0.95)';
+  nctx.lineWidth = 1.5 * DPR;
+  nctx.beginPath();
+  let prev = null;
+  censusRows.forEach((r) => {
+    const x = g.xAt(r.day);
+    const y = yAt(r.population);
+    if (prev === null || r.day - prev !== 1) nctx.moveTo(x, y);
+    else nctx.lineTo(x, y);
+    prev = r.day;
+  });
+  nctx.stroke();
+
+  // Extinctions (▼, red) and first countings (▲, in the species' colour), at the
+  // day the difference was observed — which is the day the book says it was.
+  for (const e of censusEvents(censusData?.changes)) {
+    const row = censusRows.find((r) => r.day === e.day);
+    if (!row) continue;
+    const x = g.xAt(e.day);
+    const tip = yAt(row.population) - 2 * DPR;
+    nctx.fillStyle = e.kind === 'lost' ? '#ff6b6b' : (ARCHETYPE_COLORS[e.archetype] ?? '#7ee2a8');
+    nctx.beginPath();
+    if (e.kind === 'lost') {
+      nctx.moveTo(x - 3 * DPR, tip - 7 * DPR);
+      nctx.lineTo(x + 3 * DPR, tip - 7 * DPR);
+      nctx.lineTo(x, tip - 2 * DPR);
+    } else {
+      nctx.moveTo(x - 3 * DPR, tip + 5 * DPR);
+      nctx.lineTo(x + 3 * DPR, tip + 5 * DPR);
+      nctx.lineTo(x, tip);
+    }
+    nctx.closePath();
+    nctx.fill();
+  }
+
+  nctx.fillStyle = 'rgba(201, 214, 232, 0.45)';
+  nctx.textBaseline = 'top';
+  nctx.textAlign = 'left';
+  nctx.fillText(t('censusDay', { day: g.first }), g.padL, g.padT + g.plotH + 3 * DPR);
+  nctx.textAlign = 'right';
+  nctx.fillText(t('censusDay', { day: g.last }), g.padL + g.plotW, g.padT + g.plotH + 3 * DPR);
+
+  const hovered = censusRows.find((r) => r.day === aimDay()) ?? null;
+  if (hovered) {
+    const x = g.xAt(hovered.day);
+    nctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+    nctx.lineWidth = DPR * 0.75;
+    nctx.beginPath();
+    nctx.moveTo(x, g.padT);
+    nctx.lineTo(x, g.padT + g.plotH);
+    nctx.stroke();
+    const lines = [
+      { text: `${t('censusDay', { day: hovered.day })} · ${hovered.population}`, color: '#f0f6ff' },
+      ...ARCHETYPES.map((a) => ({
+        text: `${a} ${hovered.byArchetype?.[a] ?? 0}`,
+        color: ARCHETYPE_COLORS[a],
+      })),
+      { text: hovered.hash.slice(0, 14), color: 'rgba(201, 214, 232, 0.6)' },
+    ];
+    nctx.font = `${9 * DPR}px monospace`;
+    const tw = Math.max(...lines.map((l) => nctx.measureText(l.text).width)) + 10 * DPR;
+    const th = lines.length * 11 * DPR + 6 * DPR;
+    const tx = Math.min(x + 6 * DPR, censusCanvas.width - tw - 2 * DPR);
+    const ty = g.padT + 2 * DPR;
+    nctx.fillStyle = 'rgba(7, 12, 22, 0.92)';
+    nctx.fillRect(tx, ty, tw, th);
+    nctx.strokeStyle = 'rgba(60, 80, 120, 0.8)';
+    nctx.strokeRect(tx, ty, tw, th);
+    nctx.textAlign = 'left';
+    nctx.textBaseline = 'top';
+    lines.forEach((l, i) => {
+      nctx.fillStyle = l.color;
+      nctx.fillText(l.text, tx + 5 * DPR, ty + 4 * DPR + i * 11 * DPR);
+    });
+  }
+}
+
+censusCanvas.addEventListener('mousemove', (ev) => {
+  if (censusRows.length === 0 || censusCanvas.width === 0) return;
+  const g = censusGeom(censusCanvas);
+  const r = censusCanvas.getBoundingClientRect();
+  const px = (ev.clientX - r.left) * DPR;
+  const day = Math.round((px - g.padL) / g.slotW - 0.5 + g.first);
+  const hit = censusRows.some((row) => row.day === day) ? day : null;
+  if (hit !== censusHoverDay) {
+    censusHoverDay = hit;
+    drawCensusChart();
+  }
+});
+censusCanvas.addEventListener('mouseleave', () => {
+  if (censusHoverDay === null) return;
+  censusHoverDay = null;
+  drawCensusChart();
+});
+
+/** Which day the crosshair and the tooltip belong to: the cursor, else the pin. */
+function aimDay() {
+  return censusHoverDay ?? censusPinnedDay;
+}
+
+// Clicking a bar is the difference between looking and meaning it. The pin
+// survives the cursor leaving the chart, and it is what the address bar records,
+// so "copy this day" is one click and one button instead of a screenshot.
+censusCanvas.addEventListener('click', () => {
+  const day = censusHoverDay;
+  censusPinnedDay = day === null || day === censusPinnedDay ? null : day;
+  setFocus({ day: censusPinnedDay });
+  // The whole pair, not just the canvas: the pin is also a sentence in text, and
+  // a crosshair that moves while the line under it still names the old day is two
+  // answers to one question.
+  paintCensus();
+});
+
+/**
+ * The same book in words, because a stacked area cannot answer "is anything
+ * dying?" — it shows total height, and a species going extinct inside a growing
+ * tank is invisible in colour alone. Each line is one species and one word, and
+ * `unknown` is allowed to be the word: a two-day book does not know trends yet.
+ */
+function renderCensusText() {
+  const cov = document.getElementById('census-coverage');
+  const trends = document.getElementById('census-trends');
+  const events = document.getElementById('census-events');
+  if (!censusData) {
+    cov.textContent = '';
+    trends.textContent = t('censusLoading');
+    events.textContent = '';
+    pinCensus(null, null);
+    return;
+  }
+  if (censusRows.length === 0) {
+    cov.textContent = '';
+    trends.textContent = t('censusEmpty');
+    events.textContent = '';
+    pinCensus(null, null);
+    return;
+  }
+  const c = censusData.coverage;
+  cov.textContent = t('censusCoverage', { days: c.days, first: c.first, last: c.last });
+  const newest = censusRows[censusRows.length - 1];
+  trends.innerHTML = ARCHETYPES.map((a) => {
+    const tr = censusTrend(censusRows, a);
+    const rate = tr.perDay === null
+      ? ''
+      : ` <em>${t('censusPerDay', { n: `${tr.perDay > 0 ? '+' : ''}${tr.perDay.toFixed(2)}` })}</em>`;
+    return `<div class="census-row"><i class="cr-dot" style="background:${ARCHETYPE_COLORS[a]}"></i>`
+      + `<span class="cr-name">${esc(a)}</span>`
+      + `<b class="cr-state cr-${tr.state}">${esc(t(CENSUS_TREND_KEYS[tr.state]))}</b>`
+      + `<span class="cr-num">${newest.byArchetype?.[a] ?? 0}${rate}</span></div>`;
+  }).join('');
+  const gaps = censusStack.gaps.slice(0, 3).map((gp) => `<div class="census-row cr-gap"><span>${esc(t('censusGap', { after: gp.after, before: gp.before }))}</span></div>`);
+  const marks = censusEvents(censusData.changes)
+    .slice(-6)
+    .reverse()
+    .map((e) => `<div class="census-row"><i class="cr-dot" style="background:${e.kind === 'lost' ? '#ff6b6b' : (ARCHETYPE_COLORS[e.archetype] ?? '#8899aa')}"></i>`
+      + `<span>${esc(t(e.kind === 'lost' ? 'censusLost' : 'censusGained', { a: e.archetype, day: e.day }))}</span></div>`);
+  events.innerHTML = [...gaps, ...marks].join('');
+  pinCensus(censusPinnedDay, censusRows.find((r) => r.day === censusPinnedDay) ?? null);
+}
+
+/**
+ * The pinned day in words, so that a shared `?day=` states what it points at
+ * rather than leaving it as a pixel a viewer has to hover to discover. When the
+ * day is real but outside the window we fetched, it says that too: an absent row
+ * is a fact about our request, not a claim that the day was never lived.
+ */
+function pinCensus(day, row) {
+  const el = document.getElementById('census-pin');
+  if (day === null || day === undefined) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
+  el.hidden = false;
+  el.textContent = row
+    ? t('censusPin', { day: row.day, pop: row.population, hash: row.hash.slice(0, 12) })
+    : t('censusPinAbsent', { day });
+}
+
+/**
+ * The one paint path for the census: bars and words come from the same rows, so
+ * they are always refreshed together. `refreshCensus` chains this rather than the
+ * text alone — a book that arrived over the wire but was never redrawn left the
+ * canvas empty until the next 30-second aux cycle, which at boot meant "the text
+ * says four days and the chart says nothing at all".
+ */
+function paintCensus() {
+  drawCensusChart();
+  renderCensusText();
+}
+
+// The boot fetch sits here rather than beside `pollAux()` where the other pollers
+// start, and that is not a style choice: `censusInFlight` is a `let` two thousand
+// lines below that call site, so asking for the book from there threw a TDZ
+// ReferenceError and took the whole module down with it. `let` bindings hoist into
+// a dead zone, functions do not carry their file position with them.
+//
+// The book is its own request rather than another arm of `pollAux`'s Promise.all:
+// one failing endpoint there used to take the charts, the culls and the reports
+// down with it, and the census has even less reason to ride along every 30s.
+refreshCensus().then(paintCensus);
 
 /* ---------- obituaries (cull records grouped by event) ---------- */
 
@@ -4404,6 +4812,10 @@ let cardFor = null;
 
 function renderCard(c) {
   const el = document.getElementById('creature-card');
+  // The card is the one place every selection path ends up — click, follow list,
+  // intervention target, language switch — so the link is kept honest here rather
+  // than at the four call sites that would each forget one.
+  setFocus(c ? { creature: c.id } : { creature: null });
   if (!c) { el.hidden = true; cardFor = null; return; }
   if (cardFor !== c.id) { cardFor = c.id; cardAdvanced = false; }
   const maxEnergy = 200;
@@ -4449,6 +4861,7 @@ function renderCard(c) {
     <div class="card-actions">
       <button id="watch-btn" class="dock-btn">${watched.has(c.id) ? t('unwatch') : t('watch')}</button>
       <button id="adv-btn" class="dock-btn mini">${cardAdvanced ? t('advancedHide') : t('advanced')}</button>
+      <button id="link-btn" class="dock-btn mini">${t('copyLink')}</button>
     </div>
     <div class="card-actions">
       <button id="card-name-btn" class="dock-btn mini">${t('ivName')}</button>
@@ -4472,6 +4885,7 @@ function renderCard(c) {
     cardAdvanced = !cardAdvanced;
     renderCard(c);
   };
+  el.querySelector('#link-btn').onclick = copyFocusLink;
   // The three paid actions live on the card too, so picking a creature in the
   // water is one click from spending on it — no hunting through the panel.
   el.querySelector('#card-name-btn').onclick = () => openIvModal('name', c);
@@ -4576,6 +4990,99 @@ let myWho = null;
 let meFetchedAt = 0;
 let factionCounts = {};
 
+/* ---------- what changed here while the visitor was away ---------- */
+
+/**
+ * The baseline is the previous `/who` answer for this address, kept on this
+ * device. Not in the tank's ledger: the ledger has a storage budget that alarms,
+ * a route that writes on read would defeat its own caching, and when somebody
+ * looked at their own standing is not data the server should be holding.
+ */
+const STANDING_PREFIX = 'abyssal-standing:';
+
+function readStanding(addr) {
+  if (!addr) return null;
+  try {
+    const raw = localStorage.getItem(STANDING_PREFIX + addr.toLowerCase());
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function writeStanding(row) {
+  try {
+    localStorage.setItem(STANDING_PREFIX + row.address, JSON.stringify(row));
+  } catch { /* private mode, or the quota is full: the standing itself still shows */ }
+}
+
+/** `null` is "no memory to compare with"; `[]` is "memory, and nothing changed". */
+let mySince = null;
+/** The row the comparison was made against, kept for the moment it was taken. */
+let mySinceFrom = null;
+
+/** Species first, then the name: a forgotten name (`#7`) still reads as somebody. */
+const sinceWho = (i) => (i.archetype ? `${i.archetype} ${i.name}` : String(i.name));
+
+const SINCE_LINE = {
+  lost: (i) => t('sinceLost', { who: sinceWho(i) }),
+  added: (i) => t('sinceAdded', { who: sinceWho(i) }),
+  report: (i) => t('sinceReport', { type: i.type, n: i.affected, score: i.score ?? '…' }),
+  burn: (i) => t('sinceBurn', { n: i.n, amt: i.amount.toLocaleString() }),
+  passTo: (i) => t('sincePassTo', { d: sinceDay(i.until, latestSnap?.ticksPerDay ?? 19200) ?? '…' }),
+  passGone: () => t('sincePassGone'),
+  rank: (i) => t('sinceRank', { from: i.from ?? '—', to: i.to ?? '—' }),
+  cheer: (i) => t('sinceCheer', { a: i.to ?? '—' }),
+};
+
+/**
+ * Fold this address's new answer into the memory of the last one.
+ *
+ * The order is the feature: comparing must happen before the write, or there is
+ * nothing left to compare, and neither may happen on a fetch that failed — a
+ * network gap is not a quiet spell in the tank.
+ */
+function noteStanding() {
+  const row = standingSeed(myWho, { tick: state?.tick, day: state?.day });
+  // An answer that does not say whose address it is cannot be filed, and diffing
+  // it against somebody else's memory would be a claim about the wrong person.
+  if (!row.address) {
+    mySince = null;
+    mySinceFrom = null;
+    return;
+  }
+  const prev = readStanding(row.address);
+  mySince = diffStanding(prev, row);
+  mySinceFrom = prev;
+  writeStanding(row);
+}
+
+function renderSince() {
+  const el = document.getElementById('me-since');
+  if (!el) return;
+  if (!myAddr || (!myWho && mySince === null)) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  if (mySince === null) {
+    el.hidden = false;
+    el.innerHTML = `<div class="prop ms-none"><span>${esc(t('sinceFirst'))}</span></div>`;
+    return;
+  }
+  const day = mySinceFrom?.seenDay;
+  const head = Number.isFinite(day) ? t('sinceTitleTick', { d: day }) : t('sinceTitle');
+  if (mySince.length === 0) {
+    el.hidden = false;
+    el.innerHTML = `<div class="ms-head">${esc(head)}</div>`
+      + `<div class="prop"><span>${esc(t('sinceQuiet'))}</span></div>`;
+    return;
+  }
+  const { shown, more } = trimSince(mySince);
+  el.hidden = false;
+  el.innerHTML = `<div class="ms-head">${esc(head)}</div>`
+    + shown.map((i) => `<div class="prop"><span>${esc(SINCE_LINE[i.kind]?.(i) ?? i.kind)}</span></div>`).join('')
+    + (more ? `<div class="ms-more">${esc(t('sinceMore', { n: more }))}</div>` : '');
+}
+
 /**
  * The connected address, without prompting: eth_accounts only answers once the
  * visitor has approved this site, which the burn flow already asks for.
@@ -4589,6 +5096,11 @@ async function resolveMe() {
     if (next === myAddr) return;
     myAddr = next;
     myWho = null;
+    // The memory belongs to the address that made it, so a switch starts over:
+    // the alternative is telling somebody the story of whoever used this browser
+    // before them.
+    mySince = null;
+    mySinceFrom = null;
     if (next) {
       await fetchMe();
     } else {
@@ -4608,6 +5120,11 @@ async function fetchMe() {
     myWho = await res.json();
     meFetchedAt = Date.now();
     myCheer = myWho.cheer;
+    // Only while the standing is actually on screen. The wallet is resolved at
+    // boot, so an unconditional note here would spend the visitor's memory on a
+    // fetch they never saw, and by the time they opened the drawer the honest
+    // answer to "what happened while you were away" would always be "nothing".
+    if (!document.getElementById('drawer-you').hidden) noteStanding();
     renderMe();
     renderFactions(factionCounts);
   } catch { /* offline: keep the last card */ }
@@ -4626,6 +5143,10 @@ function renderMe() {
   if (!myAddr) {
     el.hidden = true;
     if (none) none.hidden = false;
+    // The card goes and the memory of it goes with it — reached from here rather
+    // than from the caller, because this is the one place that knows the wallet is
+    // gone.
+    renderSince();
     return;
   }
   el.hidden = false;
@@ -4641,6 +5162,7 @@ function renderMe() {
     (w?.cheer ? line('rallyingFor', w.cheer) : '') +
     (w?.badges?.length ? `<div class="chips">${badgeChips(w.badges)}</div>` : '');
   el.querySelector('.who-link')?.addEventListener('click', () => openAddrCard(myAddr));
+  renderSince();
 }
 
 function renderFactions(cheers) {
@@ -4842,6 +5364,10 @@ function toggleDrawer(which) {
     el.hidden = !open;
     btn.classList.toggle('open', open);
   }
+  // Only one drawer can be open, so the state worth recording is which one ended
+  // up open — including "none", which is what closing the last one means.
+  const openKey = Object.keys(drawers).find((key) => !document.getElementById(drawers[key]).hidden) ?? null;
+  setFocus({ drawer: openKey });
   if (which === 'analytics' && !document.getElementById(drawers.analytics).hidden) {
     resize();
   }
@@ -4896,3 +5422,49 @@ document.addEventListener('langchange', () => {
     renderCard(c ?? null);
   }
 });
+
+/* ---------- open where the link says to ---------- */
+
+/**
+ * Apply the focus this page was opened with.
+ *
+ * Called from the bottom of the module, and only from here: every writer it
+ * reaches — `setView`, `toggleDrawer`, `openAddrCard`, `renderCard` — is declared
+ * further down than the pollers that start at the top, and a `const` in the way is
+ * a dead zone, not a hoist. The order below is the order the states depend on:
+ * the view first, because changing it closes the address card, and the card after,
+ * because opening one is what the view is for.
+ */
+async function applyFocus() {
+  setView(focus.view);
+  if (focus.day !== undefined) censusPinnedDay = focus.day;
+  if (focus.drawer) toggleDrawer(focus.drawer);
+  if (focus.addr) openAddrCard(focus.addr);
+  if (focus.creature !== undefined) await selectLinkedCreature(focus.creature);
+  paintCensus();
+}
+
+/**
+ * Select an animal the link named, once the snapshot loop has it in hand.
+ *
+ * A creature id is not a permanent handle — animals die every day, and a link
+ * copied this morning can point at nothing by noon. So this waits for the poll
+ * that would carry it and then gives up quietly: the tank the link opens is still
+ * the right tank, and "no such creature" is a claim about a snapshot, not a fact
+ * worth interrupting a visitor with.
+ */
+async function selectLinkedCreature(id, tries = 20) {
+  for (let i = 0; i < tries; i += 1) {
+    const c = latestSnap?.byId.get(id);
+    if (c) {
+      selectedId = id;
+      renderCard(c);
+      followCreature(id, 8000);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
+applyFocus();

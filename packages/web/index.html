@@ -10,6 +10,18 @@
   <meta property="og:title" content="ABYSSAL — the x402 observatory" />
   <meta property="og:description" content="A live observatory for x402 machine payments on Arc mainnet, plus a deterministic ecosystem fed by that same flow." />
   <meta property="og:type" content="website" />
+  <!-- The preview card is a committed PNG, drawn by `tools/make-og.mjs` out of the two
+       strings above and out of assets/favicon.svg. Static on purpose: this document
+       is served by the asset layer with the edge cache in front of it — a GET / never
+       reaches the Worker — so naming the creature in the card would mean routing every
+       page view through the Durable Object to change three meta tags.
+       Absolute URLs, because a relative og:image is not resolved by every crawler. -->
+  <meta property="og:url" content="https://www.abyssal-arc.com/" />
+  <meta property="og:image" content="https://www.abyssal-arc.com/assets/og.png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="The Abyssal icon beside the word ABYSSAL and the words the x402 observatory, on a dark blue gradient" />
+  <meta name="twitter:card" content="summary_large_image" />
   <link rel="icon" type="image/svg+xml" href="/assets/favicon.svg" />
   <link rel="apple-touch-icon" href="/assets/apple-touch.png" />
   <link rel="stylesheet" href="/style.css" />
@@ -129,6 +141,7 @@
     <div class="addr-sub" data-i18n="addrRecent">Recent flows</div>
     <div id="addr-flows"></div>
     <a class="explore" href="#" target="_blank" rel="noopener" data-i18n="addrExplorer">View on explorer</a>
+    <button id="addr-link" class="dock-btn" data-i18n="copyLink">copy link</button>
     <button id="addr-world" class="dock-btn" data-i18n="viewInTank" hidden>view in tank</button>
   </div>
 
@@ -244,6 +257,17 @@
           <div class="section-title" data-i18n="tempsTitle">Chain &amp; Market</div>
           <canvas id="temps"></canvas>
         </div>
+        <div id="census-wrap">
+          <div class="section-title">
+            <span data-i18n="censusTitle">Census, day by day</span>
+            <span class="census-coverage" id="census-coverage"></span>
+          </div>
+          <canvas id="census"></canvas>
+          <div id="census-pin" hidden></div>
+          <div id="census-trends" class="census-rows"></div>
+          <div id="census-events" class="census-rows"></div>
+          <p class="hint" data-i18n="censusHint">one row per closed day · the top of each stack is the population that day committed to, the species inside it are our report</p>
+        </div>
       </div>
     </div>
   </div>
@@ -252,6 +276,7 @@
     <div class="section-title" data-i18n="yourStanding">Your standing</div>
     <div id="me-card" class="daily" hidden></div>
     <div id="me-none" class="addr-empty" data-i18n="standingNone">Burn ABYS from your wallet and your standing appears here.</div>
+    <div id="me-since" class="daily" hidden></div>
     <div class="section-title" data-i18n="factionsTitle">Factions</div>
     <div id="factions" class="chips"></div>
     <div class="section-title" data-i18n="burnersTitle">Top burners</div>

@@ -51,6 +51,22 @@ export const SIGNAL_KINDS = [
   'digest_reverted',
   'digest_record_rejected',
   /**
+   * A stored day-book row no longer means what it claims — usually a headcount
+   * that does not add up to the population beside it. Counted for the same reason
+   * as the digest record above: the row was read out of storage, so whatever wrote
+   * it is already gone, and without a number the only evidence that the tank's
+   * history is being discarded on every cold start is a console line.
+   */
+  'census_row_rejected',
+  /**
+   * The day book reached its cap and a day fell out of the front of it. A warning
+   * in the `*_past_budget` sense: nothing failed, the write worked, and the point
+   * of counting it is that history silently stops being complete from here on.
+   * 400 days is more than a year of tank, so a growing count is a long-running
+   * world and a signal to go publish the part about to be forgotten.
+   */
+  'census_days_dropped',
+  /**
    * A payer did the wallet work and the money could not be taken. Counted
    * because nothing else can see it: the buyer gets a 402 back and moves on, and
    * the only record of a lost sale would be a log line nobody tails.

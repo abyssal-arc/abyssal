@@ -369,6 +369,15 @@ button.chip.faction.mine {
 #burners .af.me .who { color: var(--accent); }
 .who-link { color: var(--accent); cursor: pointer; border-bottom: 1px solid transparent; }
 .who-link:hover { border-bottom-color: var(--accent); }
+/* The memory of the previous answer, sitting under the standing it describes.
+   Quieter than a stat line on purpose: it speaks about a stretch of time rather
+   than about a number, and it is a sentence rather than a label. */
+#me-since { margin-top: calc(var(--sp) * 2); }
+.ms-head {
+  font-family: var(--font-display); font-size: 9px; line-height: 14px;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--fg-3);
+}
+.ms-more, .ms-none { font-size: 9px; color: var(--fg-3); }
 #addr-tank { margin-top: calc(var(--sp) * 2); }
 .rules-hint {
   margin-top: calc(var(--sp) * 2);
@@ -376,7 +385,7 @@ button.chip.faction.mine {
   line-height: 1.5;
   color: var(--fg-3);
 }
-#addr-world { margin-top: calc(var(--sp) * 2); }
+#addr-link, #addr-world { margin-top: calc(var(--sp) * 2); }
 .langs { position: relative; }
 .lang-menu {
   position: absolute;
@@ -890,19 +899,47 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 }
 .analytics-charts {
   display: grid;
-  grid-template-rows: 1fr 1fr;
+  grid-template-rows: 1fr 1fr minmax(160px, 1.15fr);
   gap: calc(var(--sp) * 3);
   height: 60vh;
   min-width: 0;
 }
-#chart-wrap, #temps-wrap { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-#chart, #temps {
+#chart-wrap, #temps-wrap, #census-wrap { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#chart, #temps, #census {
   flex: 1;
   width: 100%;
   min-height: 0;
   background: rgba(7, 12, 22, 0.6);
   border-radius: var(--radius-sm);
   cursor: crosshair;
+}
+
+/* ---------- census: the same book in words ---------- */
+/* A stack of four translucent colours cannot answer "is anything dying?", so the
+   trend words sit under the chart. Colours follow the existing semantic tokens:
+   accent for growth, amber for a decline that is still alive, danger for zero. */
+.census-coverage { margin-left: 10px; font-size: 10px; color: var(--fg-3); }
+.census-rows { display: flex; flex-direction: column; gap: 1px; margin-top: calc(var(--sp)); }
+.census-row { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--fg-2); }
+.census-row .cr-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.census-row .cr-name { font-family: var(--font-display); letter-spacing: 0.02em; color: var(--fg-1); }
+.census-row .cr-state { font-weight: 600; }
+.census-row .cr-state.cr-expanding { color: var(--accent); }
+.census-row .cr-state.cr-shrinking { color: var(--amber); }
+.census-row .cr-state.cr-gone { color: var(--danger); }
+.census-row .cr-state.cr-steady { color: var(--fg-2); }
+.census-row .cr-state.cr-unknown { color: var(--fg-3); font-style: italic; }
+.census-row .cr-num { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--fg-1); }
+.census-row .cr-num em { font-style: normal; color: var(--fg-3); }
+.census-row.cr-gap span { color: var(--fg-3); font-style: italic; }
+/* The pinned day, in words. A crosshair on a canvas is not something a forwarded
+   URL can carry, so the day a link points at has to be readable as text. */
+#census-pin {
+  margin-top: calc(var(--sp));
+  font-family: var(--font-display);
+  font-size: 10px;
+  color: var(--fg-1);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- obituaries ---------- */
@@ -1341,8 +1378,8 @@ body.view-observe .drawer, body.view-observe #banner { display: none !important;
   #drawer-analytics { max-height: 62vh; }
   .analytics-grid { grid-template-columns: 1fr; gap: calc(var(--sp) * 3); }
   .analytics-side { max-height: none; overflow: visible; }
-  .analytics-charts { grid-template-rows: auto auto; height: auto; }
-  #chart, #temps { height: 30vh; flex: 0 0 auto; }
+  .analytics-charts { grid-template-rows: auto auto auto; height: auto; }
+  #chart, #temps, #census { height: 30vh; flex: 0 0 auto; }
   #observe-view { top: calc(var(--sp) * 26); display: flex; flex-direction: column; overflow-y: auto; }
   .obs-col { flex: 0 0 auto; }
   /* Flex-basis-0 canvases contribute nothing to grid row sizing, so give them

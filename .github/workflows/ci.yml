@@ -25,4 +25,7 @@ jobs:
           node --input-type=module --check < packages/web/i18n.js
           node --input-type=module --check < packages/web/src/geom.js
           node --input-type=module --check < packages/web/src/format.js
+          node --input-type=module --check < packages/web/src/census.js
+          node --input-type=module --check < packages/web/src/deeplink.js
+          node --input-type=module --check < packages/web/src/since.js
       - run: npm test

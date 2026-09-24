@@ -29,10 +29,12 @@ import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
-  buildPayload, coherenceProblem, digestHash, digestStats, encodeDigest, isSettled,
+  buildPayload, censusChanges, censusProblem, censusRow, coherenceProblem, digestHash, digestStats,
+  encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
-  newDigestRecord, nextDigestAction, verifyPayload, DIGEST_MAX_ATTEMPTS,
-  type DigestRecord,
+  newDigestRecord, nextDigestAction, verifyPayload,
+  CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS,
+  type CensusDay, type DigestRecord,
 } from './digest.js';
 import { healthProblem, type Health } from './health.js';
 import {
@@ -202,6 +204,13 @@ export interface LedgerSnapshot {
    * was first hashed rather than re-reading a world that has moved on.
    */
   digest?: DigestRecord;
+  /**
+   * The day book: one row per anchored day, oldest first. Durable for the same
+   * reason the digest record is — a cold isolate that cannot read its own history
+   * back has no past to chart, and re-deriving one from a world that has moved on
+   * would be invention. Bounded by `CENSUS_CAP` on both sides of the write.
+   */
+  dayBook?: CensusDay[];
 }
 
 /**
@@ -221,6 +230,8 @@ export interface LedgerLoad {
   feedState?: FeedState;
   /** Absent in ledgers written before the digest was made durable. */
   digest?: DigestRecord;
+  /** Absent in ledgers written before the tank kept a day book. */
+  dayBook?: CensusDay[];
 }
 
 export interface WorldStore {
@@ -889,6 +900,15 @@ export function createApp(options: AppOptions = {}) {
         sales: dataSales,
         spentPayments: settledNonces.size,
       },
+      // How far back the tank remembers, in days, against the cap it is cut off
+      // at. Reported even when the book is empty, because `days: 0` is the answer
+      // to "since when can I chart this" and silence would read as a broken route.
+      census: {
+        days: dayBook.length,
+        cap: CENSUS_CAP,
+        first: dayBook.length ? dayBook[0].day : null,
+        last: dayBook.length ? dayBook[dayBook.length - 1].day : null,
+      },
       world: {
         tick: world.tick,
         day: Math.floor(world.tick / world.config.ticksPerDay),
@@ -961,6 +981,34 @@ export function createApp(options: AppOptions = {}) {
    * durable while this flag is not, which is the point of keeping them apart.
    */
   let digestPumpInFlight = false;
+
+  /**
+   * The day book, oldest first. Written where the commitment is made — see
+   * `pumpDigest` — so a row and its hash describe the same reading or neither
+   * exists. Only the tail is kept; see `CENSUS_CAP`.
+   */
+  let dayBook: CensusDay[] = [];
+
+  /**
+   * Append one day to the book.
+   *
+   * One row per day is the invariant the charts depend on, and the day is the
+   * key rather than the array position: a record rebuilt for a day already in
+   * the book replaces that row instead of stacking a second claim onto the same
+   * date. Trimming from the front keeps the newest `CENSUS_CAP` days, which is
+   * the only history this route has ever promised.
+   */
+  function noteDayBook(row: CensusDay): void {
+    const last = dayBook[dayBook.length - 1];
+    if (last && last.day === row.day) dayBook[dayBook.length - 1] = row;
+    else dayBook.push(row);
+    if (dayBook.length > CENSUS_CAP) {
+      dayBook.splice(0, dayBook.length - CENSUS_CAP);
+      // The alternative is a chart that quietly stops being a complete record of
+      // the world's past, discovered by whoever notices the first day missing.
+      options.health?.note('census_days_dropped', `day ${row.day} closed a book of ${CENSUS_CAP}`);
+    }
+  }
 
   /**
    * The signing key, from whichever channel actually delivered it.
@@ -1059,8 +1107,18 @@ export function createApp(options: AppOptions = {}) {
         // An unsettled record is deliberately *not* replaced. Dropping a day
         // that still has retries left would lose its anchor silently the first
         // time an RPC hiccuped across a day boundary.
-        rec = newDigestRecord(prevDay, await buildPayload(digestStats(prevDay, world), Date.now()));
+        const stats = digestStats(prevDay, world);
+        const ts = Date.now();
+        const payload = await buildPayload(stats, ts);
+        rec = newDigestRecord(prevDay, payload);
         digest = rec;
+        // The book row is written from the same `stats` and the same `world` as
+        // the payload two lines above, so the population it publishes cannot
+        // disagree with the population that just went on chain. Written whether
+        // or not the broadcast succeeds: the day happened, and a book that only
+        // recorded the days the RPC co-operated with would be an uptime log with
+        // creatures in it.
+        noteDayBook(censusRow(stats, world, payload.hash, ts));
         saveStore();
       }
       const action = nextDigestAction(rec, Date.now());
@@ -1622,6 +1680,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
+        'GET /history/census': `the day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows; ?days=<n> for the newest n; see .hashed for what the commitment covers`,
         'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the Arc USDC flow ring this isolate has polled so far, filtered by ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; the answer carries retained/oldest/newest so the coverage bought is visible rather than implied; 503 until the SELLER_PRIVATE_KEY binding is set`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
@@ -1722,6 +1781,36 @@ export function createApp(options: AppOptions = {}) {
       } catch {
         return json({ error: 'history unavailable' }, 503);
       }
+    }
+
+    if (req.method === 'GET' && path === '/history/census') {
+      // The day book: what was alive each day, beside the commitment made for it.
+      // `?days=` trims what is *sent*, never what the derivation sees — extinction
+      // is a statement about two consecutive days, and a window that hid the
+      // predecessor would quietly stop reporting the ones that mattered.
+      const want = positiveInt(url.searchParams.get('days'), 0);
+      const rows = want > 0 ? dayBook.slice(-want) : [...dayBook];
+      const shown = new Set(rows.map((r) => r.day));
+      const changes = censusChanges(dayBook).filter((c) => shown.has(c.day));
+      return json({
+        cap: CENSUS_CAP,
+        book: dayBook.length,
+        // First day in the book, not the first day of the tank: rows exist only
+        // from when the book started being written, and this says which that was.
+        coverage: dayBook.length
+          ? { first: dayBook[0].day, last: dayBook[dayBook.length - 1].day, days: dayBook.length }
+          : null,
+        // Which fields of a row travelled to the chain. The headcounts did not,
+        // and a reader who assumes otherwise is trusting the wrong artifact.
+        hashed: [...DIGEST_HASH_FIELDS],
+        rows,
+        changes,
+        today: {
+          ...digestStats(Math.floor(world.tick / world.config.ticksPerDay), world),
+          byArchetype: headcountByArchetype(world),
+          committed: false,
+        },
+      }, 200, 3);
     }
 
     if (req.method === 'GET' && path === '/data/flows') {
@@ -2330,6 +2419,24 @@ export function createApp(options: AppOptions = {}) {
           options.health?.note('digest_record_rejected');
         } else digest = s.digest;
       }
+      // Every stored row is asked whether it still means what it claims, for the
+      // same reason the digest record is: this value outlives the code that wrote
+      // it. A census row whose headcount does not add up to its own population is
+      // the exact shape that would sit in a chart for a year looking like a fact.
+      if (Array.isArray(s.dayBook)) {
+        const rows: CensusDay[] = [];
+        for (const row of s.dayBook) {
+          const problem = row ? censusProblem(row) : 'not a row at all';
+          if (problem) {
+            console.error(`stored census row rejected: ${problem} (day ${row?.day ?? 'unknown'})`);
+            // Counted per hydrate, like the digest record: a row that cannot be
+            // read back fails on every cold start until a new day replaces it, so
+            // a growing count is the sound of the book being rewritten from zero.
+            options.health?.note('census_row_rejected');
+          } else rows.push(row);
+        }
+        dayBook = rows.length > CENSUS_CAP ? rows.slice(rows.length - CENSUS_CAP) : rows;
+      }
     })();
     return hydrated;
   }
@@ -2343,6 +2450,7 @@ export function createApp(options: AppOptions = {}) {
       lastAdvanceAt,
       feedState: chainFeed.exportState?.(),
       digest: digest ?? undefined,
+      dayBook,
     });
   }
 

@@ -21,12 +21,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import {
-  buildPayload, digestHash, digestStats, encodeDigest, newDigestRecord,
+  buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestStats, encodeDigest, newDigestRecord,
   markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
   nextDigestAction, coherenceProblem, verifyPayload, isSettled,
-  DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
+  CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
   DIGEST_RETRY_MS, DIGEST_V,
-  type DigestPayload, type DigestRecord,
+  type CensusChange, type CensusDay, type DigestPayload, type DigestRecord,
 } from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 import {
@@ -1307,6 +1307,14 @@ function memStore() {
      */
     digest: () => state.digest,
     seedDigest: (d: DigestRecord) => { state = { ...state, digest: d }; },
+    /**
+     * The day book, out of the persisted ledger rather than the closure, for the
+     * same reason as `digest()` above — and reading it back through a second
+     * `createApp` is the only way to test that a row survives the isolate that
+     * wrote it, which is the whole difference between a history and a session.
+     */
+    dayBook: () => state.dayBook,
+    seedDayBook: (rows: CensusDay[]) => { state = { ...state, dayBook: rows }; },
   };
 }
 
@@ -3257,6 +3265,7 @@ type HealthBody = {
     verifies: boolean;
     signer: string | null;
   } | null;
+  census: { days: number; cap: number; first: number | null; last: number | null };
   data: {
     forSale: boolean;
     priceUsdc: string;
@@ -3494,6 +3503,280 @@ test('a payload whose hash no longer describes it is named without an attempt be
   assert.equal(value.healthy, false);
   assert.equal(value.digest?.verifies, false);
   assert.equal(value.digest?.status, 'queued');
+});
+
+/* ---------- the day book: what was alive, beside what was anchored ---------- */
+
+/**
+ * The census route's payload, named once so the tests below assert against a
+ * shape rather than against a pile of `as any`.
+ */
+type CensusBody = {
+  cap: number;
+  book: number;
+  coverage: { first: number; last: number; days: number } | null;
+  hashed: string[];
+  rows: CensusDay[];
+  changes: CensusChange[];
+  today: Omit<CensusDay, 'hash' | 'ts'> & { committed: boolean };
+};
+
+const readCensus = async (
+  target: { fetch(req: Request): Promise<Response> },
+  query = '',
+): Promise<CensusBody> =>
+  (await (await target.fetch(new Request(`http://localhost/history/census${query}`))).json()) as CensusBody;
+
+const sumHeads = (row: { byArchetype: Record<string, number> }): number =>
+  Object.values(row.byArchetype).reduce((s, n) => s + n, 0);
+
+/**
+ * A hand-built row for the tests that need many of them (the cap, the
+ * derivations) and cannot afford to live through that many days of tank.
+ * Cumulative counters run forward by a fixed amount per day, so a delta is a
+ * small literal instead of arithmetic on the fixture. Every one of these is
+ * asserted to be a legal row in the test below it: a rejection anywhere else is
+ * then the guard firing, not sloppy data.
+ */
+function censusFixture(
+  day: number,
+  byArchetype: Record<string, number> = { APE: 2, WHALE: 1, ALGO: 1, INSIDER: 1 },
+): CensusDay {
+  const population = sumHeads({ byArchetype });
+  return {
+    day,
+    tick: (day + 1) * 19_200,
+    population,
+    totalEnergy: population * 100,
+    born: 100 + day * 10,
+    died: 50 + day * 5,
+    predations: day * 3,
+    topPredator: population ? `APE:${population}` : null,
+    byArchetype,
+    hash: 'ab'.repeat(32),
+    ts: 1_800_000_000_000 + day * 86_400_000,
+  };
+}
+
+test('the fixtures are rows the guard accepts, so a rejection later means something', () => {
+  assert.equal(censusProblem(censusFixture(0)), null);
+  assert.equal(censusProblem(censusFixture(401)), null);
+  assert.equal(censusProblem(censusFixture(3, {})), null, 'an extinct day is a legal row, not a missing one');
+});
+
+test('a closed day is written into the book and still there when it is read back', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth(1);
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 3);
+      assert.equal(m.dayBook()?.length ?? 0, 0, 'day 0 is still open, so nothing is promised about it and nothing is filed');
+
+      await tickTimes(app, 1);
+      const rec = await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
+      const book = m.dayBook() ?? [];
+      assert.equal(book.length, 1, 'the row and the record land in one write, so one without the other is a bug');
+      const row = book[0];
+      assert.equal(row.day, 0, 'the day that closed');
+      assert.match(row.hash, /^[0-9a-f]{64}$/, 'bare digest hex, the shape `digestHash` emits — not a `0x` tx hash');
+      assert.equal(await digestHash(row), row.hash, 'the stored row is still the pre-image its hash was taken from');
+      assert.equal(sumHeads(row), row.population, 'the species add up to the population they were counted with');
+      // The claim the whole design rests on, checked rather than described: the
+      // census and the anchor are the same reading, so no viewer can be shown a
+      // population that the chain commitment contradicts.
+      assert.equal(row.population, rec.payload.population);
+      assert.equal(row.tick, rec.payload.tick);
+
+      // A second isolate over the same storage. This is the assertion that makes
+      // the hash shape above load-bearing: a validator that expected the `0x` a
+      // transaction hash carries would drop every honest row here, and the tank
+      // would serve an empty history to anybody who restarted.
+      const again = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      const reread = await readCensus(again);
+      assert.deepEqual(reread.rows, book, 'read back whole, oldest first, with its hash intact');
+      assert.deepEqual(reread.coverage, { first: 0, last: 0, days: 1 });
+      const h = await readHealth(again);
+      assert.equal(h.signals?.counts.census_row_rejected, undefined, 'a sound row is not refused on the way in');
+      assert.deepEqual(h.census, { days: 1, cap: CENSUS_CAP, first: 0, last: 0 });
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('days are still written down when nothing goes on chain', async () => {
+  assert.equal(process.env.ARC_DIGEST_KEY, undefined, 'no key in this one, on purpose');
+  const m = memStore();
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  shortenDay(app);
+  await tickTimes(app, 4);
+  // Let day 0's pump finish before closing day 1. While a pump is in flight the
+  // guard at the top of `pumpDigest` returns immediately, and a test that ticks
+  // straight through two boundaries in one event-loop turn therefore never gives
+  // the second day a pump at all — on a live tank the next tick retries in 250ms,
+  // here nothing would ever ask again.
+  await pumpQuiet();
+  await tickTimes(app, 4);
+  // Wait on the *second* day's record, not on any record: the first one is
+  // already `unconfigured` the moment it lands, so asking for that status is
+  // satisfied a whole day early and the assertion below races the pump.
+  await untilDigest(m.digest, (r) => r.day === 1 && r.status === 'unconfigured', 'day 1 unconfigured');
+  const body = await readCensus(app);
+  assert.deepEqual(body.rows.map((r) => r.day), [0, 1], 'oldest first, and the off-chain days are in it');
+  assert.equal(
+    new Set(body.rows.map((r) => r.day)).size,
+    body.rows.length,
+    'one row per day — a book with two claims for a date is a book of deltas that are not days',
+  );
+});
+
+test('a day that is anchored twice replaces its row rather than stacking a second claim', async () => {
+  const m = memStore();
+  const health = createHealth(1);
+  // The reachable collision: a record that hydrate refuses (here `pending` with
+  // no transaction, the D1 lie) leaves the pump with nothing outstanding, so it
+  // re-records the closed day — while the book still holds the row written
+  // alongside the rejected record. Appending would hand `censusChanges` two
+  // readings of one tick and let it publish the difference as a day of births.
+  m.seedDigest({
+    ...newDigestRecord(0, await buildPayload({ ...STATS, day: 0 }, 1)),
+    status: 'pending',
+    txHash: null,
+    attempts: 1,
+    lastAttemptAt: 1,
+  });
+  m.seedDayBook([censusFixture(0)]);
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  shortenDay(app);
+  await tickTimes(app, 4);
+  await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+  const body = await readCensus(app);
+  assert.equal(body.rows.length, 1, 'one day, one row');
+  assert.notEqual(body.rows[0].hash, censusFixture(0).hash, 'and it is the fresh reading, not the stale one');
+  assert.deepEqual(body.changes, [], 'nothing is derived against a day that is no longer in the book');
+});
+
+test('a stored row whose headcount contradicts its population is dropped and counted', async () => {
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDayBook([censusFixture(0), { ...censusFixture(1), byArchetype: { APE: 99 } }]);
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value, errors } = await quiet(() => readHealth(app));
+  assert.equal(value.signals?.counts.census_row_rejected, 1);
+  assert.match(value.problem ?? '', /census_row_rejected=1/);
+  assert.equal(value.healthy, false, 'a book that is being rewritten from zero is not a healthy one');
+  assert.match(errors.join('\n'), /archetype headcount 99 is not the population 5/);
+  const body = await readCensus(app);
+  assert.deepEqual(body.rows.map((r) => r.day), [0], 'the lie is not served as history');
+  assert.deepEqual(body.coverage, { first: 0, last: 0, days: 1 }, 'and the route says which day it starts from');
+});
+
+test('a ledger over the cap is trimmed on the way in, keeping the newest days', async () => {
+  const m = memStore();
+  m.seedDayBook(Array.from({ length: CENSUS_CAP + 2 }, (_, i) => censusFixture(i)));
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const body = await readCensus(app);
+  assert.equal(body.book, CENSUS_CAP);
+  assert.equal(body.rows[0].day, 2, 'the two oldest days are what it forgot');
+  assert.equal(body.coverage?.last, CENSUS_CAP + 1);
+  assert.equal((await readCensus(app, '?days=9999')).rows.length, CENSUS_CAP, 'asking for more than exists is not an error');
+});
+
+test('a book at the cap forgets the oldest day instead of growing, and says so', async () => {
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDayBook(Array.from({ length: CENSUS_CAP }, (_, i) => censusFixture(i + 1)));
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  shortenDay(app);
+  await tickTimes(app, 4);
+  await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+  const body = await readCensus(app);
+  assert.equal(body.book, CENSUS_CAP, 'the cap holds on the write side too');
+  assert.equal(body.rows[0].day, 2, 'day 1 is the one it dropped');
+  const h = await readHealth(app);
+  assert.equal(h.signals?.counts.census_days_dropped, 1, 'forgetting is a signal, not a shrug');
+});
+
+test('extinctions and emergences are derived from the book, never stored in it', () => {
+  const rows = [
+    censusFixture(0, { APE: 2, INSIDER: 1 }),
+    censusFixture(1, { APE: 2 }),
+    censusFixture(2, { APE: 2, ALGO: 1 }),
+  ];
+  const changes = censusChanges(rows);
+  assert.equal(changes.length, 2, 'the first day makes no claim, because its predecessor is not in the book');
+  assert.deepEqual(changes[0].lost, ['INSIDER'], 'counted out of existence between two readings');
+  assert.deepEqual(changes[0].gained, []);
+  assert.equal(changes[0].populationDelta, -1);
+  assert.equal(changes[0].born, 10, 'cumulative counters are differenced, not trusted');
+  assert.equal(changes[0].died, 5);
+  assert.equal(changes[0].predations, 3);
+  assert.deepEqual(changes[1].gained, ['ALGO']);
+  assert.deepEqual(changes[1].lost, []);
+
+  const reseeded = censusChanges([rows[0], { ...censusFixture(1, { APE: 2 }), born: 1 }]);
+  assert.equal(reseeded[0].born, null, 'a counter that ran backwards is a different tank, not a day with no births');
+  assert.equal(reseeded[0].populationDelta, -1, 'and the fields that can still be compared are compared');
+  assert.equal(censusReset(rows[0], rows[1]), false);
+  assert.equal(censusReset(rows[0], { ...censusFixture(1, { APE: 2 }), born: 1 }), true);
+  assert.deepEqual(censusChanges([rows[0]]), [], 'one row is a fact; a change needs two');
+});
+
+test('?days trims what is sent, never what the derivation is allowed to see', async () => {
+  const m = memStore();
+  m.seedDayBook([
+    censusFixture(0, { APE: 2, INSIDER: 1 }),
+    censusFixture(1, { APE: 2, INSIDER: 1 }),
+    censusFixture(2, { APE: 2 }),
+  ]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const all = await readCensus(app);
+  assert.equal(all.changes.length, 2, 'two differences over three days');
+  assert.equal(sumHeads(all.today), all.today.population, 'and today is counted by the same rule as the rows behind it');
+  const lastOne = await readCensus(app, '?days=1');
+  assert.deepEqual(lastOne.rows.map((r) => r.day), [2]);
+  assert.deepEqual(
+    lastOne.changes.map((c) => c.day),
+    [2],
+    'the newest day still gets its change, computed against a row the window did not send',
+  );
+  assert.deepEqual(lastOne.changes[0].lost, ['INSIDER'], 'a window must not be able to hide an extinction');
+  assert.equal(lastOne.book, 3, 'and it still says how deep the book really goes');
+});
+
+test('the route publishes what the hash covers, and today is marked uncommitted', async () => {
+  const app = createApp({ seed: 7, ...offlineFeeds });
+  const body = await readCensus(app);
+  assert.equal(body.coverage, null, 'an empty book is admitted; a chart of nothing is not the same as no chart');
+  assert.deepEqual(body.rows, []);
+  assert.deepEqual(body.changes, []);
+  assert.deepEqual(body.hashed, [...DIGEST_HASH_FIELDS], 'which fields travelled to the chain — the headcounts did not');
+  assert.equal(body.today.committed, false, 'the live reading is not a promise');
+  assert.equal(sumHeads(body.today), body.today.population, 'same headcount rule as every row behind it');
+  const api = (await (await app.fetch(new Request('http://localhost/api'))).json()) as {
+    endpoints: Record<string, string>;
+  };
+  assert.ok('GET /history/census' in api.endpoints, 'a route nobody can discover is a route nobody uses');
+});
+
+test('a day book row is as small as its comment claims', async () => {
+  // The comment on `CENSUS_CAP` states a byte count and does the arithmetic for
+  // the whole cap from it, which makes it a claim about the code. Measured here
+  // on a real row from a real day — four archetypes present, so this is a full
+  // row and not the thinnest one the tank can produce.
+  const m = memStore();
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  shortenDay(app);
+  await tickTimes(app, 4);
+  await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+  const row = (await readCensus(app)).rows[0];
+  assert.equal(Object.keys(row.byArchetype).length, 4, 'all four archetypes alive, so nothing is missing from the measurement');
+  const bytes = JSON.stringify(row).length;
+  assert.ok(bytes <= 300, `a row is ${bytes} bytes of JSON; the comment claims 263 and the cap assumes under 300`);
+  assert.ok(CENSUS_CAP * bytes < 128 * 1024, `the cap must stay inside its storage budget: ${CENSUS_CAP * bytes} B`);
 });
 
 /* ---------- how a signing key reaches the code that has to sign with it ---------- */

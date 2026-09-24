@@ -171,6 +171,162 @@ export function encodeDigest(p: DigestPayload): `0x${string}` {
   return `0x${DIGEST_MAGIC.slice(2)}${hex}` as `0x${string}`;
 }
 
+/* ------------------------------------------------------------------ the day book */
+
+/**
+ * One day of the tank as observed, alongside the commitment made for it.
+ *
+ * The digest answers "what did we pin"; this answers "what was alive". Both are
+ * built from the same `DigestStats` and the same world view at the same instant,
+ * which is the whole design: a census whose population came from a different
+ * reading than the anchored one is a second number to explain, and the two used
+ * to be computed in two places that had never been made to agree.
+ *
+ * `byArchetype` is deliberately *outside* the hash. `DIGEST_HASH_FIELDS` is rule
+ * v1 and days are already anchored under it on chain, so widening the commitment
+ * is a version bump with its own decision — not something a row can sneak in.
+ * A reader can verify the hashed fields against the transaction and should read
+ * the headcounts as our report of the same tick, which is exactly what they are.
+ */
+export interface CensusDay extends DigestStats {
+  /** The commitment made for this day: `digestHash({ v: DIGEST_V, ...stats })`. */
+  hash: string;
+  /** Headcount per archetype, counted off the world the stats came from. */
+  byArchetype: Record<string, number>;
+  /** Wall clock of the reading. Outside the hash, like the payload's `ts`. */
+  ts: number;
+}
+
+/**
+ * Heads per archetype, counted off the world a reading was taken from.
+ *
+ * One rule, exported, used both by the day book (`censusRow`) and by the live
+ * answer in `/history/census` — so the bar a viewer watches grow today is made of
+ * the same count as the bars for the days behind it. Two expressions for one
+ * number is how the tank ended up with a preview that did not match its anchor.
+ */
+export function headcountByArchetype(w: DigestWorldView): Record<string, number> {
+  const byArchetype: Record<string, number> = {};
+  for (const c of w.creatures) byArchetype[c.archetype] = (byArchetype[c.archetype] ?? 0) + 1;
+  return byArchetype;
+}
+
+/**
+ * The row for a day, from the numbers that were anchored with it.
+ *
+ * Takes the stats rather than recomputing them on purpose: the alternative is a
+ * second expression over the world, and a second expression is how two honest
+ * functions end up disagreeing about one population.
+ */
+export function censusRow(stats: DigestStats, w: DigestWorldView, hash: string, ts: number): CensusDay {
+  return { ...stats, byArchetype: headcountByArchetype(w), hash, ts };
+}
+
+/**
+ * Name a way this row claims more than was observed, or return null.
+ *
+ * Same posture as `coherenceProblem`: the builder cannot produce these, so a row
+ * that does have one arrived from a stored ledger that was edited, truncated, or
+ * written by a future version that no longer means the same thing by these
+ * fields. Rows are checked on the way in and a bad one is dropped rather than
+ * served as history.
+ */
+export function censusProblem(row: CensusDay): string | null {
+  const heads = Object.values(row.byArchetype ?? {}).reduce((s, n) => s + (Number.isFinite(n) ? n : 0), 0);
+  if (heads !== row.population) {
+    return `archetype headcount ${heads} is not the population ${row.population} it was taken with`;
+  }
+  // Bare lowercase hex, the exact output of `digestHash`: a *transaction* hash
+  // carries the `0x`, our digest does not, and demanding the prefix here would
+  // reject every row the pump honestly writes — quietly emptying the book on the
+  // next cold start. Shape only, not re-hashing: `verifyPayload` is the place a
+  // hash is checked against its numbers, and it is run on the payload.
+  if (!/^[0-9a-f]{64}$/.test(row.hash ?? '')) return 'hash is not a SHA-256 hex digest';
+  if (!Number.isInteger(row.day) || row.day < 0) return `day ${String(row.day)} is not a day number`;
+  if (row.population < 0 || row.totalEnergy < 0) return 'negative population or energy';
+  // Cumulative counters only run one way in one world. A decrease means the
+  // counters belonged to a different world than this row claims, which is the
+  // reseed case, and `censusChanges` is where that gets said out loud.
+  if (row.born < 0 || row.died < 0 || row.predations < 0) return 'negative cumulative counter';
+  return null;
+}
+
+/** How one day differed from the one before it. */
+export interface CensusChange {
+  /** The day being described: the later of the two rows. */
+  day: number;
+  tick: number;
+  population: number;
+  populationDelta: number;
+  /** Null when the cumulative counters cannot be differenced — a reseed, or a
+   * gap in the book. Zero would be a claim about a day nobody measured. */
+  born: number | null;
+  died: number | null;
+  predations: number | null;
+  /** Species with members in the earlier row and none in this one. */
+  lost: string[];
+  /** Species absent from the earlier row and present in this one. */
+  gained: string[];
+}
+
+/**
+ * Extinctions, emergences and per-day activity, derived rather than stored.
+ *
+ * Nothing here is a field on a row. Storing `lost` would mean the row that
+ * *reports* an extinction also decides what counts as one, and the rule changes
+ * whenever the reader's does. Derived from consecutive rows, one rule, in one
+ * place: anybody who disagrees can run this function over the published book.
+ *
+ * The first row produces no change, because its predecessor is not in the book:
+ * `coverage.first` on the route is where that gap is admitted instead of being
+ * papered over with a delta against nothing.
+ */
+export function censusChanges(rows: readonly CensusDay[]): CensusChange[] {
+  const out: CensusChange[] = [];
+  for (let i = 1; i < rows.length; i += 1) {
+    const prev = rows[i - 1];
+    const row = rows[i];
+    const delta = (after: number, before: number): number | null => (after >= before ? after - before : null);
+    out.push({
+      day: row.day,
+      tick: row.tick,
+      population: row.population,
+      populationDelta: row.population - prev.population,
+      born: delta(row.born, prev.born),
+      died: delta(row.died, prev.died),
+      predations: delta(row.predations, prev.predations),
+      lost: Object.keys(prev.byArchetype).filter((a) => prev.byArchetype[a] > 0 && !(row.byArchetype[a] > 0)),
+      gained: Object.keys(row.byArchetype).filter((a) => row.byArchetype[a] > 0 && !(prev.byArchetype[a] > 0)),
+    });
+  }
+  return out;
+}
+
+/**
+ * Days kept in the book. Sized against what a row costs rather than against
+ * optimism: a row measured 263 bytes of JSON — a real one, written by the pump,
+ * four archetypes, a 64-character hash, thirteen digits of wall clock; the
+ * `a day book row is as small as its comment claims` test re-measures it — so
+ * the whole cap is ~103 KiB. 400 days is more history than any chart asks for
+ * and more than a year of tank.
+ *
+ * There is no byte alarm on this array, on purpose: the ledger is stored as an
+ * object, so its encoded size is not a number this code can produce honestly —
+ * see the note in `worker.ts` about why the ledger reports no byte count. The cap
+ * and the `census_days_dropped` counter are what stand in for one.
+ */
+export const CENSUS_CAP = 400;
+
+/**
+ * What a "reset" between two rows means for the counters: the cumulative fields
+ * went backwards, so the world was reseeded and the two rows are not the same
+ * tank. Exported because the route has to say this about a pair of rows without
+ * recomputing the rule.
+ */
+export function censusReset(prev: CensusDay, row: CensusDay): boolean {
+  return row.born < prev.born || row.died < prev.died || row.predations < prev.predations;
+}
+
 /* ------------------------------------------------------------------ state machine */
 
 /**

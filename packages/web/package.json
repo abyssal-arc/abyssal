@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test test/pure.test.js test/render.test.js"
+    "test": "node --test test/pure.test.js test/render.test.js test/census.test.js test/deeplink.test.js test/deeplink-boot.test.js test/since.test.js test/since-boot.test.js test/i18n.test.js"
   },
   "devDependencies": {
     "@napi-rs/canvas": "^1.0.9",

@@ -32,13 +32,13 @@ Two views over one data source:
   leaderboard row jumps the camera to the matching whale or creature.
 
 What a visitor can *do* splits in two: a free social layer — adopt, rally,
-lineage, the fossil wall — and ten paid actions, each settled by **burning
+lineage, the fossil wall — and nine paid actions, each settled by **burning
 ABYS**. The burn receipt is the payment, nobody custodies anything, and the
 tokens leave circulation.
 
 The interface ships in six languages — English, Français, Deutsch, 中文,
 日本語, 한국어 — from a hand-written dictionary in `packages/web/i18n.js`
-(314 keys per language, kept in step by a test).
+(357 keys per language, kept in step by a test).
 
 > Everything in this repository is original work.
 
@@ -187,10 +187,12 @@ board).
 └─────────────────────┘
 ```
 
-`packages/server/src/facilitator.ts` keeps a Circle Facilitator client
-(EIP-3009 seller proofs, `/settle`, signer recovery) as a reserved path for a
-future USDC-denominated product. Nothing in the live product calls it: every
-paid action settles by burning ABYS.
+`packages/server/src/facilitator.ts` is the Circle Facilitator client (EIP-3009
+seller proofs, `/settle`, signer recovery). It serves one route today:
+`GET /data/flows`, the historical flow ring in depth, priced at `0.001` USDC per
+query. That is the only place money reaches a seller instead of being destroyed —
+every in-world action still settles by burning ABYS, and the two are kept apart in
+the UI for exactly that reason.
 
 ## Run locally
 
@@ -208,7 +210,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (121 total)
+npm test           # sim + server + web tests (241 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -232,13 +234,13 @@ on `node:test` with `jsdom` and `@napi-rs/canvas` for a render smoke test.
 | `ARC_USDC_ADDRESS` | `0x3600…0000` | Native USDC precompile on Arc |
 | `EXPLORER_TX_URL` | `https://explorer.arc.io/tx/` | Explorer base URL for tx links |
 | `ABYS_TOKEN_ADDRESS` | unset locally; set in `wrangler.toml` `[vars]` for production | The deployed ABYS contract. Until it is set, `POST /intervene` answers 503 while the observatory still runs free |
-| `ARC_DIGEST_KEY` | unset | Signing key for the daily digest. Unset, the digest is still computed and served but never committed on chain. `/state` reports `digestChain: null` until a day rolls inside the object, then `digestChain.status: "unconfigured"` |
+| `ARC_DIGEST_KEY` | unset | Signing key for the daily digest. Unset, the digest is still computed and served but never committed on chain: `/state` reports `digestChain: null` until a day rolls inside the object, then `digestChain.status: "unconfigured"`. Production sets it as a secret and anchors one day on chain per rollover; `/health` reports the signer address |
 | `USED_BURNS_FILE` | `.data/used-burns.txt` | Append-only log of spent burn receipts, so a restart cannot replay an old burn |
 | `COMPRESS_LEVEL` | `6` | Brotli quality in the node adapter (6 ≈ 0.5–3 ms/payload; 11 costs ~570 ms on `/history`) |
 | `COMPRESS_MIN_BYTES` | `1024` | Responses smaller than this are sent uncompressed |
 | `CORS_ORIGINS` | empty | Comma-separated extra origins allowed to post. Not needed for the deployed site, which is same-origin with itself |
 | `ALLOW_DEBUG_TICK` | unset | `POST /tick` answers 404 unless this is `1` |
-| `FACILITATOR_URL`, `SELLER_PRIVATE_KEY`, `SELLER_PAY_TO`, `X402_TESTNET` | unset | Reserved Circle Facilitator path. No live route reads them |
+| `FACILITATOR_URL`, `SELLER_PRIVATE_KEY`, `SELLER_PAY_TO`, `X402_TESTNET` | unset | The Circle Facilitator path. `GET /data/flows` answers 503 until `SELLER_PRIVATE_KEY` reaches the object, and quotes `0.001` USDC to `SELLER_PAY_TO` once it has |
 
 **One world, shared.** The simulation runs server-side, so every browser sees
 the same ecosystem at the same simulated instant; positions interpolate against
@@ -576,6 +578,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/snapshot` | Combined world + state + events + txRain in one request: `?since=<seq>` for unseen events, `?tail=<n>` caps the cold-start event replay, `?tx=<hash>` returns only meteors newer than that hash |
 | GET | `/history` | Per-tick stats for charts: `?window=<n>` sets the depth (default and max 2000), `?slots=<n>` decimates server-side to the chart's point budget |
 | GET | `/history/pulse` | Time-travel for the OBSERVE pulse: `?range=1h\|24h` returns re-bucketed USDC volume columns |
+| GET | `/history/census` | The day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows; `?days=<n>` for the newest n. The in-progress day carries `committed: false` |
 | GET | `/judgments` | Cull records, each tagged `type: "harvest" \| "judgment"`; filter with `?type=` |
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
@@ -584,6 +587,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/who?addr=0x…` | One address in the tank: burns, badges, day pass, board rank, its own battle reports |
 | GET | `/observe` | Arc USDC flow observatory: window stats, venue breakdown (which rail each transfer settled on — x402, swap, ERC-4337, direct), endpoint ranking, volume pulse, recent flows (`{available:false}` off Arc) |
 | GET | `/observe?addr=0x…` | One address's two-way flow inside the window plus its stats, what the address drawer opens |
+| GET | `/data/flows` | The paid tier: the flow ring in depth and filtered, `0.001` USDC per query settled through the Facilitator. 402 without a payment header, 503 until the seller key is configured |
 | GET | `/export?pass=0x…&kind=` | Day-pass download of the observation window: `csv`, `replay` or `digest` |
 | POST | `/intervene` | One of nine interventions, gated on an ABYS burn receipt; 503 until `ABYS_TOKEN_ADDRESS` is set |
 | POST | `/flare` | Pin a signal flare: `{addr, x, y, label, color?}`; free with a day pass, otherwise a 1,000 ABYS burn |
@@ -592,6 +596,7 @@ reading says nothing about whether the digest commit is configured — check
 | DELETE | `/adopt` | Release an adoption: `{addr, creatureId}` |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | Debug only: 404 unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
+| GET | `/health` | Self-observation: what the counters saw, the snapshot and receipt budget watermarks, and the state of the anchor and the data tier. Never cached |
 | GET | `/ui` | Redirects to `/` |
 
 `OPTIONS` on any path answers 204 with permissive CORS headers; the write routes
@@ -727,47 +732,54 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-121 tests on `node:test`, no test framework dependency:
+241 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
-| `@abyssal/sim` | 54 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 59 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, payload shape, the durable wall clock behind `catchUp()`, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
-| `@abyssal/web` | 8 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, a canvas render smoke test |
+| `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
+| `@abyssal/server` | 132 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the health counters and their budget watermarks, the day book and its derived extinctions, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
+| `@abyssal/web` | 50 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, the standing diff behind "while you were away", the preview card against the file it names, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
-offline and never touches Arc. GitHub Actions (`.github/workflows/ci.yml`) runs
-four gates on Node 22: `npm run build`, `npm run typecheck`, an ESM syntax check
-over the four web modules, and `npm test`. The syntax gate exists because the
-client is dependency-free ES modules — a stray top-level await should fail in CI
-rather than in a browser.
+offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
+against a local server, which is why `@napi-rs/canvas` is there: a canvas that
+cannot measure text cannot lay out a card. GitHub Actions
+(`.github/workflows/ci.yml`) runs four gates on Node 22: `npm run build`,
+`npm run typecheck`, an ESM syntax check over the seven client files the browser
+loads, and `npm test`. The syntax gate exists because the client is
+dependency-free ES modules — a stray top-level await should fail in CI rather
+than in a browser.
 
 ## Status
 
-Live in production: both views, all ten paid actions against the deployed ABYS
-contract, the free social layer, six languages, and the Durable Object tank
-ticking on a one-minute Cron Trigger with zero viewers.
+Live in production: both views, all nine paid actions against the deployed ABYS
+contract, the paid historical-data route settled in USDC, the free social layer,
+six languages, and the Durable Object tank ticking on a one-minute Cron Trigger
+with zero viewers.
 
-Still open:
+The trust anchor is live rather than reserved: a day that closes is committed to
+Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
+anybody can recompute, and `GET /history/census` serves the book of those days —
+the numbers that went on chain next to the headcount they describe. The
+bookkeeping the anchor needed outlived its first draft: `lastCommittedDay` and the
+outstanding transaction moved into the ledger, because an eviction between two day
+boundaries used to be able to commit the same day twice.
 
-- **Trust anchor.** The daily world digest is computed, served and exported, but
-  not committed on chain: production runs without `ARC_DIGEST_KEY`, so the
-  commit path stops at `status: "unconfigured"` and never signs. Until a key is
-  set, "the operator didn't rig the simulation" rests on determinism and the
-  published seed rather than on an attestation anybody can verify
-  independently. Setting one needs more than the secret: `lastCommittedDay`
-  lives in the isolate too, so an eviction between two day boundaries would
-  commit the same day twice. That bookkeeping has to become durable first. The
-  ledger that now carries `lastAdvanceAt` and the feed state is the obvious home
-  for it, but it needs a stronger guarantee than either: `save()` is
-  fire-and-forget (`void storage.put`), and a lost write costs a backfill when
-  what it carries is a block number and a duplicate on-chain transaction when
-  what it carries is a commit guard.
-- **Paid data tier.** `facilitator.ts` is complete and unused. Historical API
-  access in USDC would be its first product; today the only paid data is the day
-  pass, which burns ABYS.
+Three edges are where they are on purpose:
 
-**ABYS** is the project's payment asset and nothing else: it is quoted for every
-paid action, it is always destroyed to pay, and there is no discount tier, no
-USDC alternative and no treasury flow in the live product. Supply and
+- Only a *closed* day is in the day book. The row for the day in progress carries
+  `committed: false`, so a chart cannot present a number that has no attestation
+  behind it.
+- "While you were away" is remembered in the browser that saw the last visit. It is
+  a diff against a previous answer, kept in `localStorage`; the server is not told
+  who looked at what, which is the reason there is no account to sync it from.
+- The social preview card is one static image. Naming a creature in it would mean
+  generating HTML per request, and `GET /` is served by the asset layer with the
+  edge cache in front of it — the Worker never sees that request today.
+
+**ABYS** is the project's payment asset for everything that happens *inside* the
+tank: it is quoted for every intervention, it is always destroyed to pay, and there
+is no discount tier and no treasury flow in the live product. USDC buys only the
+historical data route, which pays a seller instead of burning — the one place in
+the product where money goes somewhere rather than out of circulation. Supply and
 distribution are out of scope for this repository.
