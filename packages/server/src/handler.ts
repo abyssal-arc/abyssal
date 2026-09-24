@@ -26,6 +26,11 @@ import {
   type World,
 } from '@abyssal/sim';
 import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
+import {
+  addDecimalUnits, anchorEconProblem, anchorRunway, hexToDecimalUnits, newAnchorEcon,
+  RUNWAY_ALARM_ANCHORS, txFeeUnits, unitScaleProblem, ARC_FEE_DECIMALS, USDC_TOKEN_DECIMALS,
+  type AnchorCost, type AnchorEcon,
+} from './econ.js';
 import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
 import { SyntheticMarketFeed, type MarketFeed } from './market.js';
 import {
@@ -36,7 +41,7 @@ import {
   CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS,
   type CensusDay, type DigestRecord,
 } from './digest.js';
-import { healthProblem, type Health } from './health.js';
+import { healthProblem, staleSignals, type Health } from './health.js';
 import {
   ABYS_PRICES,
   ABYS_PRICE_LEGENDARY_NAME,
@@ -211,6 +216,14 @@ export interface LedgerSnapshot {
    * would be invention. Bounded by `CENSUS_CAP` on both sides of the write.
    */
   dayBook?: CensusDay[];
+  /**
+   * What the anchor costs, what funds it, and what selling data has brought in.
+   * Optional because every ledger written before the field existed is still a
+   * complete account of everything else; absent here means the numbers have not
+   * been re-read by this world yet, which `/health` reports as an age rather than
+   * as a balance of zero.
+   */
+  anchor?: AnchorEcon;
 }
 
 /**
@@ -232,6 +245,8 @@ export interface LedgerLoad {
   digest?: DigestRecord;
   /** Absent in ledgers written before the tank kept a day book. */
   dayBook?: CensusDay[];
+  /** Absent in ledgers written before the anchor's economics were measured. */
+  anchor?: AnchorEcon;
 }
 
 export interface WorldStore {
@@ -446,11 +461,22 @@ export function readEnv(
   return proc?.env?.[name];
 }
 
+/**
+ * The USDC contract to read, resolved the same way the feed is built.
+ *
+ * One expression rather than two, because a `to` that disagrees with the address
+ * the indexer watches turns "the balance is zero" into a fact about the wrong
+ * contract — which is a sentence that looks like a result.
+ */
+function usdcAddressFromEnv(): string {
+  return readEnv('ARC_USDC_ADDRESS') ?? ARC_USDC_ADDRESS;
+}
+
 function defaultChainFeedFromEnv(rpc?: string): ChainFeed {
   // Arc is the product; the offline rain is an explicit opt-out for working
   // without network (and for hermetic tests), not the default.
   if (readEnv('CHAIN_FEED') === 'synthetic') return new SyntheticFeed();
-  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, readEnv('ARC_USDC_ADDRESS') ?? ARC_USDC_ADDRESS);
+  return new ArcUsdcFeed(rpc ?? PUBLIC_ARC_RPC, usdcAddressFromEnv());
 }
 
 function round1(v: number): number {
@@ -863,12 +889,22 @@ export function createApp(options: AppOptions = {}) {
     // record written before the field list existed is coherent, untrusted, and
     // never gets as far as the gate that would have counted it.
     const mismatch = digest && !(await verifyPayload(digest.payload)) ? 'digest_payload_mismatch' : null;
+    // The two derived economics figures, computed from the stored readings rather
+    // than stored beside them: a runway is a quotient, and a stored quotient is one
+    // more number that can disagree with the two it came from.
+    const econScale = unitScaleProblem(anchorEcon.balanceUnits, anchorEcon.tokenUnits);
+    const econRunway = anchorRunway(anchorEcon.balanceUnits, anchorEcon.costUnits);
+    const stale = view ? staleSignals(view) : [];
     const parts = [problem, mismatch].filter((p): p is string => Boolean(p));
     return {
       // `null` when no ledger is wired at all — the honest difference between
       // "nothing went wrong" and "nobody was counting".
       healthy: view ? parts.length === 0 : null,
       problem: parts.length ? parts.join(' ') : null,
+      // Counted and out of window, named here so the recency rule above costs no
+      // information: this response distinguishes "clean for a day" from "clean,
+      // ever" without the reader having to know that the two are different claims.
+      stale: stale.length ? stale.join(' ') : null,
       signals: view ? { counts: view.counts, last: view.last } : null,
       storage: options.metrics?.() ?? null,
       digest: digest ? {
@@ -897,8 +933,52 @@ export function createApp(options: AppOptions = {}) {
         network: tier?.network ?? `eip155:${ARC_MAINNET_CHAIN_ID}`,
         payTo: tier?.payTo ?? null,
         arcFeed: arcFeed !== null,
-        sales: dataSales,
+        sales: anchorEcon.sales,
+        salesThisIsolate: dataSales,
         spentPayments: settledNonces.size,
+      },
+      // What committing a day costs, what pays for it, and for how long that lasts.
+      //
+      // Every quantity is an integer count of base units plus the scale it is
+      // denominated in, because neither of these numbers fits in a JS number and
+      // rounding one is how a payment route ended up quoting zero. `readAt` is 0
+      // until the first confirmation is polled, which is reported as never-read —
+      // the alternative is a `null` balance that looks like an empty account.
+      anchor: {
+        signer: digestSigner(),
+        readAt: anchorEcon.at,
+        ageSeconds: anchorEcon.at ? Math.max(0, Math.round((Date.now() - anchorEcon.at) / 1000)) : null,
+        funded: {
+          feeUnits: anchorEcon.balanceUnits,
+          feeDecimals: ARC_FEE_DECIMALS,
+          usdcUnits: anchorEcon.tokenUnits,
+          usdcDecimals: USDC_TOKEN_DECIMALS,
+          // Whether the fee balance and the token balance were both read this time,
+          // and whether they still name the same money. `scaleOk: null` is "not
+          // knowable", which is not the same answer as `false`.
+          bothRead: anchorEcon.balanceUnits !== null && anchorEcon.tokenUnits !== null,
+          scaleOk: anchorEcon.balanceUnits === null || anchorEcon.tokenUnits === null ? null : econScale === null,
+        },
+        lastCost: { feeUnits: anchorEcon.costUnits, day: anchorEcon.costDay },
+        runway: {
+          anchors: econRunway.anchors,
+          // Why there is no number, when there is none — an unread balance and a
+          // day that has not confirmed yet are different reasons and want different
+          // actions.
+          unknown: econRunway.problem,
+          alarmBelow: RUNWAY_ALARM_ANCHORS,
+          low: econRunway.anchors !== null && econRunway.anchors < RUNWAY_ALARM_ANCHORS,
+          // Whether the alarm has been raised and not yet cleared — the durable edge
+          // state, published next to the live figure so a reader can tell "low now"
+          // from "low, and it was already known when the last day closed".
+          alarmNoted: anchorEcon.lowNoted,
+          capped: econRunway.capped,
+        },
+        revenue: {
+          sales: anchorEcon.sales,
+          quotedUnits: anchorEcon.revenueUnits,
+          unitDecimals: USDC_TOKEN_DECIMALS,
+        },
       },
       // How far back the tank remembers, in days, against the cap it is cut off
       // at. Reported even when the book is empty, because `days: 0` is the answer
@@ -971,6 +1051,12 @@ export function createApp(options: AppOptions = {}) {
    * newer day needs anchoring, so at most one day is ever in flight.
    */
   let digest: DigestRecord | null = null;
+  /**
+   * The anchor's economics, as last read from the chain. A `newAnchorEcon(0)` with
+   * `at: 0` means "never read", which `/health` reports as such rather than as a
+   * balance of zero.
+   */
+  let anchorEcon: AnchorEcon = newAnchorEcon(0);
   /**
    * Guards against two pumps running at once inside this isolate.
    *
@@ -1186,13 +1272,16 @@ export function createApp(options: AppOptions = {}) {
         value: 0n,
         data: encodeDigest(r.payload),
         // Arc's fee unit is 18-decimal, not the 6 the token contract uses.
-        // Measured against mainnet: for one address `eth_getBalance` and USDC
-        // `balanceOf` differ by exactly 1e12 while naming the same 6,167,837.56
-        // USDC, and a 21,000-gas transfer costs 4.22e14 fee units — $0.0004 read
-        // at 18 decimals, $422 million read at 6. `decimals` only sizes display
-        // today, so this is not a live bug; it is a wrong fact about the chain we
-        // deploy to, and the sort that becomes a bug the first time a balance is
-        // printed for a human to read.
+        // Measured against mainnet again on 2026-09-24, on the account that signs
+        // these: `eth_getBalance` answered 0x1156fcae4bf3247f0 and the USDC
+        // contract's `balanceOf` answered 0x1310b7c for the same address — the same
+        // 19.99 of the money, one layer at 18 decimals and the other at 6 (see
+        // `unitScaleProblem` for the truncation that relates them). And a
+        // 21,000-gas transfer costs 4.22e14 fee units — $0.0004 read at 18
+        // decimals, $422 million read at 6. `decimals` only sizes display today,
+        // so this is not a live bug; it is a wrong fact about the chain we deploy
+        // to, and the sort that becomes a bug the first time a balance is printed
+        // for a human to read.
         chain: {
           id: CHAIN_ID,
           name: 'Arc',
@@ -1239,7 +1328,9 @@ export function createApp(options: AppOptions = {}) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [r.txHash] }),
       });
-      const j = (await res.json()) as { result?: { status?: string } | null };
+      const j = (await res.json()) as {
+        result?: { status?: string; gasUsed?: string; effectiveGasPrice?: string } | null;
+      };
       if (j.result?.status === '0x1') {
         digest = markConfirmed(current, Date.now());
         // The row for the day is told where its commitment landed, from the
@@ -1259,6 +1350,14 @@ export function createApp(options: AppOptions = {}) {
           options.health?.note('digest_anchor_unstamped', stamp.problem);
         }
         saveStore();
+        // The receipt is in hand, the day is on chain, and this is the only moment
+        // on which the three numbers behind `anchor` in `/health` — what the last
+        // commitment cost, what funds the next one, what selling data has paid for
+        // — can be read for two RPC calls a day. A failed read is counted and the
+        // previous figures keep their age, because "no money left" and "the
+        // endpoint did not answer" are different facts and the second must never
+        // be reported as the first.
+        await readAnchorEcon(j.result, current.day);
       } else if (j.result?.status === '0x0') {
         // Broadcast and reverted: the hash stays, because it is evidence of a
         // real attempt, and the retry budget decides whether to follow it up.
@@ -1274,6 +1373,121 @@ export function createApp(options: AppOptions = {}) {
       // and rewriting the record to claim otherwise is the error this whole
       // function replaces.
     }
+  }
+
+  /** `balanceOf(address)`, the only read this build makes of a contract's own state. */
+  const BALANCE_OF_SELECTOR = '0x70a08231';
+
+  /** The call data for `balanceOf(address)`: a selector and one padded 32-byte word. */
+  function balanceOfCalldata(address: string): string {
+    const bare = address.toLowerCase().replace(/^0x/, '');
+    // Refused rather than padded blindly: a short `to` left-pads into an address in
+    // the low word and the node answers with the balance of some account nobody
+    // configured, which is a number that looks like a result.
+    if (!/^[0-9a-f]{40}$/.test(bare)) throw new TypeError(`cannot read a balance of ${address}`);
+    return `${BALANCE_OF_SELECTOR}${bare.padStart(64, '0')}`;
+  }
+
+  /** One JSON-RPC call whose answer is a hex quantity, returned as decimal units. */
+  async function rpcDecimalUnits(rpc: string, method: string, params: unknown[]): Promise<string | null> {
+    const res = await globalThis.fetch(rpc, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+    const j = (await res.json()) as { result?: string | null; error?: { message?: string } };
+    // An error answer is raised rather than folded into `null`: a node that says
+    // "method not found" and a node that says "0x0" are different news, and the
+    // counted reason below wants to know which of them happened.
+    if (j.error) throw new Error(`${method}: ${j.error.message ?? 'rpc error'}`);
+    return hexToDecimalUnits(j.result ?? null);
+  }
+
+  /**
+   * Read what the anchor costs and what it is funded with, and file the answer.
+   *
+   * Called once per confirmed day. That schedule is the whole design: it is the
+   * only moment a measured cost exists to divide a balance by, it is two reads a
+   * day against an account that moves about once a day, and it is on a path that
+   * has already committed the day — so nothing here can delay or damage a
+   * commitment, and every failure path ends in a counter plus a `/health` field
+   * that says how old its numbers are.
+   *
+   * Two failures, answered differently on purpose. A node that *refuses* — an error
+   * answer, a dead endpoint, a reverted call — changes nothing but the counter, so
+   * the figures it could not refresh stay published with the timestamp they were
+   * taken at and grow old in public. A node that answers with something that is not
+   * a number restamps the reading and stores `null`, because a stale figure wearing
+   * a fresh timestamp is the one arrangement that would lie. The cost is neither:
+   * it belongs to a specific day, travels with `costDay`, and stays useful until a
+   * newer receipt replaces it.
+   */
+  async function readAnchorEcon(
+    receipt: { gasUsed?: string; effectiveGasPrice?: string } | null | undefined,
+    day: number,
+  ): Promise<void> {
+    const rpc = options.rpc ?? readEnv('ARC_RPC_URL');
+    const signer = digestSigner();
+    if (!signer || !rpc) {
+      // A deployment without a key or an endpoint is not a chain failure, and it is
+      // still counted, because the field is about to be published as never-read and
+      // the alternative is a `/health` that cannot distinguish "this world has no
+      // anchor" from "the RPC went quiet at 03:00".
+      const why = !signer ? 'no digest key, so no address to read a balance of' : 'no RPC endpoint configured';
+      console.error(`anchor economics not read: ${why}`);
+      options.health?.note('anchor_econ_unreadable', why);
+      return;
+    }
+    const cost: AnchorCost | null = txFeeUnits(receipt ?? null);
+    if (!cost) {
+      // A mined transaction always carries both fields, so their absence is a broken
+      // node answer rather than an empty account. The balances are read anyway:
+      // losing the funding figure to a missing gas field would be reporting one
+      // failure as two.
+      const why = `the receipt for day ${day} carried no gasUsed/effectiveGasPrice`;
+      console.error(`anchor economics incomplete: ${why}`);
+      options.health?.note('anchor_econ_unreadable', why);
+    }
+    let balanceUnits: string | null;
+    let tokenUnits: string | null;
+    try {
+      [balanceUnits, tokenUnits] = await Promise.all([
+        rpcDecimalUnits(rpc, 'eth_getBalance', [signer, 'latest']),
+        rpcDecimalUnits(rpc, 'eth_call', [{ to: usdcAddressFromEnv(), data: balanceOfCalldata(signer) }, 'latest']),
+      ]);
+    } catch (err) {
+      console.error('anchor economics not read: /health keeps reporting the last figures it has, with their age', err);
+      options.health?.note('anchor_econ_unreadable', err);
+      return;
+    }
+    const scale = unitScaleProblem(balanceUnits, tokenUnits);
+    if (scale) {
+      // Every quantity in `/health` below is converted across that ratio, so a
+      // mismatch gets its own signal instead of being absorbed: the runway number
+      // would still print, and it would print meaninglessly.
+      console.error(`anchor economics suspect: ${scale}`);
+      options.health?.note('arc_unit_scale_unexpected', scale);
+    }
+    anchorEcon = {
+      ...anchorEcon,
+      at: Date.now(),
+      balanceUnits,
+      tokenUnits,
+      costUnits: cost?.units ?? anchorEcon.costUnits,
+      costDay: cost ? day : anchorEcon.costDay,
+    };
+    const runway = anchorRunway(anchorEcon.balanceUnits, anchorEcon.costUnits);
+    const low = runway.anchors !== null && runway.anchors < RUNWAY_ALARM_ANCHORS;
+    if (low && !anchorEcon.lowNoted) {
+      // Edge triggered off the stored flag rather than off the count: an account
+      // that stays poor is one event however many isolates pass through it, while a
+      // balance that recovers and falls again is two events — and the second fall
+      // is the one a reader has not heard about yet.
+      console.error(`anchor runway low: ${runway.anchors} days of commitment funded, alarm below ${RUNWAY_ALARM_ANCHORS}`);
+      options.health?.note('anchor_runway_low', `${runway.anchors} anchors funded, alarm below ${RUNWAY_ALARM_ANCHORS}`);
+    }
+    anchorEcon = { ...anchorEcon, lowNoted: low };
+    saveStore();
   }
 
   function scoreReports() {
@@ -1703,7 +1917,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /api': 'this endpoint index',
         'GET /state': 'tick, day, population, chain + market temperature, harvest/judgment countdowns, price list, legendary thresholds, editable traits',
         'GET /world': 'render snapshot: creatures (with archetype, plus paid identity where any exists), foods, world size',
-        'GET /health': 'self-observation: failure counters (receipt/ledger/snapshot writes, budget crossings, digest signals), storage sizes, day-anchor state; healthy:null when nothing is counting',
+        'GET /health': 'self-observation: failure counters (receipt/ledger/snapshot writes, budget crossings, digest signals), storage sizes, day-anchor state, what a day costs to commit and how long the account funding it lasts; healthy:null when nothing is counting',
         'GET /snapshot': 'combined world + state + events for single-request polling: ?since=<seq>, ?tail=<n> caps the event replay, ?tx=<hash> returns only newer meteors',
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
@@ -1894,10 +2108,31 @@ export function createApp(options: AppOptions = {}) {
       }
       noteSettled(nonce);
       dataSales += 1;
+      // The sale is also filed durably. `dataSales` is this isolate's count and
+      // resets when the object moves, while "what the tank has earned by selling
+      // data" is a claim about the world; the per-isolate number stays published
+      // beside it because a reader who wants to know how often this process has
+      // answered should get that answer and not the other one.
+      //
+      // `requirement.amount` is the quoted amount Circle confirmed, in the token's
+      // own units — the chain's version of what arrived is `tokenUnits`, read once a
+      // day, and the two are reported side by side rather than merged into one
+      // number that would have to pick which of them is wrong. The fallback keeps
+      // the previous total rather than writing null into a field every later reader
+      // would have to re-validate; it is unreachable by construction, since
+      // `exactRequirement` derives the amount from `usdcUnits`, which throws on
+      // anything that is not an integer count of base units.
+      const earned = addDecimalUnits(anchorEcon.revenueUnits, requirement.amount);
+      anchorEcon = {
+        ...anchorEcon,
+        sales: anchorEcon.sales + 1,
+        revenueUnits: earned ?? anchorEcon.revenueUnits,
+      };
+      saveStore();
       return json({
         ...arcFeed.queryFlows(parsed.query),
         settlement: { tx: verdict.tx ?? null, payer: verdict.payer ?? null, network: cfg.network, amount: requirement.amount },
-        sold: dataSales,
+        sold: anchorEcon.sales,
       }, 200, 0);
     }
 
@@ -2472,6 +2707,19 @@ export function createApp(options: AppOptions = {}) {
         }
         dayBook = rows.length > CENSUS_CAP ? rows.slice(rows.length - CENSUS_CAP) : rows;
       }
+      // The anchor's economics, asked the same question as the rows above: does
+      // this still mean what it claims. A bad object is dropped rather than
+      // repaired, because every figure in it is published as a fact about the chain.
+      // Dropping one loses the cumulative sales count, which is why the refusal is
+      // counted; the balance and the cost come back on their own at the next
+      // confirmation, so no other state is affected and the world is not stopped.
+      if (s.anchor) {
+        const problem = anchorEconProblem(s.anchor);
+        if (problem) {
+          console.error(`stored anchor economics refused: ${problem}`);
+          options.health?.note('anchor_econ_rejected', problem);
+        } else anchorEcon = s.anchor;
+      }
     })();
     return hydrated;
   }
@@ -2486,6 +2734,7 @@ export function createApp(options: AppOptions = {}) {
       feedState: chainFeed.exportState?.(),
       digest: digest ?? undefined,
       dayBook,
+      anchor: anchorEcon,
     });
   }
 

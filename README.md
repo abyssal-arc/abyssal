@@ -210,7 +210,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (251 total)
+npm test           # sim + server + web tests (263 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -230,7 +230,7 @@ on `node:test` with `jsdom` and `@napi-rs/canvas` for a render smoke test.
 | `SAVE_MS` | `15000` | Snapshot interval (the world is also saved on SIGINT/SIGTERM) |
 | `FRESH_WORLD` | unset | Set to any value to ignore the snapshot and reseed |
 | `CHAIN_FEED` | `arc` | `synthetic` for the offline rain; the server also degrades to it automatically after 5 consecutive RPC failures |
-| `ARC_RPC_URL` | `https://rpc.mainnet.arc.io` | Arc JSON-RPC endpoint (used when `CHAIN_FEED=arc`) |
+| `ARC_RPC_URL` | `https://rpc.mainnet.arc.io` | Arc JSON-RPC endpoint: the chain feed when `CHAIN_FEED=arc`, and the two balance reads that come with each confirmed day anchor |
 | `ARC_USDC_ADDRESS` | `0x3600…0000` | Native USDC precompile on Arc |
 | `EXPLORER_TX_URL` | `https://explorer.arc.io/tx/` | Explorer base URL for tx links |
 | `ABYS_TOKEN_ADDRESS` | unset locally; set in `wrangler.toml` `[vars]` for production | The deployed ABYS contract. Until it is set, `POST /intervene` answers 503 while the observatory still runs free |
@@ -596,7 +596,7 @@ reading says nothing about whether the digest commit is configured — check
 | DELETE | `/adopt` | Release an adoption: `{addr, creatureId}` |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | Debug only: 404 unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
-| GET | `/health` | Self-observation: what the counters saw, the snapshot and receipt budget watermarks, and the state of the anchor and the data tier. Never cached |
+| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs and how long the account funds it) and of the data tier. Never cached |
 | GET | `/ui` | Redirects to `/` |
 
 `OPTIONS` on any path answers 204 with permissive CORS headers; the write routes
@@ -732,12 +732,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-251 tests on `node:test`, no test framework dependency:
+263 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 140 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
+| `@abyssal/server` | 152 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings that must name one money, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), and — against a stubbed JSON-RPC — the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction |
 | `@abyssal/web` | 52 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the preview card against the file it names, the run list against the test files on disk, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
@@ -768,6 +768,20 @@ population says "here are the numbers, on chain", and a reverted one does not.
 The bookkeeping the anchor needed outlived its first draft: `lastCommittedDay` and the
 outstanding transaction moved into the ledger, because an eviction between two day
 boundaries used to be able to commit the same day twice.
+
+Whether the account that pays for it can keep paying is measured rather than
+assumed. Each confirmed day is priced from its own receipt — 30,440 gas on day 15's
+transaction and 30,560 on day 28's, roughly `0.00062` of the money each time — and
+the same read asks both `eth_getBalance` and the token contract's `balanceOf` for
+the signing address, so `/health` can publish the division as anchors remaining:
+32,386 of them at the time of writing, which is around five years of closing a day
+every 86.6 minutes. Those two balances are the same money at two different scales,
+so the relationship is re-checked on every read rather than trusted after the
+first: the token figure has to be the fee figure truncated at six decimals, and it
+is a *truncation* because the deployed account carries 355,000,000,000 fee units of
+dust below that boundary — an exact-equality check would have alarmed on the day it
+shipped. Below 90 anchors remaining that becomes a counted alarm, raised once per
+fall rather than once per process.
 
 Three edges are where they are on purpose:
 

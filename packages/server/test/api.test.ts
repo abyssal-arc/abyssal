@@ -32,9 +32,14 @@ import {
 } from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 import {
-  createHealth, healthProblem, receiptsValueBytes, SIGNAL_KINDS,
+  createHealth, healthProblem, PROBLEM_WINDOW_MS, receiptsValueBytes, SIGNAL_KINDS, staleSignals,
   type HealthView,
 } from '../src/health.js';
+import {
+  addDecimalUnits, anchorEconProblem, anchorRunway, ARC_FEE_DECIMALS, newAnchorEcon, RUNWAY_ALARM_ANCHORS,
+  txFeeUnits, unitScaleProblem, USDC_TOKEN_DECIMALS,
+  type AnchorEcon,
+} from '../src/econ.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -1325,6 +1330,9 @@ function memStore() {
      */
     dayBook: () => state.dayBook,
     seedDayBook: (rows: CensusDay[]) => { state = { ...state, dayBook: structuredClone(rows) }; },
+    /** The anchor's economics, for the same reason: they are read back by a later isolate. */
+    anchor: () => state.anchor,
+    seedAnchor: (a: AnchorEcon) => { state = { ...state, anchor: structuredClone(a) }; },
   };
 }
 
@@ -2484,12 +2492,31 @@ const DIGEST_BLOCK = {
 /** The hash a broadcast is answered with, unless a test overrides it. */
 const DIGEST_TX = `0x${'ee'.repeat(32)}`;
 
+/* What committing a day costs, as the stub reports it. The two real anchors
+ * measured on 2026-09-24 used 30,440 gas (day 15) and 30,560 (day 28) at about
+ * 20 gwei; this fixture sits between them and stays a fixture — a fixed number,
+ * so the runway assertions below are exact divisions rather than a second
+ * measurement to keep in sync. `DIGEST_BLOCK` carries the same base fee. */
+const DIGEST_GAS_USED = '0x7738';
+const DIGEST_GAS_PRICE = '0x4a817c800';
+const DIGEST_COST_UNITS = 30520n * 20000000000n;
+
+/** The two balances the stub reports by default: the same 1 USDC at each scale. */
+const STUB_FEE_BALANCE = `0x${(10n ** 18n).toString(16)}`;
+const STUB_USDC_BALANCE = `0x${(10n ** 6n).toString(16)}`;
+
 type DigestRpc = {
   url: string;
   /** Serialized transactions, in the order the endpoint was asked to accept them. */
   sends: string[];
   methods: string[];
+  /** The `eth_call` requests, so a test can check what was asked and not just that it asked. */
+  calls: { to: string; data: string }[];
   setReceipt: (result: unknown) => void;
+  /** The fee balance and the token balance, as hex quantities. */
+  setBalances: (feeUnits: string, tokenUnits: string) => void;
+  /** Make the next `eth_call` fail the way a node fails: an error answer, not a null. */
+  setCallError: (message: string | null) => void;
   close: () => void;
 };
 
@@ -2507,7 +2534,11 @@ type DigestRpc = {
 async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
   const sends: string[] = [];
   const methods: string[] = [];
+  const calls: { to: string; data: string }[] = [];
   let receipt: unknown = null;
+  let feeBalance = STUB_FEE_BALANCE;
+  let tokenBalance = STUB_USDC_BALANCE;
+  let callError: string | null = null;
   const server = createServer(async (req, res) => {
     let body = '';
     for await (const c of req) body += c;
@@ -2522,8 +2553,20 @@ async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
       case 'eth_maxPriorityFeePerGas': result = '0x0'; break;
       case 'eth_estimateGas': result = '0x61a8'; break;
       case 'eth_gasPrice': result = '0x4a817c800'; break;
-      case 'eth_getBalance': result = `0x${(10n ** 18n).toString(16)}`; break;
+      case 'eth_getBalance': result = feeBalance; break;
       case 'eth_getTransactionReceipt': result = receipt; break;
+      case 'eth_call':
+        calls.push({
+          to: String((call.params?.[0] as { to?: unknown } | undefined)?.to ?? ''),
+          data: String((call.params?.[0] as { data?: unknown } | undefined)?.data ?? ''),
+        });
+        if (callError) {
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: callError } }));
+          return;
+        }
+        result = tokenBalance;
+        break;
       case 'eth_sendRawTransaction':
         if (sendError) {
           res.setHeader('content-type', 'application/json');
@@ -2542,7 +2585,18 @@ async function digestRpcStub(sendError?: string): Promise<DigestRpc> {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     sends,
     methods,
-    setReceipt: (result) => { receipt = result; },
+    calls,
+    setReceipt: (result) => {
+      // A mined receipt always carries both gas fields, and `readAnchorEcon` counts
+      // their absence, so the stub fills them in unless a test overrides them —
+      // otherwise every pre-existing test that confirms a day would also be proving
+      // an economics failure it never mentions. A test that wants the missing-field
+      // case passes `gasUsed: undefined` explicitly, which wins over the default.
+      const mined = result && typeof result === 'object' && (result as { status?: string }).status === '0x1';
+      receipt = mined ? { gasUsed: DIGEST_GAS_USED, effectiveGasPrice: DIGEST_GAS_PRICE, ...(result as object) } : result;
+    },
+    setBalances: (fee, token) => { feeBalance = fee; tokenBalance = token; },
+    setCallError: (message) => { callError = message; },
     close: () => server.close(),
   };
 }
@@ -3334,6 +3388,24 @@ type HealthBody = {
     signer: string | null;
   } | null;
   census: { days: number; cap: number; first: number | null; last: number | null };
+  /** Signals that have fired and fallen out of the window that reddens the light. */
+  stale: string | null;
+  anchor: {
+    signer: string | null;
+    readAt: number;
+    ageSeconds: number | null;
+    funded: {
+      feeUnits: string | null;
+      feeDecimals: number;
+      usdcUnits: string | null;
+      usdcDecimals: number;
+      bothRead: boolean;
+      scaleOk: boolean | null;
+    };
+    lastCost: { feeUnits: string | null; day: number | null };
+    runway: { anchors: number | null; unknown: string | null; alarmBelow: number; low: boolean; alarmNoted: boolean; capped: boolean };
+    revenue: { sales: number; quotedUnits: string; unitDecimals: number };
+  };
   data: {
     forSale: boolean;
     priceUsdc: string;
@@ -3341,6 +3413,7 @@ type HealthBody = {
     payTo: string | null;
     arcFeed: boolean;
     sales: number;
+    salesThisIsolate: number;
     spentPayments: number;
   };
   world: { tick: number; day: number; ticksPerDay: number; population: number };
@@ -4497,22 +4570,25 @@ async function dataTierApp(env: {
   app: ReturnType<typeof createApp>;
   stub: StubFacilitator;
   close: () => Promise<void>;
+  /** The ledger the app writes through, so a second isolate can be started over it. */
+  m: ReturnType<typeof memStore>;
 }> {
   const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
   const stub = await serveFacilitator(env.replies ?? [{ json: { success: true, transaction: '0x' + 'fe'.repeat(32), payer: ALPHA } }]);
   const arc = env.arc !== false;
   const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
   (feed as unknown as { flows: unknown[] }).flows = arc ? RING.map((r) => ({ ...r })) : [];
+  const m = memStore();
   const app = createApp({
     seed: 1,
-    store: memStore().store,
+    store: m.store,
     chainFeed: arc ? feed : offlineFeeds.chainFeed,
     marketFeed: arc ? undefined : offlineFeeds.marketFeed,
     sellerKey: env.sellerKey === null ? undefined : env.sellerKey ?? SELLER_KEY,
     facilitatorUrl: stub.url,
     health: env.health,
   });
-  return { app, stub, close: () => stub.close() };
+  return { app, m, stub, close: () => stub.close() };
 }
 
 const get = (path: string, headers: Record<string, string> = {}): Request =>
@@ -4670,7 +4746,7 @@ test('the ring answers its filters, and reports the ceiling on its own answer', 
 
 test('a paid call settles first and answers with the depth the free stream withholds', async () => {
   const health = createHealth();
-  const { app, stub, close } = await dataTierApp({ health });
+  const { app, m, stub, close } = await dataTierApp({ health });
   try {
     const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
     assert.ok(cfg);
@@ -4720,6 +4796,22 @@ test('a paid call settles first and answers with the depth the free stream withh
     assert.equal(after.data.sales, 1);
     assert.equal(after.data.spentPayments, 1, 'the nonce that bought this is remembered as spent');
     assert.deepEqual(after.signals?.counts, {}, 'a sale is not a failure');
+    // The same sale as the durable ledger records it. `data.sales` outlives this
+    // isolate and `salesThisIsolate` does not, and the two answers are different
+    // questions; `quotedUnits` is what Circle confirmed, in base units, because
+    // 1000 of them is 0.001 USDC and a float is how a price gets lost.
+    assert.equal(after.data.salesThisIsolate, 1);
+    assert.equal(after.anchor.revenue.sales, 1);
+    assert.equal(after.anchor.revenue.quotedUnits, '1000');
+    assert.equal(after.anchor.revenue.unitDecimals, USDC_TOKEN_DECIMALS);
+    // And it really is the durable one: a process that never saw the sale reads the
+    // same total out of the ledger, while its own counter starts at zero. Without
+    // this half the distinction above is a comment about a field nobody checked.
+    const cold = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+    const third = await readHealth(cold);
+    assert.equal(third.data.sales, 1, 'the sale outlives the isolate that settled it');
+    assert.equal(third.data.salesThisIsolate, 0, 'the per-isolate count does not');
+    assert.equal(third.anchor.revenue.quotedUnits, '1000');
   } finally {
     await close();
   }
@@ -4973,6 +5065,461 @@ test('the seller binding wins over an ambient key, so a stale global cannot be p
     if (had === undefined) delete process.env.SELLER_PRIVATE_KEY;
     else process.env.SELLER_PRIVATE_KEY = had;
   }
+});
+
+/* ---------- what committing a day costs, and how long it is funded for ---------- */
+
+/**
+ * The anchor has been paying for itself out of an account nobody measured. These
+ * tests are the measurement: what a receipt says a day cost, what the chain says
+ * is left to pay for, and the two failure modes that would make a published number
+ * a lie — a read that did not happen reported as a balance of zero, and an alarm
+ * that fires once per process restart instead of once per event.
+ */
+
+const feeHex = (units: bigint): string => `0x${units.toString(16)}`;
+
+/**
+ * Seed a day whose transaction is already broadcast, so the next tick polls it —
+ * and seed the book row that its confirmation points at.
+ *
+ * Both halves are needed because `stampAnchor` refuses to link a commitment to a
+ * row carrying a different hash, so seeding only the record makes every test below
+ * also fire `digest_anchor_unstamped` — a fact worth its own test (there is one),
+ * and noise in all the others.
+ */
+async function seedPendingDay(m: ReturnType<typeof memStore>, day: number): Promise<void> {
+  const queued = newDigestRecord(day, await buildPayload({ ...STATS, day, tick: day * 4 }, 1));
+  m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
+  m.seedDayBook([{ ...censusFixture(day), hash: queued.payload.hash }]);
+}
+
+test('the cost of a day is read from the receipt, in units that cannot round', () => {
+  const cost = txFeeUnits({ gasUsed: DIGEST_GAS_USED, effectiveGasPrice: DIGEST_GAS_PRICE });
+  assert.ok(cost);
+  assert.equal(cost.units, DIGEST_COST_UNITS.toString());
+  assert.equal(cost.gasUsed, DIGEST_GAS_USED, 'the operands stay visible, so a reader can redo the product');
+  assert.equal(cost.gasPrice, DIGEST_GAS_PRICE);
+  // A node that answers with the pre-`effectiveGasPrice` field is still legible,
+  // because the quantity that matters is the one the chain charged.
+  assert.equal(txFeeUnits({ gasUsed: '0x2', gasPrice: '0x3' })?.units, '6');
+  for (const bad of [null, undefined, {}, { gasUsed: '0x2' }, { effectiveGasPrice: '0x3' },
+    { gasUsed: '0x', effectiveGasPrice: '0x3' }, { gasUsed: 'zz', effectiveGasPrice: '0x3' }]) {
+    assert.equal(txFeeUnits(bad as never), null, `no cost is claimable from ${JSON.stringify(bad)}`);
+  }
+
+  // The scales are asserted as numbers rather than as prose: every figure below is
+  // converted across the difference between them, and the ratio is a measurement of
+  // Arc (the same money named twice), not a preference.
+  assert.equal(ARC_FEE_DECIMALS - USDC_TOKEN_DECIMALS, 12);
+  assert.equal(unitScaleProblem(feeHex(10n ** 18n), '0x' + (10n ** 6n).toString(16)), null);
+  assert.equal(unitScaleProblem('1000000000000000000', '1000000'), null, 'decimal strings work too');
+  assert.match(unitScaleProblem('1000000000000000000', '5000000') ?? '', /is not .* at 1e12/);
+  // Both directions, because a one-sided comparison passes for the other half of
+  // the mistakes: a fee balance that *overstates* what the token contract reports
+  // is the version that promises more anchors than exist.
+  assert.match(unitScaleProblem('2000000000000000000', '1000000') ?? '', /is not .* at 1e12/,
+    'a fee balance twice the token one is as much a moved scale as half of it');
+  assert.equal(unitScaleProblem(null, '5000000'), null, 'an unread balance is not a broken scale');
+  // The rule is a truncation, not a scaled equality, and the deployed account is
+  // what proved it: read on 2026-09-24 it answered `0x1156fcae4bf3247f0` for
+  // `eth_getBalance` and `0x1310b7c` for `balanceOf` — the same money, with
+  // 355,000,000,000 fee units of dust under the six-decimal boundary. A check that
+  // demanded exact equality would have alarmed on the first read after shipping.
+  assert.equal(unitScaleProblem('19991420355000000000', '19991420'), null,
+    'sub-USDC dust in the fee layer is not a moved scale');
+  assert.match(unitScaleProblem('19991420355000000000', '19991421') ?? '', /is not .* at 1e12/,
+    'but one whole USDC off is');
+
+  assert.equal(addDecimalUnits('1000', '1000'), '2000');
+  assert.equal(addDecimalUnits('1000', '0.5'), null, 'half a base unit is not a count');
+  assert.equal(addDecimalUnits('-1', '1'), null);
+});
+
+test('a runway is a division, and refuses to be one when either side is missing', () => {
+  const funded = anchorRunway((10n ** 18n).toString(), DIGEST_COST_UNITS.toString());
+  assert.equal(funded.anchors, 1638, 'one USDC of fee balance at the measured price');
+  assert.equal(funded.problem, null);
+  assert.equal(funded.capped, false);
+  assert.equal(anchorRunway('0', DIGEST_COST_UNITS.toString()).anchors, 0, 'an empty account is a real answer');
+
+  // The three ways to have no answer are named separately, because they want three
+  // different actions and `0` would be the wrong answer for all of them.
+  assert.match(anchorRunway(null, '5').problem ?? '', /balance not read/);
+  assert.match(anchorRunway('10', null).problem ?? '', /no anchor cost measured/);
+  assert.match(anchorRunway('10', '0').problem ?? '', /not believable/);
+  assert.equal(anchorRunway('10', '0').anchors, null, 'a zero-cost receipt is not an infinite runway');
+
+  const huge = anchorRunway('1' + '0'.repeat(40), '1');
+  assert.equal(huge.anchors, Number.MAX_SAFE_INTEGER, 'the clamp is reported rather than silently saturating');
+  assert.equal(huge.capped, true);
+});
+
+test('the stored economics object is asked whether it still means what it claims', () => {
+  assert.equal(anchorEconProblem(newAnchorEcon(0)), null);
+  assert.equal(anchorEconProblem(newAnchorEcon(123)), null);
+  const corrupt: [string, AnchorEcon][] = [
+    ['a balance that arrived as a number', { ...newAnchorEcon(1), balanceUnits: 12345 as unknown as string }],
+    ['a token balance that arrived as a number', { ...newAnchorEcon(1), tokenUnits: 7n as unknown as string }],
+    ['a cost that arrived as a number', { ...newAnchorEcon(1), costUnits: 5 as unknown as string, costDay: 1 }],
+    ['a revenue total that is not a count', { ...newAnchorEcon(1), revenueUnits: '1.5' }],
+    ['a negative sale count', { ...newAnchorEcon(1), sales: -1 }],
+    ['an alarm flag that is a string', { ...newAnchorEcon(1), lowNoted: 'yes' as unknown as boolean }],
+    ['a cost belonging to no day', { ...newAnchorEcon(1), costUnits: '5', costDay: null }],
+    ['a day attached to no cost', { ...newAnchorEcon(1), costUnits: null, costDay: 3 }],
+    ['an unparseable timestamp', { ...newAnchorEcon(Number.NaN) }],
+  ];
+  for (const [what, value] of corrupt) assert.ok(anchorEconProblem(value), what);
+});
+
+test('a signal reddens the health light only while it is still happening', () => {
+  const T = 1_700_000_000_000;
+  const view = (at: number | undefined): HealthView => ({
+    startedAt: T,
+    counts: { census_row_rejected: 2 },
+    last: at === undefined ? {} : { census_row_rejected: { at, detail: 'headcount does not add up', count: 2 } },
+  });
+  assert.equal(healthProblem(view(T), T + 1000), 'census_row_rejected=2', 'a fresh signal is a red light');
+  assert.equal(healthProblem(view(T), T + PROBLEM_WINDOW_MS), 'census_row_rejected=2', 'the boundary itself counts');
+  assert.equal(healthProblem(view(T), T + PROBLEM_WINDOW_MS + 1), null, 'and the moment after it is history');
+  assert.deepEqual(staleSignals(view(T), T + PROBLEM_WINDOW_MS + 1), ['census_row_rejected=2'],
+    'out of window is not the same as forgotten');
+  // A count with nothing to date it by is treated as fresh: guessing "ancient" is
+  // how the one ledger that should be looked at gets the benefit of the doubt.
+  const undated = { startedAt: T, counts: { census_row_rejected: 2 }, last: {} } as HealthView;
+  assert.equal(healthProblem(undated, T + 10 * PROBLEM_WINDOW_MS), 'census_row_rejected=2');
+  assert.deepEqual(staleSignals(undated, T + 10 * PROBLEM_WINDOW_MS), []);
+  assert.equal(healthProblem(null), 'no health view');
+  assert.deepEqual(staleSignals(undefined), []);
+});
+
+/** Drive one already-broadcast day to confirmation and hand back what `/health` says. */
+async function anchoredOnce(
+  rpc: DigestRpc,
+  m: ReturnType<typeof memStore>,
+  health: ReturnType<typeof createHealth>,
+  day = 0,
+): Promise<HealthBody> {
+  const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+  shortenDay(app);
+  await tickTimes(app, 4);
+  await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === day, `day ${day} confirmed`);
+  return readHealth(app);
+}
+
+test('/health reports a repaired defect as history, not as a present failure', async () => {
+  // The state the public tank actually reached: rows refused by a loader that has
+  // since been fixed, with the counts still standing in durable storage. Reddening
+  // forever over a defect that no longer happens is how an alarm becomes a
+  // decoration, and the count going backwards is not an option either — it happened.
+  const health = createHealth();
+  health.merge({
+    counts: { census_row_rejected: 2 },
+    last: {
+      census_row_rejected: {
+        at: Date.now() - PROBLEM_WINDOW_MS - 60_000, detail: 'headcount does not add up', count: 2,
+      },
+    },
+  });
+  const app = createApp({ seed: 1, health, ...offlineFeeds });
+  const { value: body } = await quiet(() => readHealth(app));
+  assert.equal(body.healthy, true, 'clean for longer than the window, which is what healthy means');
+  assert.equal(body.problem, null);
+  assert.equal(body.stale, 'census_row_rejected=2', 'and the total is still there to be read');
+  assert.equal(body.signals?.counts.census_row_rejected, 2);
+
+  // The same kind firing again is news again: a window is not a mute button.
+  health.note('census_row_rejected', 'headcount does not add up');
+  const now = await readHealth(app);
+  assert.equal(now.healthy, false);
+  assert.equal(now.problem, 'census_row_rejected=3');
+  assert.equal(now.stale, null, 'a signal cannot be both current and out of window');
+});
+
+test('a confirmed day says what it cost and how long the account funds', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
+      const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health));
+      assert.ok(rpc.methods.includes('eth_call'), 'the token balance was asked for, not assumed');
+      // Asked, and asked *correctly*: the call has to be `balanceOf(signer)` against
+      // the USDC contract. A `to` that names some other contract, or an account that
+      // names some other holder, both answer with a number that looks like a result —
+      // and the scale check below would then be comparing the wrong two balances.
+      const { ARC_USDC_ADDRESS } = await import('../src/arc.js');
+      assert.equal(rpc.calls.length, 1, 'one token read per confirmed day');
+      assert.equal(rpc.calls[0].to.toLowerCase(), ARC_USDC_ADDRESS.toLowerCase(), 'against the USDC contract');
+      assert.equal(
+        rpc.calls[0].data,
+        `0x70a08231${(body.anchor.signer ?? '').toLowerCase().replace(/^0x/, '').padStart(64, '0')}`,
+        'for the balance of the address that pays for the anchor',
+      );
+      assert.ok(errors.every((e) => !/anchor economics|runway/.test(e)), 'a clean read prints nothing');
+      assert.equal(body.healthy, true, `nothing went wrong: ${body.problem ?? ''}`);
+      assert.equal(body.anchor.signer, body.digest?.signer, 'whose balance this is, named once');
+      assert.ok(body.anchor.signer, 'with a key configured, there is a signer');
+      assert.ok(body.anchor.readAt > 0, 'the reading is stamped with when it happened');
+      assert.ok((body.anchor.ageSeconds ?? 99) < 5, 'and its age is published beside it');
+      assert.equal(body.anchor.funded.feeUnits, (10n ** 18n).toString());
+      assert.equal(body.anchor.funded.feeDecimals, ARC_FEE_DECIMALS);
+      assert.equal(body.anchor.funded.usdcUnits, (10n ** 6n).toString());
+      assert.equal(body.anchor.funded.usdcDecimals, USDC_TOKEN_DECIMALS);
+      assert.equal(body.anchor.funded.bothRead, true);
+      assert.equal(body.anchor.funded.scaleOk, true, 'the two balances name the same money');
+      assert.equal(body.anchor.lastCost.feeUnits, DIGEST_COST_UNITS.toString());
+      assert.equal(body.anchor.lastCost.day, 0, 'a cost always names the day it belongs to');
+      assert.equal(body.anchor.runway.anchors, 1638);
+      assert.equal(body.anchor.runway.unknown, null);
+      assert.equal(body.anchor.runway.low, false);
+      assert.equal(body.anchor.runway.alarmBelow, RUNWAY_ALARM_ANCHORS);
+      assert.equal(body.anchor.revenue.sales, 0);
+      assert.equal(body.anchor.revenue.quotedUnits, '0');
+
+      // Durable, and not re-read by an idle isolate: the numbers a later process
+      // publishes are the ones the chain gave, with the age they have earned.
+      assert.equal(m.anchor()?.costUnits, DIGEST_COST_UNITS.toString());
+      const later = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      const second = await readHealth(later);
+      assert.equal(second.anchor.readAt, body.anchor.readAt, 'the reading survived the isolate that took it');
+      assert.equal(second.anchor.funded.feeUnits, body.anchor.funded.feeUnits);
+      assert.equal(second.anchor.runway.anchors, 1638);
+      assert.ok((second.anchor.ageSeconds ?? 0) >= 0, 'older now, and saying so');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a low runway is one event, and falling again after recovering is two', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  const feePerToken = 10n ** 12n;
+  const poor = 50n * DIGEST_COST_UNITS;
+  const rich = 200n * DIGEST_COST_UNITS;
+  const stage = async (day: number, feeUnits: bigint) => {
+    rpc.setBalances(feeHex(feeUnits), feeHex(feeUnits / feePerToken));
+    await seedPendingDay(m, day);
+    rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
+    const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health, day));
+    return { body, errors };
+  };
+  try {
+    await withDigestKey(async () => {
+      const first = await stage(0, poor);
+      assert.equal(first.body.anchor.runway.anchors, 50, 'fifty days of commitment left, which is a fact worth printing');
+      assert.equal(first.body.anchor.runway.low, true);
+      assert.equal(first.body.anchor.runway.alarmNoted, true);
+      assert.equal(first.body.signals?.counts.anchor_runway_low, 1);
+      assert.match(first.body.problem ?? '', /anchor_runway_low=1/, 'and it reddens the light');
+      assert.ok(first.errors.some((e) => /anchor runway low/.test(e)), 'the line a human tails still prints');
+
+      // A later process over an account that is still poor does not raise it again:
+      // the count would otherwise measure how long the tank has been broke, which is
+      // not a thing anyone needs a counter for.
+      const again = await stage(1, poor);
+      assert.equal(again.body.anchor.runway.anchors, 50);
+      assert.equal(again.body.signals?.counts.anchor_runway_low, 1, 'one event, not one per isolate');
+      assert.equal(again.errors.filter((e) => /anchor runway low/.test(e)).length, 0, 'and nothing printed the second time');
+
+      // Recovering clears the stored flag, so a second fall is genuinely new news.
+      const toppedUp = await stage(2, rich);
+      assert.equal(toppedUp.body.anchor.runway.anchors, 200);
+      assert.equal(toppedUp.body.anchor.runway.low, false);
+      assert.equal(toppedUp.body.anchor.runway.alarmNoted, false, 'the edge state resets with the balance');
+      assert.equal(toppedUp.body.signals?.counts.anchor_runway_low, 1);
+
+      const fell = await stage(3, poor);
+      assert.equal(fell.body.signals?.counts.anchor_runway_low, 2, 'a second fall is a second event');
+      assert.equal(fell.body.anchor.lastCost.day, 3, 'and the cost shown is the newest receipt');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a receipt without gas is one failure, and does not erase the last cost', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const priced = await anchoredOnce(rpc, m, health);
+      assert.equal(priced.anchor.lastCost.feeUnits, DIGEST_COST_UNITS.toString());
+
+      // Day 1's receipt arrives without the gas fields a mined receipt always has.
+      // Explicitly undefined: they must beat the stub's defaults, because this is
+      // the case where the node answered something that cannot be priced.
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX, gasUsed: undefined, effectiveGasPrice: undefined });
+      await seedPendingDay(m, 1);
+      const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health, 1));
+      // Nothing new is claimed about day 1's price, and nothing already known is
+      // thrown away: the cost stays the one the chain actually reported, with the
+      // day it belongs to still attached.
+      assert.equal(body.anchor.lastCost.feeUnits, DIGEST_COST_UNITS.toString(), 'the last real cost survives an unreal one');
+      assert.equal(body.anchor.lastCost.day, 0, 'and it keeps saying which day it was');
+      assert.equal(body.anchor.runway.anchors, 1638, 'the runway is still the division it was');
+      assert.equal(body.signals?.counts.anchor_econ_unreadable, 1);
+      assert.match(healthDetail(body, 'anchor_econ_unreadable'), /gasUsed.effectiveGasPrice/, 'with the reason');
+      assert.ok(errors.some((e) => /anchor economics incomplete/.test(e)));
+      assert.match(body.problem ?? '', /anchor_econ_unreadable=1/);
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a chain that stops naming one money with two units is reported, not absorbed', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // 1e18 fee units against 5e6 token units: the same account, two incompatible
+      // stories. Every conversion in `econ.ts` goes through that ratio, so the
+      // runway below would still print — and mean nothing.
+      rpc.setBalances(feeHex(10n ** 18n), feeHex(5n * 10n ** 6n));
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const body = await anchoredOnce(rpc, m, health);
+      assert.equal(body.anchor.funded.scaleOk, false);
+      assert.equal(body.anchor.funded.bothRead, true);
+      assert.equal(body.signals?.counts.arc_unit_scale_unexpected, 1);
+      assert.match(healthDetail(body, 'arc_unit_scale_unexpected') ?? '', /is not .* at 1e12/);
+      assert.match(body.problem ?? '', /arc_unit_scale_unexpected=1/);
+      // The figures are still published, with the alarm beside them: a reader who
+      // wants the balance gets it and sees that it is distrusted.
+      assert.equal(body.anchor.runway.anchors, 1638);
+      assert.equal(body.anchor.runway.low, false);
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the account the chain actually reports has dust in it, and is still believed', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // Both figures are the ones the deployed anchor account answered on
+      // 2026-09-24: `0x1156fcae4bf3247f0` from `eth_getBalance` and `0x1310b7c`
+      // from `balanceOf`. The stub's default pair is exactly 1e12 apart, which is
+      // precisely why it was the wrong shape to test this with — a balance with no
+      // dust under the six-decimal boundary is not a balance an account holds.
+      rpc.setBalances('0x1156fcae4bf3247f0', '0x1310b7c');
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const { value: body, errors } = await quiet(() => anchoredOnce(rpc, m, health));
+      assert.equal(body.healthy, true, `dust is not a defect: ${body.problem ?? ''}`);
+      assert.equal(body.anchor.funded.scaleOk, true, 'the two readings still name one money');
+      assert.equal(body.anchor.funded.bothRead, true);
+      assert.equal(body.signals?.counts.arc_unit_scale_unexpected, undefined, 'and no alarm is raised');
+      assert.ok(errors.every((e) => !/suspect/.test(e)), 'nothing is printed about it either');
+      assert.equal(body.anchor.runway.anchors, 32_751, 'the division is the same one, on the real balance');
+      assert.equal(body.anchor.runway.low, false, 'and 32,751 days of commitment is not an alarm');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('an unreadable balance ages the last figures instead of erasing them quietly', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const good = await anchoredOnce(rpc, m, health);
+      assert.equal(good.anchor.funded.feeUnits, (10n ** 18n).toString());
+
+      // Day 1 confirms and the node *refuses* the token read. An error answer
+      // changes nothing but the counter: the previous figures stay, and the age
+      // they publish grows, which is the only honest way to say "we have not heard
+      // from the chain since" without inventing a zero.
+      rpc.setCallError('execution reverted');
+      await seedPendingDay(m, 1);
+      const app2 = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app2);
+      const { value: refused, errors } = await quiet(async () => {
+        await tickTimes(app2, 4);
+        await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 1, 'day 1 confirmed');
+        return readHealth(app2);
+      });
+      assert.equal(refused.signals?.counts.anchor_econ_unreadable, 1);
+      assert.match(refused.problem ?? '', /anchor_econ_unreadable=1/);
+      assert.ok(errors.some((e) => /anchor economics not read/.test(e)));
+      assert.equal(refused.anchor.readAt, good.anchor.readAt, 'a read that failed does not restamp the figures');
+      assert.equal(refused.anchor.funded.feeUnits, (10n ** 18n).toString(), 'the last answer stands');
+      assert.equal(refused.anchor.runway.anchors, 1638, 'and is still divided by the cost it was divided by');
+
+      // Day 2 confirms and the node answers one balance and mangles the other.
+      // That is the opposite case to a refusal: a legible "I have no idea" gets a
+      // fresh timestamp and a null, because the alternative is a stale figure
+      // wearing a current one — and `bothRead` has to be false rather than letting
+      // the half that answered speak for the half that did not.
+      rpc.setCallError(null);
+      rpc.setBalances(feeHex(10n ** 18n), '0x');
+      await seedPendingDay(m, 2);
+      const app3 = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app3);
+      const unread = await quiet(async () => {
+        await tickTimes(app3, 4);
+        await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 2, 'day 2 confirmed');
+        return readHealth(app3);
+      });
+      assert.equal(unread.value.anchor.readAt > refused.anchor.readAt, true, 'a new timestamp, for a new answer');
+      assert.equal(unread.value.anchor.funded.usdcUnits, null, 'the half that mangled is null, not stale');
+      assert.equal(unread.value.anchor.funded.feeUnits, (10n ** 18n).toString(), 'the half that answered is the fresh one');
+      assert.equal(unread.value.anchor.funded.bothRead, false);
+      assert.equal(unread.value.anchor.funded.scaleOk, null, 'not knowable, which is not the same as false');
+      // The runway is still a number, because the money that pays for a day anchor
+      // is the fee balance and the cost is quoted in the same units: the half that
+      // mangled is the token one, and what it was supposed to prove — that the two
+      // readings name the same money — is reported as `scaleOk: null` above rather
+      // than being smuggled into the division. "No balance was read at all" is a
+      // different sentence and is locked by the test that loads a refused ledger.
+      assert.equal(unread.value.anchor.runway.unknown, null);
+      assert.equal(unread.value.anchor.runway.anchors, 1638, 'the readable half still carries the runway');
+      // The cost survives both failures, because it belongs to a day rather than to
+      // a read: it is the newest receipt, whichever day that was.
+      assert.equal(unread.value.anchor.lastCost.feeUnits, DIGEST_COST_UNITS.toString());
+      assert.equal(unread.value.anchor.lastCost.day, 2);
+      assert.equal(unread.value.stale, null, 'a signal this fresh cannot be stale');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a stored economics object that no longer means what it claims is refused out loud', async () => {
+  const m = memStore();
+  const health = createHealth();
+  // A balance that arrived as a JSON number: every comparison downstream would
+  // throw inside the health route, which is the worst place in the build for it.
+  m.seedAnchor({ ...newAnchorEcon(1_700_000_000_000), sales: 9, revenueUnits: '9000', balanceUnits: 42 as unknown as string });
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value: body, errors } = await quiet(() => readHealth(app));
+  assert.equal(body.signals?.counts.anchor_econ_rejected, 1);
+  assert.match(healthDetail(body, 'anchor_econ_rejected'), /balanceUnits is not a decimal integer string/);
+  assert.ok(errors.some((e) => /stored anchor economics refused/.test(e)));
+  assert.match(body.problem ?? '', /anchor_econ_rejected=1/);
+  // Refused rather than repaired: the nine sales go with it, which is exactly why
+  // the refusal is counted, and the funding figures start over as never-read.
+  assert.equal(body.anchor.readAt, 0, 'never read, which is not the same as zero');
+  assert.equal(body.anchor.revenue.sales, 0);
+  assert.equal(body.anchor.funded.feeUnits, null);
+  assert.equal(body.anchor.runway.anchors, null);
+  assert.match(body.anchor.runway.unknown ?? '', /balance not read/);
 });
 
 

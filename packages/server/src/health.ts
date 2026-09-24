@@ -60,6 +60,40 @@ export const SIGNAL_KINDS = [
    */
   'digest_anchor_unstamped',
   /**
+   * The day closed, the transaction confirmed, and the chain would not say what
+   * it cost or what the account holds. Nothing about the anchor breaks when this
+   * happens — the day still commits, the census still grows — so without a count
+   * the site would keep publishing a funding figure it can no longer support.
+   * Counted because the honest answer to "how long is this funded for" is
+   * "unknown, and here is when it stopped being known".
+   */
+  'anchor_econ_unreadable',
+  /**
+   * `eth_getBalance` and the USDC `balanceOf` of the signing address no longer
+   * truncate into each other at the ratio every quantity in `econ.ts` converts
+   * between. Dust under the six-decimal boundary is expected and is not this
+   * signal — the deployed account carries it — so what fires it is the quotient
+   * itself moving, which means the chain's fee model changed. At that point the
+   * runway is not slightly wrong but meaningless, and the number that would
+   * quietly be wrong is the one a top-up gets decided from.
+   */
+  'arc_unit_scale_unexpected',
+  /**
+   * Fewer days of commitment are funded than `RUNWAY_ALARM_ANCHORS`. Edge
+   * triggered like the budget watermarks: a low balance that stays low is one
+   * event, not a counter that doubles every poll until it buries the two numbers
+   * that were the reason for looking.
+   */
+  'anchor_runway_low',
+  /**
+   * A stored economics object no longer means what it claims, so it was refused on
+   * load and the funding figures start over from nothing. Counted on the same
+   * argument as `digest_record_rejected`: the row came out of storage, whatever
+   * wrote it is already gone, and without a number the only evidence is a console
+   * line that is never delivered. Its `detail` carries which field failed.
+   */
+  'anchor_econ_rejected',
+  /**
    * A stored day-book row no longer means what it claims — usually a headcount
    * that does not add up to the population beside it. Counted for the same reason
    * as the digest record above: the row was read out of storage, so whatever wrote
@@ -208,17 +242,65 @@ export function createHealth(startedAt: number = Date.now(), onChange?: (v: Heal
 }
 
 /**
- * Whether there is anything to read. Deliberately blunt: a monitoring caller
- * should not have to reproduce the rules for which kinds count.
+ * Whether there is anything to read, and whether it is still happening.
+ *
+ * A signal counts here only if its last event is inside `PROBLEM_WINDOW_MS`. That
+ * is the whole difference between a number and an alarm: counts are cumulative and
+ * outlive every deploy, so a rule that reddens on `count > 0` reports a defect that
+ * was fixed last week as a present-tense failure forever — and an alarm that can
+ * never go off again is not read the next time it matters. Nothing is hidden by
+ * this: the totals stay in `counts`, and `staleSignals` names the kinds that are
+ * out of window so a reader can tell "clean for a day" from "clean, ever".
+ *
+ * Deliberately blunt in every other respect: a monitoring caller should not have
+ * to reproduce the rules for which kinds count, so there is one window and it
+ * applies to all of them.
  */
-export function healthProblem(v: HealthView | null | undefined): string | null {
+export function healthProblem(v: HealthView | null | undefined, now: number = Date.now()): string | null {
   if (!v || typeof v.counts !== 'object' || v.counts === null) return 'no health view';
-  const flagged = Object.entries(v.counts).filter(([, n]) => typeof n === 'number' && n > 0);
+  const flagged = Object.entries(v.counts).filter(([kind, n]) => (typeof n === 'number' && n > 0) && isFresh(v, kind, now));
   if (!flagged.length) return null;
   return flagged
     .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
     .map(([k, n]) => `${k}=${n}`)
     .join(' ');
+}
+
+/**
+ * How long a signal holds the health light red after it last fired.
+ *
+ * One day of wall clock, which is not a generous number for this system: the
+ * longest interval between any two events the anchor machinery can produce is one
+ * world day (about 81 minutes measured), so a full day of silence covers every
+ * daily path here more than eighteen times over. Anything that fired once, a day
+ * ago, and has not repeated is history rather than a fault.
+ */
+export const PROBLEM_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** Whether the last event of this kind is inside the window. */
+function isFresh(v: HealthView, kind: string, now: number): boolean {
+  const event = v.last?.[kind];
+  // No event to date the count by is treated as fresh, not as stale. A count that
+  // arrived from storage without a timestamp is a corrupt or an ancient ledger,
+  // and guessing "ancient" is how the one case that should be looked at gets the
+  // benefit of the doubt.
+  if (!event || typeof event.at !== 'number') return true;
+  return now - event.at <= PROBLEM_WINDOW_MS;
+}
+
+/**
+ * Kinds that have fired and are now out of window, as `kind=count` strings.
+ *
+ * Published next to `problem` so the recency rule costs no information: a reader
+ * sees what is wrong now and what was wrong lately, in the same response, without
+ * having to know that the two are produced by different rules.
+ */
+export function staleSignals(v: HealthView | null | undefined, now: number = Date.now()): string[] {
+  if (!v || typeof v.counts !== 'object' || v.counts === null) return [];
+  return Object.entries(v.counts)
+    .filter(([kind, n]) => typeof n === 'number' && n > 0 && !isFresh(v, kind, now))
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${k}=${n}`);
 }
 
 /**
