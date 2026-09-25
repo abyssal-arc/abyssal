@@ -668,19 +668,12 @@ export function createApp(options: AppOptions = {}) {
     // tank once a minute.
     const day = Math.floor(world.tick / world.config.ticksPerDay);
     if (day > 0) {
-      // Not awaited for the reason in the comment below; the promise is kept only
-      // so `settleDigest()` can answer "is the pump finished" as a fact rather
-      // than as a wait of some guessed length.
-      digestPumpPromise = pumpDigest(day - 1).catch((err: unknown) => {
-        // `advance()` is on the viewer's request path, so the pump cannot be
-        // awaited without letting a stalled chain RPC hold up a page load. Not
-        // awaiting is fine; not answering for it is not — the record itself
-        // records the attempt, this line is only for what escapes it.
-        console.error('day digest pump failed: the anchor may be stuck on the previous day', err);
-        options.health?.note('digest_pump_failed', err);
-      }).finally(() => {
-        digestPumpPromise = null;
-      });
+      // Not awaited for the reason in the comment below. `startDigestPump()` is the
+      // only place the promise `settleDigest()` waits on is written, because this
+      // line runs on every elapsed tick — including the ones where the pump is
+      // already busy and the run would otherwise be recorded as a no-op that has
+      // finished.
+      startDigestPump(day - 1);
     }
 
     lastAdvanceAt = Date.now();
@@ -1103,7 +1096,9 @@ export function createApp(options: AppOptions = {}) {
    * The pump run currently outstanding, or null when the pump is idle. Kept
    * beside the re-entry guard rather than instead of it: the guard exists so a
    * tick never starts a second pump, and this exists so something can wait for
-   * the one already going. Both are needed, and neither is the other.
+   * the one already going. Both are needed, and neither is the other — which is
+   * why `startDigestPump()` writes them together, since a promise maintained
+   * anywhere else can be pointed at a run that never started.
    */
   let digestPumpPromise: Promise<void> | null = null;
 
@@ -1227,18 +1222,48 @@ export function createApp(options: AppOptions = {}) {
   }
 
   /**
-   * Move the digest one step forward, if a step is due.
+   * Start a pump run if one is not already going, and record *that* run as the
+   * thing a wait has to outlive.
    *
-   * Called from `advance()`, which on a Worker runs on every request and every
-   * cron poke that finds elapsed ticks — anywhere between four times a second
-   * and once a minute depending on traffic. So the part that matters for
-   * correctness is that nothing here consults the call rate: `nextDigestAction`
-   * decides against the wall clock, and this function only carries out the one
-   * action it is handed.
+   * Both halves used to happen at the call site in `advance()`, which meant a tick
+   * arriving while a pump was busy replaced the outstanding run's promise with the
+   * skipped re-entry's already-settled one. `settleDigest()` then answered
+   * "finished" while a confirmation's two balance reads were still open — a wait
+   * that a skipped call can satisfy is a false green with a deadline on it, and
+   * every test that reads the anchor's economics depends on this one meaning what
+   * it says. The re-entry decision and the promise therefore belong to the same
+   * three lines.
+   */
+  function startDigestPump(prevDay: number): void {
+    if (digestPumpInFlight) return;
+    digestPumpInFlight = true; // cleared by `pumpDigest`'s own `finally`
+    // `advance()` is on the viewer's request path, so the pump cannot be awaited
+    // without letting a stalled chain RPC hold up a page load. Not awaiting is
+    // fine; not answering for it is not — the record itself records the attempt,
+    // this catch is only for what escapes it.
+    const tracked = pumpDigest(prevDay)
+      .catch((err: unknown) => {
+        console.error('day digest pump failed: the anchor may be stuck on the previous day', err);
+        options.health?.note('digest_pump_failed', err);
+      })
+      .finally(() => {
+        // Only if this run is still the one on record: a later run has already
+        // put itself there, and clearing it by mistake would unwait the wait.
+        if (digestPumpPromise === tracked) digestPumpPromise = null;
+      });
+    digestPumpPromise = tracked;
+  }
+
+  /**
+   * Move the digest one step forward.
+   *
+   * Called through `startDigestPump()`, which holds the re-entry guard; nothing
+   * here consults the call rate: `nextDigestAction` decides against the wall clock,
+   * and this function only carries out the one action it is handed. On a Worker
+   * that clock is checked anywhere between four times a second and once a minute
+   * depending on traffic, which is why the time-shaped decisions all live there.
    */
   async function pumpDigest(prevDay: number): Promise<void> {
-    if (digestPumpInFlight) return;
-    digestPumpInFlight = true;
     try {
       let rec = digest;
       if (!rec || (rec.day !== prevDay && isSettled(rec))) {

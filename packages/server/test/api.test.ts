@@ -3535,6 +3535,12 @@ test('the receipt settles an anchor, and a settled day lets the next one through
       await tickTimes(app, 4);
 
       const done = await untilDigest(m.digest, (r) => r.status === 'confirmed', 'confirmed');
+      // Settle before spending any more ticks. The confirmation's economics read is
+      // still running, the pump is not re-entered while it runs, and these four
+      // ticks are the only thing that drives day 1 forward — so on a busy machine
+      // they were all swallowed by the busy window and the next day never anchored
+      // at all. Under load this failed 4 times in 6 before the wait was here.
+      await app.settleDigest();
       assert.equal(done.txHash, DIGEST_TX, 'the hash that was confirmed stays on the record');
       assert.ok((done.confirmedAt ?? 0) > 1, 'with a time, so the UI can show a checkmark and nothing more');
       assert.equal(rpc.methods.filter((x) => x === 'eth_sendRawTransaction').length, 0, 'a poll is not a resend');
@@ -5799,6 +5805,48 @@ test('the reading beside a confirmed day is waited for, not raced', async () => 
   }
 });
 
+test('a tick that arrives while the pump is busy does not answer "the pump has finished"', async () => {
+  // The wait above is only as honest as the promise it watches. `advance()` used to
+  // write that promise at the call site, so the next tick — the one the re-entry
+  // guard turns into an immediate no-op — replaced the running one with a promise
+  // that had already settled, and `settleDigest()` answered "done" while a
+  // confirmed day's two balance reads were still open. Every anchor assertion in
+  // this file would then be reading a moment that had not happened yet, which is
+  // the false green the wait exists to prevent. The latency is generous on purpose:
+  // the point to prove is that a skipped tick still has a run outstanding, and a
+  // machine under load should not be able to fake the other answer.
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      rpc.setBalanceLatency(300);
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 0, 'day 0 confirmed');
+      // Ticks the guard swallows, arriving while the tail is open: these are the
+      // calls that used to satisfy the wait.
+      await tickTimes(app, 2);
+      await assert.rejects(
+        () => app.settleDigest(10),
+        /the anchor pump never settled within 10ms/,
+        'a skipped re-entry is not a finished run',
+      );
+      await app.settleDigest();
+      const body = await readHealth(app);
+      assert.equal(body.anchor.funded.bothRead, true, 'the wait handed over balances that had arrived');
+      assert.equal(body.anchor.funded.feeUnits, (10n ** 18n).toString());
+      assert.equal(body.anchor.runway.anchors, 1638);
+      assert.equal(health.view().counts.digest_pump_failed, undefined, 'and refusing to finish early is not a failure');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
 test('a confirmed day says what it cost and how long the account funds', async () => {
   const rpc = await digestRpcStub();
   const m = memStore();
@@ -6256,13 +6304,12 @@ test('an unreadable balance ages the last figures instead of erasing them quietl
       // from the chain since" without inventing a zero.
       rpc.setCallError('execution reverted');
       await seedPendingDay(m, 1);
-      const app2 = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
-      shortenDay(app2);
-      const { value: refused, errors } = await quiet(async () => {
-        await tickTimes(app2, 4);
-        await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 1, 'day 1 confirmed');
-        return readHealth(app2);
-      });
+      // `anchoredOnce`, not a hand-rolled copy of what it does: the copy waited for
+      // the record to say `confirmed` and then read `/health`, and `confirmed` is
+      // persisted *before* the two balance reads start, because a viewer's tick must
+      // never block on the chain. So the copy raced the very refusal it asserts —
+      // which is how it passed on an idle machine and failed on the runner.
+      const { value: refused, errors } = await quiet(() => anchoredOnce(rpc, m, health, 1));
       assert.equal(refused.signals?.counts.anchor_econ_unreadable, 1);
       assert.match(refused.problem ?? '', /anchor_econ_unreadable=1/);
       assert.ok(errors.some((e) => /anchor economics not read/.test(e)));
@@ -6278,13 +6325,7 @@ test('an unreadable balance ages the last figures instead of erasing them quietl
       rpc.setCallError(null);
       rpc.setBalances(feeHex(10n ** 18n), '0x');
       await seedPendingDay(m, 2);
-      const app3 = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
-      shortenDay(app3);
-      const unread = await quiet(async () => {
-        await tickTimes(app3, 4);
-        await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 2, 'day 2 confirmed');
-        return readHealth(app3);
-      });
+      const unread = await quiet(() => anchoredOnce(rpc, m, health, 2));
       assert.equal(unread.value.anchor.readAt > refused.anchor.readAt, true, 'a new timestamp, for a new answer');
       assert.equal(unread.value.anchor.funded.usdcUnits, null, 'the half that mangled is null, not stale');
       assert.equal(unread.value.anchor.funded.feeUnits, (10n ** 18n).toString(), 'the half that answered is the fresh one');

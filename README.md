@@ -32,7 +32,7 @@ Two views over one data source:
   leaderboard row jumps the camera to the matching whale or creature.
 
 What a visitor can *do* splits in two: a free social layer — adopt, rally,
-lineage, the fossil wall — and nine paid actions, each settled by **burning
+lineage, the fossil wall — and ten paid actions, each settled by **burning
 ABYS**. The burn receipt is the payment, nobody custodies anything, and the
 tokens leave circulation.
 
@@ -788,12 +788,43 @@ list still matches the files on disk in both directions: a ninth file that no ga
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
 
+Green on an idle laptop is not the standard, and one push proved the difference: the
+same 292 passed here and failed on the runner. Two tests waited for a day to say
+`confirmed` and then looked at what that confirmation set in motion — and the anchor
+pump persists the confirmation *before* it reads the balances, because a viewer's
+tick must never block on the chain. Against a local stub on an idle machine those
+two calls finish before the test's next line, which is exactly why the tests looked
+fine here; on a busy runner they did not. `settleDigest()` is how a test says "wait
+for the pump": the first test had hand-rolled a sequence a helper already wraps
+without the helper's wait, and now calls the helper; the second drives two days
+through one app and waits explicitly, between the confirmation and the ticks that
+were being eaten.
+Measured on both sides of the change, under eight CPU spinners: before it, the first
+failed 4 of 5 runs (`undefined !== 1`, on the counter a refused balance read files)
+and the second 4 of 6 (`digest never became day 1 anchored` — every tick it was
+waiting on had been swallowed while the pump was busy); after it, the whole suite ran
+ten more times under the same load, 2,920 test results and no failure among them.
+The wait itself had a hole of the same family, found by reading the primitive rather
+than by being shown: `advance()` recorded the pump's promise at the call site, so a
+tick arriving while the pump was busy wrote a finished no-op over the run still in
+flight, and `settleDigest()` would have answered "the pump is done" before the
+balance reads came back — the false green this helper exists to prevent. Guarding
+the re-entry, recording the run and clearing it only for the run that is still on
+record now happen in one function. The test for it needs no loaded machine, because
+it does not wait for a race: the stub is told to take 300 ms to answer, the swallowed
+tick is issued inside that window, and the assertion is that a wait with a 10 ms
+timeout still refuses to claim the pump finished. Putting the defect back makes that
+test red on the first run, twice over — a mutated guard and a mutated record, both
+caught.
+
 ## Status
 
-Live in production: both views, all nine paid actions against the deployed ABYS
-contract, the paid historical-data route settled in USDC, the free social layer,
-six languages, and the Durable Object tank ticking on a one-minute Cron Trigger
-with zero viewers.
+Live in production: both views, all ten paid actions against the deployed ABYS
+contract — an unpaid `POST /intervene` and an unpaid `POST /flare` each answer
+with a burn offer naming the same asset, `0x347ef48695eb437cf9e7e3df8637866f9baf1767`,
+probed 2026-09-25 — the paid historical-data route settled in USDC, the free
+social layer, six languages, and the Durable Object tank ticking on a one-minute
+Cron Trigger with zero viewers.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
