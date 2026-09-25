@@ -38,7 +38,8 @@ tokens leave circulation.
 
 The interface ships in six languages — English, Français, Deutsch, 中文,
 日本語, 한국어 — from a hand-written dictionary in `packages/web/i18n.js`
-(357 keys per language, kept in step by a test).
+(358 keys per language as measured on 2026-09-25, counted with the same regexes
+the in-step test uses rather than a copy of them, and kept in step by that test).
 
 > Everything in this repository is original work.
 
@@ -274,12 +275,54 @@ The node adapter compresses every text response (brotli preferred, gzip
 fallback, `Vary: accept-encoding`); on Cloudflare Workers the edge does this
 instead, which is why compression lives in `dev.ts` and not in the handler.
 Static assets carry `ETag`/`Last-Modified`, so an unchanged reload is a 304 with
-an empty body. Polling is incremental: `/snapshot?since=` returns only unseen
-events, `?tx=` only unseen meteors, and `/history?slots=` ships the chart's 200
-points instead of the raw 2000-tick window. A hidden tab stops polling entirely
-and soft-restarts on return. Measured on Arc mainnet at the time of writing:
-**~12.6 KB/s per viewer** in WORLD view (~14.8 in OBSERVE), down from ~107 KB/s
-uncompressed, and **0** while the tab is hidden.
+an empty body, and they are the only thing here that the edge demonstrably
+shares (below). `/history?slots=` ships the chart's 200 points instead of the raw
+2000-tick window, `/snapshot?tail=6` caps the replay an opening tab is given, and
+`?tx=` returns only unseen meteors. A hidden tab stops polling entirely and
+soft-restarts on return.
+
+Measured against production on 2026-09-25, per viewer, at the cadence the client
+actually keeps — `/snapshot` twice a second (`POLL_MS = 500`) plus
+`/history` + `/judgments` + `/reports` every 30 s (`pollAux`), OBSERVE adding one
+`/observe` every 6 s:
+
+| view | over the wire (brotli) | the same requests uncompressed |
+| --- | --- | --- |
+| WORLD | **29.4 KB/s** (28.0 of it is `/snapshot` alone) | 161.1 KB/s |
+| OBSERVE | **31.9 KB/s** | 172.7 KB/s |
+
+Eight samples per endpoint, counted as bytes off the socket: the edge omits
+`content-length` on its brotli responses, so a "wire size" read from that header
+comes back empty, and one read out of a decompressed body is the identity size
+wearing a hat — both mistakes were made writing the first version of this probe.
+The earlier run, 78 minutes before the table above, put WORLD at 31.1 KB/s from
+`/snapshot` alone and 32.0 with the trio, on twenty samples (13,699–16,724 B
+compressed, 79,800–83,072 B not); the run in the table is eight samples
+(13,504–15,162 B compressed, 74,783–79,868 B not). Both are printed because the
+payload is a population and the spread between two runs an hour apart is most of
+the spread within one: brotli holds at 0.185–0.191 of identity, a factor of 5.2
+to 5.4. The aux trio is 27.0–27.1 KB per 30 seconds, and `/reports` is 14 bytes
+of it. An earlier pair of figures in this file, ~12.6 KB/s against ~107 KB/s, is
+superseded: it carries no window, no sample size and no date beside it, so there
+is nothing to check it against, and the tank it was measured on is not the tank
+now. That is the whole reason the numbers above have dates attached.
+
+What is *not* happening is worth as much as what is. `/snapshot` answers
+`Cache-Control: public, s-maxage=3, stale-while-revalidate=9`, and the client
+sends every viewer the same canonical URL rather than a per-viewer `?since=`
+specifically so that the edge can collapse those requests into one origin call.
+Probed with eight `GET /snapshot`s inside 4.5 seconds on a single keep-alive
+connection — inside the freshness window by construction — every response came
+back with a different body length (83,821 through 86,060 B uncompressed in one
+run, 16,340 through 16,656 B brotli-compressed in another an hour later — a tank
+that is alive) and no `cf-cache-status` header at all, while `/app.js` and
+`/src/census.js` on the same host answered `cf-cache-status: HIT` to the same
+probe; `/index.html` got no such header either, so the control is the two
+scripted assets. So the polls are not being served from the edge, and the
+per-viewer bandwidth above is also per-viewer origin load: two Durable Object
+calls a second each. The header stays, because making it true is a cache
+configuration and not a rewrite, and because `no-store` on the routes that need
+it is only meaningful if the routes that do ask are asking in the same dialect.
 
 ### Time conversion (at the default 250ms tick)
 
@@ -452,7 +495,15 @@ no viewers that means no ticks at all, which is what the Cron Trigger in
   EIP-3009, so it is a transaction addressed to the token itself carrying
   `transferWithAuthorization` (`0xe3ee160e`). Of 2283 mainnet transactions
   sampled, 20 were that: about 0.9%. Of the 87 addressed to USDC directly, 57 were
-  `approve`, which is not a payment either.
+  `approve`, which is not a payment either. That sample was taken by hand while the
+  replacement was being written and cannot be re-run from this repository; the
+  deployed instrument is re-readable, and it does not agree with 0.9%. Read off
+  `/observe` on 2026-09-25: the pulse series' own 360 buckets over 19.3 hours hold
+  152,667 transfers, 151,232 of them with the transaction body read, and 3,183
+  x402 settlements — **2.10%** of the resolved count — while the rolling
+  five-minute heading figure moved between 2.3% and 4.5% across fourteen reads of
+  `GET /observe` taken a minute apart. A percentage on a chain this young
+  is a window statistic, so the window travels with the number.
   `venue.ts` now classifies every flow onto a rail — `x402`, `swap`, `aa`,
   `direct`, `contract`, `unknown` — from the contract called and the method
   called, against a registry read off mainnet (Universal Router, ERC-4337
@@ -767,12 +818,12 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-292 tests on `node:test`, no test framework dependency:
+293 tests on `node:test`, no test framework dependency:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 172 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
+| `@abyssal/server` | 173 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
 | `@abyssal/web` | 61 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
@@ -787,6 +838,17 @@ than in a browser — and it lists those files by name, so a web test asserts th
 list still matches the files on disk in both directions: a ninth file that no gate
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
+
+A green suite is a claim about tests, not about the code, so every batch here also
+runs negative verification: a battery of 223 hand-written single-line mutations of
+these files, each paired with the name of the test that has to go red for it, and
+each classified caught / missed / no-verdict rather than merely "failing". A
+mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
+it gets deleted with the reason recorded in the battery instead of kept as a green
+row that flatters the count. The last full run on the tree described here caught
+223 of 223. The battery itself lives outside the committed tree (it is a working
+tool that rewrites these files in place), and this paragraph is where that is said
+plainly rather than implied by a directory listing.
 
 Green on an idle laptop is not the standard, and one push proved the difference: the
 same 292 passed here and failed on the runner. Two tests waited for a day to say
@@ -841,27 +903,41 @@ boundaries used to be able to commit the same day twice.
 Whether the account that pays for it can keep paying is measured rather than
 assumed. Each confirmed day is priced from its own receipt, read off the chain
 rather than quoted, and every receipt the book points at has been fetched back
-and multiplied out: eighteen of its nineteen rows carry a transaction hash — the
+and multiplied out: twenty of its twenty-one rows carry a transaction hash — the
 first row, day 27, is timestamped 2026-09-24T07:35:11Z, under ten minutes before
 the commit that taught the poll to record one, and its absence is kept rather
-than filled in after the fact. Those eighteen, with the day-15 anchor that
+than filled in after the fact. Those twenty, with the day-15 anchor that
 predates the book (`0xcc60e690…`) added, span 30,440 to 30,600 gas: the gas a
 day burns is not a constant. Neither is the price — 20, 20.001, 20.1, 20.115,
 20.131747031, 20.19900952 and 21 gwei have each appeared on one of them — which
 puts a day at 611,200,000,000,000 to 640,920,000,000,000 fee units, `0.0006` of
-the money. The newest of those measured costs is what the balance gets divided
-by, and the pair moves with every confirmation: the reading `/health` published
-for day 45 (taken 2026-09-25T08:29:34Z) held 19,980,968,075,540,751,440 fee
-units against a day that had just cost 612,030,600,000,000, and the first divided
-by the second, truncated, is the `32,647` printed beside them — a division
+the money, the cheapest and the dearest of those twenty-one separated by 4.9%. The
+newest of those measured costs is what the balance gets divided by, and the pair
+moves with every confirmation: the reading `/health` published
+for day 46 (taken 2026-09-25T09:59:25Z) held 19,980,353,015,540,751,440 fee
+units against a day that had just cost 615,060,000,000,000, and the first divided
+by the second, truncated, is the `32,485` printed beside them — a division
 anybody can redo from the two figures published next to it, which is the only way
-this figure stays checkable through the ~82 minutes it takes to be superseded.
-Seventeen consecutive confirmations' block timestamps put the gap between one
-anchored day and the next between 79 minutes 58 seconds and 86 minutes 54
-seconds, mean 82 minutes 45 seconds; at that mean the runway above is 5.14
-years, and across the spread of those gaps 4.96 to 5.39. Both balances are read
-at the moment a day confirms — two RPC calls per anchored day, not one per page
-view — and the age of the reading is published beside the figures, so a reader
+this figure stays checkable through the ~83 minutes it takes to be superseded.
+The next confirmation replaced it with 19,979,737,955,540,751,440 over the same
+quoted cost, i.e. `32,484`, and the subtraction that produced the runway did not
+change between the two readings — but the pair has a second check in it, because
+what the two balances differ by is *exactly* the 615,060,000,000,000 the
+newer receipt says that day cost. A gas price read off a receipt and a balance
+read off the node agree to the fee unit, and nothing else has spent from that
+account in between: the same subtraction, three times over now (days 35→36 and
+42→43 are quoted below). Nineteen gaps between twenty consecutive confirmations' block
+timestamps put the distance from one anchored day to the next between 79 minutes
+58 seconds and 90 minutes 3 seconds, mean 83 minutes 24 seconds; at that mean the
+runway above is 5.15 years, and across the spread of those gaps 4.94 to 5.56. That
+spread is not stable either: the version of this sentence before last had
+seventeen gaps, a maximum of 86 minutes 54 seconds and a mean of 82 minutes 45;
+the confirmation that followed it was 90 minutes 3 seconds from its predecessor
+and widened the maximum by three minutes nine seconds, and the one after that
+moved the mean a further 14 seconds. Which is the reason the spread is printed
+beside the mean instead of folded into it. Both balances are read at the moment a
+day confirms — two RPC calls per anchored day, not one per page view — and the age
+of the reading is published beside the figures, so a reader
 can see how stale the arithmetic is rather than assume it is current. The same
 read also asks the
 token contract `balanceOf` for the signing address, not to divide anything with

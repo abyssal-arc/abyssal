@@ -1319,9 +1319,15 @@ function resetTimeline() {
 async function poll() {
   const bootstrap = stale;
   try {
-    // One canonical URL per mode, so the edge can cache the answer and every
-    // viewer of one tank shares a single origin fetch instead of each polling
-    // the Durable Object personally. Events are filtered locally by seq.
+    // One canonical URL per mode, because a per-viewer `?since=` would be a
+    // per-viewer cache key and the sharing is supposed to happen at the edge. It
+    // is not happening there today: eight `GET /snapshot`s inside 4.5 seconds on
+    // one connection came back with eight different bodies and no
+    // `cf-cache-status` at all on 2026-09-25, twice, an hour apart (the `json()`
+    // note in packages/server/src/handler.ts carries the probe). So these two
+    // polls a second are, for now, two origin calls each — and the URL is still
+    // kept canonical so that honouring the intention is a cache change rather
+    // than a rewrite. Events are filtered locally by seq.
     const snap = await getJSON(bootstrap ? '/snapshot?tail=6' : '/snapshot');
     const recv = clock();
     stale = false;

@@ -707,18 +707,24 @@ export function createApp(options: AppOptions = {}) {
   }
 
   /**
-   * `cacheSec` lets the edge absorb the poll storm: every viewer of one tank
-   * asks the same question every second or two, and each of those requests
-   * lands on the Durable Object, whose free allowance is tiny. A few seconds of
-   * shared edge freshness costs nothing visually (the client interpolates) and
-   * cuts origin load by the number of concurrent viewers.
-   */
-  /**
    * Every JSON answer this app gives leaves through here, which is why the
    * caching policy is stated rather than omitted.
    *
-   * `cacheSec > 0` is the free, deliberately-stale-able stream: `/observe` and
-   * friends publish `s-maxage` and let the edge serve one copy to many readers.
+   * `cacheSec > 0` asks the edge to absorb the poll storm: every viewer of one
+   * tank asks the same question every second or two, each of those requests
+   * lands on the Durable Object, whose free allowance is tiny, and a few seconds
+   * of shared freshness costs nothing visually (the client interpolates).
+   * Measured against the deployment on 2026-09-25 the ask is not honoured: eight
+   * `GET /snapshot`s inside 4.5 seconds on one connection — inside
+   * `s-maxage=3` by construction — came back with eight different body lengths
+   * and no `cf-cache-status` header at all, while static assets on the same host
+   * answered `cf-cache-status: HIT` to the same probe. Run again an hour later
+   * against a different tank, same verdict. So this header is an intention, not a
+   * saving: at that reading every viewer's two polls a second are two origin
+   * calls, and the bytes counted per viewer are counted per origin too. Any
+   * comment or document that repeats the sharing claim has to be measured again
+   * before it is believed.
+   *
    * `cacheSec === 0` used to mean "say nothing", which left the answer to the
    * zone's configuration — and on a deployment where some routes do ask for
    * edge caching, silence is not a guarantee. It is now `no-store`, which no
