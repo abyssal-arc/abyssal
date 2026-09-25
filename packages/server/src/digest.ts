@@ -27,17 +27,34 @@
 /** Calldata tag: ASCII "ABYS", so a reader of the chain can spot our records. */
 export const DIGEST_MAGIC = '0x41425953';
 
-/** Which hashing rule produced this payload. Bumping it means a new rule, not a tweak. */
-export const DIGEST_V = 1;
-
 /**
- * The fields that go into the hash, in the order they are joined. Exported
- * because a verifier needs it and should not have to read our source to learn
- * it; the payload is self-describing given this list and `v`.
+ * Every hashing rule this build can check, keyed by the `v` a payload carries.
+ *
+ * A table rather than a list of fields, and looked up by the payload's own
+ * version rather than by the constant below, because a day already on chain
+ * cannot be re-hashed: the field list that made its number has to stay readable
+ * beside the list that makes the next one. The alternative — one current list
+ * doing all the choosing — means publishing a second rule turns every record
+ * written under the first into what this file calls a corrupt anchor, which is
+ * the one verdict a verifier must never hand out about a day that is honestly
+ * on chain and correct.
+ *
+ * Adding a rule means adding a row and leaving the old rows alone. Removing one
+ * is not a cleanup: it turns stored payloads into ones nobody can check.
  */
-export const DIGEST_HASH_FIELDS = [
-  'v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator',
-] as const;
+export const DIGEST_RULES = {
+  1: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
+} as const satisfies Record<number, readonly string[]>;
+
+/** Which rule new payloads are built with. Typed as a key of the table, so a bump
+ * that names no rule is a type error rather than a runtime surprise. */
+export const DIGEST_V: keyof typeof DIGEST_RULES = 1;
+
+/** The fields the current rule hashes, in order — `DIGEST_RULES[DIGEST_V]`, named. */
+export const DIGEST_HASH_FIELDS = DIGEST_RULES[DIGEST_V];
+
+/** The versions published to readers. JSON has no integer keys, so this one does not either. */
+export const DIGEST_RULE_TABLE: Record<string, readonly string[]> = DIGEST_RULES;
 
 /** Domain separator, so this pre-image cannot be made to read as anyone else's. */
 const PRE_IMAGE_PREFIX = 'abyssal-day-digest';
@@ -139,17 +156,40 @@ export function digestStats(day: number, w: DigestWorldView): DigestStats {
   return censusReading(day, w).stats;
 }
 
+/** Either the bytes a hash is taken over, or the reason this build cannot make them. */
+export type PreImage = { preImage: string } | { problem: string };
+
 /**
- * The hash pre-image: the fields, in order, joined by `|`.
+ * The hash pre-image of one payload: its rule's fields, in order, joined by `|`.
+ *
+ * The rule comes from the payload's own `v`, not from `DIGEST_V`. A payload is
+ * evidence about the day it was built, and the only way to read that evidence is
+ * to re-derive it under the rule that was in force then — checking an old record
+ * with the newest list is not verification, it is a second opinion nobody asked for.
  *
  * `null` becomes `~` rather than the empty string. An empty field against a
  * delimiter-joined fixed-width list is not ambiguous here, but `~` makes the
  * rendered pre-image legible and keeps "no creatures" visibly distinct from an
  * archetype that somehow got named the empty string.
  */
-export function digestPreImage(p: Pick<DigestPayload, (typeof DIGEST_HASH_FIELDS)[number]>): string {
-  const field = (v: string | number | null): string => (v === null ? '~' : String(v));
-  return [PRE_IMAGE_PREFIX, ...DIGEST_HASH_FIELDS.map((k) => field(p[k]))].join('|');
+export function digestPreImage(p: { v: number }): PreImage {
+  const fields: readonly string[] | undefined = DIGEST_RULE_TABLE[String(p.v)];
+  if (!fields) return { problem: `no published rule for v=${String(p.v)}` };
+  const values: string[] = [PRE_IMAGE_PREFIX];
+  for (const key of fields) {
+    const value = (p as unknown as Record<string, unknown>)[key];
+    // Absent is not the same as null. `~` is a day with nothing to report —
+    // `topPredator` in an empty tank — while a name the payload never carried
+    // means a rule is being applied to the wrong shape. Letting that through as
+    // `String(undefined)` would commit to a field no part of this payload
+    // describes, which is the quiet version of the mistake this module was
+    // extracted from `handler.ts` to stop.
+    if (value === undefined) {
+      return { problem: `rule v=${String(p.v)} hashes \`${key}\`, which this payload does not carry` };
+    }
+    values.push(value === null ? '~' : String(value));
+  }
+  return { preImage: values.join('|') };
 }
 
 // Node has exposed webcrypto globally since v19 and Workers always have it; the
@@ -172,13 +212,30 @@ export async function sha256Hex(text: string): Promise<string> {
 }
 
 export async function digestHash(stats: DigestStats): Promise<string> {
-  return sha256Hex(digestPreImage({ v: DIGEST_V, ...stats }));
+  const pre = digestPreImage({ v: DIGEST_V, ...stats });
+  // Unreachable by construction: `DIGEST_V` is typed as a key of the rule table,
+  // and the test "every field the payload publishes is inside the commitment"
+  // asserts that the current rule's names are exactly the fields a payload this
+  // build produces carries. That leaves this branch open only for a rule grown
+  // without growing the stats — and refusing there is right, because the
+  // alternative is hashing a hole into a commitment on a public chain.
+  if ('problem' in pre) throw new Error(`the current digest rule is not satisfiable: ${pre.problem}`);
+  return sha256Hex(pre.preImage);
 }
 
 /** Build the payload that goes on chain: the stats, the rule version, and their hash. */
 export async function buildPayload(stats: DigestStats, ts: number): Promise<DigestPayload> {
-  const base = { v: DIGEST_V, ...stats };
+  const base = { v: DIGEST_V as number, ...stats };
   return { ...base, ts, hash: await digestHash(base) };
+}
+
+/** What a check can say. `uncheckable` is neither of the other two, on purpose. */
+export type VerifyOutcome = 'verified' | 'mismatch' | 'uncheckable';
+
+export interface Verification {
+  outcome: VerifyOutcome;
+  /** Why not, for a log line and a reader. `null` exactly when `verified`. */
+  problem: string | null;
 }
 
 /**
@@ -187,11 +244,43 @@ export async function buildPayload(stats: DigestStats, ts: number): Promise<Dige
  * This is the whole point of the shape: anyone with the calldata, the field
  * list and a SHA-256 implementation can confirm the numbers say what the
  * commitment claims they say, without trusting this repository to agree.
+ *
+ * Three outcomes because a boolean has to lie with one of them. `mismatch` is
+ * "these numbers do not describe that commitment" — a real alarm, and the one the
+ * UI calls *Anchor corrupt*. `uncheckable` is "this build has no rule for the
+ * version this payload names", which is a fact about the build and not about the
+ * day: reporting it as a mismatch would call an honest on-chain record corrupt
+ * the first time this file gains a second row.
+ *
+ * The two failures are separated by looking at the table rather than at the
+ * pre-image's complaint, because both arrive as a `problem` and only one of them
+ * is about the payload. A record missing a field its own rule hashes stays a
+ * `mismatch`: the old boolean called it false, and a truncated payload that now
+ * reads as "the build cannot say" would be a lost alarm wearing the clothes of a
+ * new feature.
  */
-export async function verifyPayload(p: DigestPayload): Promise<boolean> {
+export async function verifyPayload(p: DigestPayload): Promise<Verification> {
   const { hash, ts, ...rest } = p;
   void ts; // Not hashed. Excluded explicitly so adding a field cannot silently join the pre-image.
-  return (await digestHash(rest)) === hash;
+  const pre = digestPreImage(rest);
+  if ('problem' in pre) {
+    return DIGEST_RULE_TABLE[String(p.v)] === undefined
+      ? { outcome: 'uncheckable', problem: pre.problem }
+      : { outcome: 'mismatch', problem: pre.problem };
+  }
+  const computed = await sha256Hex(pre.preImage);
+  return computed === hash
+    ? { outcome: 'verified', problem: null }
+    : { outcome: 'mismatch', problem: `the fields hash to ${computed}, the payload publishes ${hash}` };
+}
+
+/**
+ * The check, folded into the value the routes publish: `true`, `false`, or `null`
+ * for "this build cannot say". One function because two routes publish it and a
+ * ternary written twice is a rule that can disagree with itself.
+ */
+export function verifiesOrNull(v: Verification): boolean | null {
+  return v.outcome === 'verified' ? true : v.outcome === 'mismatch' ? false : null;
 }
 
 /** The payload as calldata: the magic tag, then the JSON hex-encoded. */

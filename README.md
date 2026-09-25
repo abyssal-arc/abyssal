@@ -38,8 +38,9 @@ tokens leave circulation.
 
 The interface ships in six languages — English, Français, Deutsch, 中文,
 日本語, 한국어 — from a hand-written dictionary in `packages/web/i18n.js`
-(369 keys per language as measured on 2026-09-25, counted as `Object.keys` off the
-loaded dictionary for all six, which is exactly what the in-step test compares).
+(369 keys per language as re-measured at 2026-09-25T19:31Z, counted as
+`Object.keys` off the loaded dictionary for all six, which is exactly what the
+in-step test compares).
 
 > Everything in this repository is original work.
 
@@ -218,7 +219,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (310 total)
+npm test           # sim + server + web tests (327 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -689,7 +690,7 @@ reading says nothing about whether the digest commit is configured — check
 | DELETE | `/adopt` | Release an adoption: `{addr, creatureId}` |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | Debug only: 404 unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
-| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs, how long the account funds it, and the settled revenue tally as of the reading the scale check was computed from), of the data tier, and of the feed (`feed.indexedUpTo`, `feed.head`, `feed.lagBlocks`, `feed.tag` — the tag that bounds the indexed height is named in the answer, and the whole block is null when running on the offline rain). Never cached |
+| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs, how long the account funds it, the settled revenue tally as of the reading the scale check was computed from, the version of the hash rule the stored payload names and the problem text behind a verdict that is not `true` — `digest.payloadV`, `digest.verifyProblem`), of the data tier, and of the feed (`feed.indexedUpTo`, `feed.head`, `feed.lagBlocks`, `feed.tag` — the tag that bounds the indexed height is named in the answer, and the whole block is null when running on the offline rain). Never cached |
 | GET | `/ui` | Redirects to `/` |
 
 `OPTIONS` on any path answers 204 with permissive CORS headers; the write routes
@@ -825,40 +826,61 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-310 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them on 2026-09-25. The runner reports the same 310 and 309 pass
-there (CI run #66, read out of the job log the runner keeps): the one skip is a lock
-that compares a price against `TOKEN_PLAN.md`, which is gitignored and so only ever
-exists in a working copy.
+327 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-25T19:39:32Z: 59 + 176 + 92,
+0 fail, 0 skip. CI holds one of them back from being green and prints the reason
+in the test's own name — `the price in the code is the price written in the plan
+# SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
+so a job log reads one pass short of the totals here rather than a different
+count: run #68, the commit this batch stands on, logs 310 tests and 309 passes
+with exactly that skip and no failure, which is the shape to expect from the 327
+above once this tree is the one the runner has.
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 174 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
-| `@abyssal/web` | 77 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
+| `@abyssal/server` | 176 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say"), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
+| `@abyssal/web` | 92 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
 against a local server, which is why `@napi-rs/canvas` is there: a canvas that
 cannot measure text cannot lay out a card. GitHub Actions
 (`.github/workflows/ci.yml`) runs four gates on Node 22: `npm run build`,
-`npm run typecheck`, an ESM syntax check over the nine client files the browser
+`npm run typecheck`, an ESM syntax check over the ten client files the browser
 loads, and `npm test`. The syntax gate exists because the client is
 dependency-free ES modules — a stray top-level await should fail in CI rather
 than in a browser — and it lists those files by name, so a web test asserts the
-list still matches the files on disk in both directions: a tenth file that no gate
+list still matches the files on disk in both directions: an eleventh file that no gate
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 253 hand-written single-line mutations of
+runs negative verification: a battery of 271 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-253 of 253, in 34.3 minutes of wall clock read off the battery's own per-row
-stamps (15:41:33Z to 16:15:51Z, 253 rows). The battery itself lives outside the
+271 of 271 in one pass, over 34 minutes 40 seconds read off the battery's own
+per-row stamps (18:52:35Z to 19:27:15Z, 271 rows), 0 missed and 0 without a
+verdict. One line of prose in one of these files changed after that pass — a header
+comment, which no mutant quotes, and the battery's `--check` mode reads every
+mutant's anchor to answer exactly that question in a second (271/271 point at
+exactly one line).
+
+A pass before it caught 267 of 271 and *refused* to judge four, and the reason is
+worth the sentence: a mutant is pinned to the source it rewrites by quoting a line
+of it, and this batch rewrote all four places those four quoted, so the battery
+printed `anchor matched 0 times` rather than guess — and a mutant that was never
+applied cannot be reported as caught. Those four were re-pinned by hand to the text
+that replaced theirs and caught 4 of 4 (18:43:10Z to 18:43:39Z); the 271 above is
+the run that happened afterwards, so no verdict here is inherited from a tree that
+no longer exists. One of the eighteen mutants this batch added was first written in
+a shape that did not compile — `if (false && …)`, whose narrowing TypeScript then
+rejected at a line further down the same file — and a mutant that cannot build has
+no verdict either, so it was rewritten to delete the gate through a constant of the
+same type and then caught like the rest. The battery itself lives outside the
 committed tree (it is a working tool that rewrites these files in place), and this
 paragraph is where that is said plainly rather than implied by a directory listing.
 
@@ -931,6 +953,32 @@ whose transaction mined, the hash of the transaction itself so a reader can open
 and check the calldata alone. A reverted transaction is kept on the day's record as
 evidence that an attempt happened and pointed at by no row: a link beside a
 population says "here are the numbers, on chain", and a reverted one does not.
+
+That recomputation is a *rule*, and it is now keyed by the version the record
+itself names rather than by the version the code happens to be on: rule 1 is
+`v, day, tick, population, totalEnergy, born, died, predations, topPredator`, and a
+stored payload whose `v` has no rule in the table is answered `uncheckable` instead
+of `mismatch`. The distinction is the whole point. A mismatch is a claim about the
+record — its fields do not hash to the hash printed beside them — and the chip says
+*Anchor corrupt* and offers no link, because inviting a reader to trust a record
+that disagrees with itself is worse than saying nothing. An `uncheckable` is a claim
+about the build — it has never heard of the rule this day was written under — and
+the chip says *Anchor unchecked* in grey while still linking to the transaction,
+since the chain evidence is real and hiding it would be its own lie. Before the key
+was the record's own, the second version of the field list would have rewritten
+every day under the first as corrupt: the book is meant to outlive the code that
+wrote it, so a rule can only ever be added, never reinterpreted. Two details hold
+the boundary in place. A payload that is missing one of the fields its *own*
+published rule names stays a mismatch — the boolean this replaced said `false` for
+exactly that case, and downgrading a real alarm to "cannot say" while shipping it as
+a feature is the failure mode the third answer exists to avoid. And the broadcast
+gate refuses gas to both non-verified outcomes but counts an attempt for either, so
+a day blocked by a rule nobody published retires after the same five tries that a
+corrupt one does rather than wedging every day after it forever. The words the page
+shows are not the only way out: `/health` publishes `digest.payloadV` beside
+`digest.verifies` and `digest.verifyProblem`, so a `null` can be read for *which*
+version has no rule without anybody opening the site.
+
 The bookkeeping the anchor needed outlived its first draft: `lastCommittedDay` and the
 outstanding transaction moved into the ledger, because an eviction between two day
 boundaries used to be able to commit the same day twice.

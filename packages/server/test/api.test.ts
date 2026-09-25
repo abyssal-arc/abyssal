@@ -23,11 +23,11 @@ import type { AddressInfo } from 'node:net';
 import {
   buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestStats, encodeDigest, newDigestRecord,
   markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
-  nextDigestAction, coherenceProblem, verifyPayload, isSettled,
+  nextDigestAction, coherenceProblem, verifyPayload, verifiesOrNull, isSettled,
   CENSUS_CAP, CENSUS_BUDGET_BYTES, CENSUS_ROW_BYTES,
   censusReading, censusRow, headcountByArchetype, type DigestWorldView,
   DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
-  DIGEST_RETRY_MS, DIGEST_V, stampAnchor,
+  DIGEST_RETRY_MS, DIGEST_RULE_TABLE, DIGEST_V, stampAnchor,
   type CensusChange, type CensusDay, type DigestPayload, type DigestRecord,
 } from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
@@ -3131,7 +3131,9 @@ type StateWithDigest = {
     maxAttempts: number;
     payload: DigestPayload;
     hash: string;
-    verifies: boolean;
+    // `true` / `false` / `null`: the null is this build having no rule for the
+    // version the stored payload names, which is not the same news as `false`.
+    verifies: boolean | null;
   } | null;
 };
 
@@ -3201,19 +3203,101 @@ test('every field the payload publishes is inside the commitment', async () => {
     Object.keys(p).filter((k) => k !== 'hash' && k !== 'ts'),
     [...DIGEST_HASH_FIELDS],
   );
-  assert.equal(await verifyPayload(p), true, 'and a payload we built verifies');
+  assert.equal((await verifyPayload(p)).outcome, 'verified', 'and a payload we built verifies');
 
   for (const field of DIGEST_HASH_FIELDS) {
     const value = p[field];
     const tampered = { ...p, [field]: value === null ? 'x:1' : typeof value === 'number' ? value + 1 : 'tampered' };
-    assert.equal(await verifyPayload(tampered), false, `${field} is in the hash, so changing it must break it`);
+    if (field === 'v') {
+      // The version is the one hashed field that cannot be judged by its own rule:
+      // `v` + 1 names a version with no published rule today, so the honest answer
+      // is `uncheckable` — indistinguishable from a legitimate record written by a
+      // future build, which is exactly why the two must not get different verdicts.
+      // When a second rule lands this becomes a `mismatch`; what may never happen
+      // either way is a changed version reading as verified.
+      const outcome = (await verifyPayload(tampered)).outcome;
+      assert.notEqual(outcome, 'verified', `${field} selects the rule, so a payload naming another one is not a second opinion about this one`);
+      assert.equal(outcome, 'uncheckable', 'and today that value names no rule at all, which is not the same news as a disagreement');
+      continue;
+    }
+    assert.equal((await verifyPayload(tampered)).outcome, 'mismatch', `${field} is in the hash, so changing it must break it`);
   }
-  // Dropping a field breaks it too: `undefined` is not `~`.
+  // Dropping a field breaks it too: `undefined` is not `~`. It is a `mismatch` and
+  // not an `uncheckable` on purpose — the rule for this version is published, so
+  // the complaint is about the payload, and a truncated record that downgraded
+  // itself to "the build cannot say" would cost the one alarm this gate has ever
+  // had about a stored payload.
   const { predations: _dropped, ...minusOne } = p;
-  assert.equal(await verifyPayload(minusOne as DigestPayload), false);
+  assert.equal((await verifyPayload(minusOne as DigestPayload)).outcome, 'mismatch');
   // When we broadcast is not a world fact, so it is deliberately outside the
   // hash and may change without invalidating anything.
-  assert.equal(await verifyPayload({ ...p, ts: p.ts + 60_000 }), true);
+  assert.equal((await verifyPayload({ ...p, ts: p.ts + 60_000 })).outcome, 'verified');
+});
+
+test('a record is judged by the rule it names, not by the rule in force', async () => {
+  // The property the next version of the rule depends on. If the verifier took
+  // the field list from `DIGEST_V`, then publishing a second rule would turn every
+  // day already anchored under the first into a reported corruption — a red
+  // `/health` and an "Anchor corrupt" label about a record that is honestly on
+  // chain and correct. So the lookup key is the payload's own `v`, and the only
+  // way to show that from a build with one rule is to name a version it lacks.
+  const p = await buildPayload({ ...STATS, day: 12 }, 1_700_000_000_000);
+  assert.equal(DIGEST_V, 1, 'this build has one rule');
+  assert.ok(DIGEST_RULE_TABLE[String(DIGEST_V)], 'and it is published under its own name');
+
+  const future = { ...p, v: 999 };
+  const checked = await verifyPayload(future);
+  assert.equal(checked.outcome, 'uncheckable', 'a version nobody published is not a verdict about the day');
+  assert.match(String(checked.problem), /v=999/, 'and the reason names the version the payload carries');
+  assert.equal(verifiesOrNull(checked), null, '`null` is the third answer, not a rounding of `false`');
+
+  // A `false` and a `null` are different news, so they may not share a health
+  // problem name: the first is a record disagreeing with itself, the second is
+  // this build missing a page of the rule book — which a rollback heals and the
+  // other never does.
+  const broken = { ...p, hash: 'ff'.repeat(32) };
+  assert.equal(verifiesOrNull(await verifyPayload(broken)), false);
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDigest(newDigestRecord(12, future));
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value } = await quiet(() => readHealth(app));
+  assert.equal(value.problem, 'digest_rule_unpublished', 'said by its own name');
+  assert.equal(value.digest?.verifies, null, 'and not reported as corruption');
+  assert.equal(value.digest?.payloadV, 999, 'with the version that could not be checked, so the reader is not hunting for it');
+  assert.match(String(value.digest?.verifyProblem), /v=999/);
+  assert.deepEqual(value.signals?.counts, {}, 'a state nobody produced is not an event that happened');
+});
+
+test('an unpublished rule refuses the broadcast and is counted like any other refusal', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  try {
+    await withDigestKey(async () => {
+      const payload = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      // One attempt short of the budget, so the backoff between retries is not
+      // what this test is waiting on — see the matching comment on the mismatch
+      // gate below.
+      m.seedDigest({
+        ...newDigestRecord(0, { ...payload, v: 999 }),
+        status: 'failed',
+        attempts: DIGEST_MAX_ATTEMPTS - 1,
+        lastAttemptAt: 0,
+      });
+      const health = createHealth(1);
+      const app = createApp({ seed: 1, store: m.store, health, rpc: rpc.url, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      const spent = await untilDigest(m.digest, (r) => r.attempts >= DIGEST_MAX_ATTEMPTS, 'a spent budget');
+      assert.equal(rpc.sends.length, 0, 'a hash this build cannot reproduce never reaches the chain');
+      assert.equal(spent.status, 'failed');
+      assert.equal(health.view().counts.digest_verify_refused, 1,
+        'counted, so a record nobody can check fails out on the same clock as a bad key '
+        + 'instead of holding every later day behind it');
+    });
+  } finally {
+    rpc.close();
+  }
 });
 
 test('the next move is decided by the wall clock, not by how often the pump runs', () => {
@@ -3862,7 +3946,12 @@ type HealthBody = {
     attempts: number;
     maxAttempts: number;
     txHash: string | null;
-    verifies: boolean;
+    // Same three answers as `/state`, plus the two that make a `null` readable
+    // without a second request: which version the record names, and why the check
+    // could not run.
+    verifies: boolean | null;
+    payloadV: number;
+    verifyProblem: string | null;
     signer: string | null;
   } | null;
   census: { days: number; cap: number; first: number | null; last: number | null };
@@ -4165,7 +4254,7 @@ test('a payload whose hash no longer describes it is named without an attempt be
   // nothing ever reaches the gate — the day is already settled.
   const good = await buildPayload({ ...STATS, day: 12 }, 7);
   const tampered: DigestPayload = { ...good, population: good.population + 1 };
-  assert.equal(await verifyPayload(tampered), false, 'the hash no longer describes the numbers');
+  assert.equal((await verifyPayload(tampered)).outcome, 'mismatch', 'the hash no longer describes the numbers');
   assert.equal(coherenceProblem(newDigestRecord(12, tampered)), null, 'and no state rule can see it');
 
   const m = memStore();

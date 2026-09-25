@@ -37,7 +37,7 @@ import {
   buildPayload, censusChanges, censusProblem, censusReading, censusRow, coherenceProblem,
   digestHash, digestStats, encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
-  newDigestRecord, nextDigestAction, stampAnchor, verifyPayload,
+  newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
   CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS,
   type CensusDay, type DigestRecord,
 } from './digest.js';
@@ -848,7 +848,9 @@ export function createApp(options: AppOptions = {}) {
         maxAttempts: DIGEST_MAX_ATTEMPTS,
         payload: digest.payload,
         hash: digest.payload.hash,
-        verifies: await verifyPayload(digest.payload),
+        // Same three answers as `/health`: a reader comparing the two responses
+        // should never have to wonder whether one of them rounds a `null` away.
+        verifies: verifiesOrNull(await verifyPayload(digest.payload)),
       } : null,
       network: NETWORK,
       chainId: CHAIN_ID,
@@ -893,7 +895,18 @@ export function createApp(options: AppOptions = {}) {
     // also the only digest condition that is reportable without an attempt — a
     // record written before the field list existed is coherent, untrusted, and
     // never gets as far as the gate that would have counted it.
-    const mismatch = digest && !(await verifyPayload(digest.payload)) ? 'digest_payload_mismatch' : null;
+    //
+    // Two names, because the check has three answers and "not verified" is two
+    // different news. `digest_payload_mismatch` is the record disagreeing with
+    // itself. `digest_rule_unpublished` is this build having no rule for a version
+    // the stored payload names, which is what a rollback leaves behind: the newer
+    // build's rule went away with it, while the days written under that rule stayed
+    // in the ledger. A rollout that adds a rule without deleting one never produces
+    // this name — that is the property the rule table exists to keep. Saying
+    // "corrupt" about either would be a lie about a day that is honestly on chain.
+    const check = digest ? await verifyPayload(digest.payload) : null;
+    const mismatch = check && check.outcome === 'mismatch' ? 'digest_payload_mismatch' : null;
+    const unpublished = check && check.outcome === 'uncheckable' ? 'digest_rule_unpublished' : null;
     // The three derived economics figures, computed from the stored readings rather
     // than stored beside them: a runway is a quotient, and a stored quotient is one
     // more number that can disagree with the two it came from. The scale check takes
@@ -911,7 +924,7 @@ export function createApp(options: AppOptions = {}) {
     const econScaleKnown = scaleTermsKnown(anchorEcon.balanceUnits, anchorEcon.tokenUnits, anchorEcon.revenueAtRead);
     const econRunway = anchorRunway(anchorEcon.balanceUnits, anchorEcon.costUnits);
     const stale = view ? staleSignals(view) : [];
-    const parts = [problem, mismatch].filter((p): p is string => Boolean(p));
+    const parts = [problem, mismatch, unpublished].filter((p): p is string => Boolean(p));
     return {
       // `null` when no ledger is wired at all — the honest difference between
       // "nothing went wrong" and "nobody was counting".
@@ -929,7 +942,14 @@ export function createApp(options: AppOptions = {}) {
         attempts: digest.attempts,
         maxAttempts: DIGEST_MAX_ATTEMPTS,
         txHash: digest.txHash,
-        verifies: !mismatch,
+        // Which rule this record was hashed under, and whether this build still
+        // publishes it. A `verifies: null` beside `payloadV: 2` names the whole
+        // failure without anybody having to diff the field list by hand.
+        payloadV: digest.payload.v,
+        // `true` / `false` / `null` — and the null is the news, not a missing
+        // value: it means this build looked at the record and could not say.
+        verifies: check ? verifiesOrNull(check) : null,
+        verifyProblem: check ? check.problem : null,
         // Which account signs, or `null` for none. Publishing an address that
         // will appear on chain anyway is what makes the difference between "no
         // key is configured" and "a key is configured and I cannot see it" —
@@ -1333,8 +1353,20 @@ export function createApp(options: AppOptions = {}) {
     // buys the guarantee that anything reaching the chain is internally
     // consistent — the alternative is finding out years later, in public, about
     // a transaction nobody can undo.
-    if (!await verifyPayload(r.payload)) {
-      console.error(`day digest payload does not verify: refusing to broadcast day ${r.day}`);
+    //
+    // Three answers, and two of them refuse: `mismatch` is the record disagreeing
+    // with itself, `uncheckable` is this build having no rule for the version the
+    // record names. Only the second can heal — a deploy that publishes the missing
+    // rule makes the same payload verifiable again — but both refuse for the same
+    // reason: an unreproducible hash on chain is worse than a day that never
+    // anchored, because the first is permanent and public. The record is marked as
+    // an attempt either way, so a payload stuck under an unpublished rule fails
+    // out on the same clock as one stuck on a bad key rather than holding every
+    // later day behind it. `digest_rule_unpublished` in `/health` is the signal
+    // that says which of the two the operator is looking at.
+    const verification = await verifyPayload(r.payload);
+    if (verification.outcome !== 'verified') {
+      console.error(`day digest payload ${verification.outcome}: refusing to broadcast day ${r.day} — ${String(verification.problem)}`);
       // Counted as an attempt before it fails. A payload that cannot verify will
       // never verify, so an uncounted refusal here is a record that stays
       // unsettled forever — and since an unsettled record is deliberately not

@@ -157,3 +157,14 @@ test('an open card names its creature in the link, and offers the link', async (
     `the copied link lost what was on screen: ${page.copied[0]}`,
   );
 });
+
+test('a page whose server has nothing to anchor shows nothing about anchoring', () => {
+  // The fixture snapshot carries no `digestChain`, which is what `/state` says when
+  // there is no record: not a failed one, not an off-chain one, nothing. Every word
+  // the chip can print is a claim about a commitment, so an empty chip is the only
+  // honest rendering of an absent record — and the one state the boot that *does*
+  // carry a record cannot prove.
+  const el = document.getElementById('digest-status');
+  assert.equal(el.innerHTML, '', `the chip printed ${JSON.stringify(el.innerHTML)} for a tank with no anchor`);
+  assert.equal(el.className, 'digest-status', 'and wears none of the four status colours');
+});

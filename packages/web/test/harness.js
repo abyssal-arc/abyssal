@@ -255,12 +255,14 @@ const addressPayload = (addr) => {
  * @param {object} [opts.who] the `/who` answer to serve, or null for "nobody known"
  * @param {string} [opts.wallet] an address a connected wallet reports as its own
  * @param {object} [opts.standing] a previous `/who` row already in this browser's memory
+ * @param {object|null} [opts.digestChain] the anchor record to put in `/snapshot`'s state;
+ *   absent leaves the fixture as the other tests expect it, `null` is "no record"
  * @returns the page, its canvases, what it asked the server for, what the visitor
  *   copied, and a `close()` that has to be called or the process never exits
  */
 let stageTaken = false;
 
-export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null } = {}) {
+export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain } = {}) {
   // One page per process, and the reason is measured rather than suspected:
   // `app.js` is evaluated once and the ESM cache never evaluates it again, so a
   // second `boot()` hands back a DOM nothing is driving. Checked on this harness —
@@ -271,11 +273,19 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   if (stageTaken) throw new Error('boot() already ran in this process — one page per test file');
   stageTaken = true;
   const served = book ?? census;
+  // The anchor chip reads `state.digestChain`, which the shared fixture leaves off
+  // because nothing else on the page looks at it. `undefined` means "this test is
+  // not about the chip" and must not start serving a `digestChain` key; an
+  // explicit `null` means "the server has no record", which is a state worth
+  // booting on purpose.
+  const servedSnapshot = digestChain === undefined
+    ? snapshot
+    : { ...snapshot, state: { ...snapshot.state, digestChain } };
   const reqs = { census: 0, observe: 0 };
   const server = createServer((req, res) => {
     const path = req.url?.split('?')[0] ?? '/';
     res.setHeader('content-type', 'application/json');
-    if (path === '/snapshot') res.end(JSON.stringify(snapshot));
+    if (path === '/snapshot') res.end(JSON.stringify(servedSnapshot));
     else if (path === '/history') res.end(JSON.stringify({ stats: [] }));
     else if (path === '/history/census') { reqs.census++; res.end(JSON.stringify(served)); }
     else if (path === '/judgments') res.end(JSON.stringify({ judgments: [] }));

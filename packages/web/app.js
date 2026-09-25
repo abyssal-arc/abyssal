@@ -31,6 +31,7 @@ import { censusEvents, censusSeries, censusTrend } from './src/census.js';
 import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
 import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
 import { diffWorld, worldSeed } from './src/worldsince.js';
+import { anchorLabel } from './src/anchor.js';
 import { venueCoverageNotes } from './src/observe.js';
 
 initI18n();
@@ -2505,50 +2506,23 @@ function updateTopbar() {
 
   // Day Digest on-chain status indicator.
   //
-  // The label may not promise more than the record proves. `pending` is the only
-  // status that carries a transaction hash, so it is the only one that links to
-  // a block explorer; the statuses before it have broadcast nothing and say so
-  // in different words. This widget used to render "Committing…" for a state the
-  // send-failure path produced with no hash at all — a wallet-shaped assurance
-  // about a transaction no chain had ever been asked about — so a `pending`
-  // arriving without one is now reported as broken rather than displayed as hope.
+  // The label may not promise more than the record proves. The table of which
+  // record may be called what lives in `src/anchor.js`; this is the renderer for
+  // whatever that says. Two mistakes this shape is guarding against, both of them
+  // once live here: rendering "Committing…" for a `pending` the send-failure path
+  // had left with no hash at all — a wallet-shaped assurance about a transaction
+  // no chain had ever been asked about — and having exactly one word for the two
+  // opposite reasons a check can come back negative, which is why a `null` from
+  // the verifier now gets its own grey rather than being read as either the green
+  // or the red it already knows.
   const digestEl = document.getElementById('digest-status');
-  const dc = state.digestChain;
-  const anchorBroken = dc
-    && (dc.verifies === false
-      || ((dc.status === 'pending' || dc.status === 'confirmed') && !dc.txHash));
-  if (!dc) {
-    digestEl.innerHTML = '';
-    digestEl.className = 'digest-status';
-  } else if (anchorBroken) {
-    // The payload disagrees with its own hash, or a status claims a transaction
-    // that is not there. Either way the anchor is worthless, and this is the
-    // only place anybody would ever find out.
-    digestEl.className = 'digest-status failed';
-    digestEl.innerHTML = '<span class="ds-dot"></span>Anchor corrupt';
-  } else if (dc.status === 'confirmed') {
-    digestEl.className = 'digest-status confirmed';
-    const short = dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4);
-    digestEl.innerHTML = `<span class="ds-dot"></span><a class="ds-link" href="${explorerTxUrl}${dc.txHash}" target="_blank" rel="noopener" title="View on explorer">✓ ${short}</a>`;
-  } else if (dc.status === 'pending') {
-    digestEl.className = 'digest-status pending';
-    const short = dc.txHash.slice(0, 6) + '…' + dc.txHash.slice(-4);
-    digestEl.innerHTML = `<span class="ds-dot"></span><a class="ds-link" href="${explorerTxUrl}${dc.txHash}" target="_blank" rel="noopener" title="Broadcast, waiting for a block">Committing… ${short}</a>`;
-  } else if (dc.status === 'queued' || dc.status === 'submitting') {
-    // Due, or attempted and not yet answered. Amber because something is being
-    // spent on it, unlinked because there is nothing on chain to link to.
-    digestEl.className = 'digest-status pending';
-    digestEl.innerHTML = '<span class="ds-dot"></span>Anchoring…';
-  } else if (dc.status === 'failed') {
-    const spent = dc.attempts >= dc.maxAttempts;
-    digestEl.className = 'digest-status failed';
-    digestEl.innerHTML = `<span class="ds-dot"></span>${spent
-      ? `Anchor dropped (${dc.attempts} tries)`
-      : `Retry ${dc.attempts}/${dc.maxAttempts}`}`;
-  } else {
-    digestEl.className = 'digest-status unconfigured';
-    digestEl.innerHTML = '<span class="ds-dot"></span>Off-chain';
-  }
+  const anchor = anchorLabel(state.digestChain, explorerTxUrl);
+  digestEl.className = anchor.cls;
+  digestEl.innerHTML = !anchor.text && !anchor.link
+    ? ''
+    : `<span class="ds-dot"></span>${anchor.text}${anchor.link
+      ? `<a class="ds-link" href="${anchor.link.href}" target="_blank" rel="noopener" title="${anchor.link.title}">${anchor.link.label}</a>`
+      : ''}`;
 }
 
 /* ---------- world rendering ---------- */
