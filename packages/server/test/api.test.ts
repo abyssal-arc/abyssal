@@ -16,7 +16,7 @@ import {
 } from '../src/facilitator.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createServer } from 'node:http';
-import { appendFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
@@ -3686,6 +3686,62 @@ test('a signal ledger counts, keeps the reason, and refuses a name nobody declar
   const clipped = long.view().last.snapshot_not_saved.detail;
   assert.ok(clipped.length <= 400, `capped, was ${clipped.length}`);
   assert.match(clipped, / … /, 'with the cut marked rather than hidden');
+});
+
+/** Where the server's own source lives, found by walking up rather than by a
+ * relative path: `src/` and `dist/` runs are one level apart, and the climb
+ * stops at the repository root (`wrangler.toml`) and nowhere else, for the same
+ * reason `readTokenPlan` says so below — measured, a tree extracted into a
+ * subdirectory of a working copy climbed out of itself. */
+function serverSourceDir(): URL | null {
+  let dir = new URL('..', import.meta.url);
+  for (let up = 0; up < 8; up += 1) {
+    if (existsSync(new URL('src/health.ts', dir))) return new URL('src/', dir);
+    if (existsSync(new URL('wrangler.toml', dir))) return null;
+    dir = new URL('..', dir);
+  }
+  return null;
+}
+
+/**
+ * The other direction of the guard above, and the one nothing was watching:
+ * `note()` throws on a kind that is not declared, so a typo at a call site is a
+ * crash. A kind that is declared and never emitted is the opposite — it costs
+ * nothing, sits in the list, and keeps being counted as coverage. The nine
+ * guards that used to be log lines are gone from the code, so a kind can now be
+ * orphaned simply by deleting the line that counted it: `/health` would publish
+ * a set of possible failures that omits one, and nothing would say so. Measured
+ * on 2026-09-25 with an audit script, 20 kinds were registered and all 20 had a
+ * call site; this is that audit, turned into a gate so the claim cannot decay.
+ */
+test('every declared signal kind is emitted somewhere in the server source', () => {
+  const srcDir = serverSourceDir();
+  const texts: { name: string; text: string }[] = [];
+  if (srcDir !== null) {
+    for (const f of readdirSync(srcDir)) {
+      if (f.endsWith('.ts') && f !== 'health.ts') texts.push({ name: f, text: readFileSync(new URL(f, srcDir), 'utf8') });
+    }
+  }
+  // A distribution check first: if the walk finds no source at all, a green test
+  // would only mean the gate stopped looking.
+  assert.ok(texts.length >= 5, `read the server's own source, found ${texts.length} files`);
+
+  for (const kind of SIGNAL_KINDS) {
+    // A literal `note('kind'` only. A call passing a variable cannot be checked
+    // this way and would not typecheck either — `note` takes the union, not any
+    // string — so the absence of a dynamic call site is a fact, not a blind spot.
+    const holders = texts.filter(({ text }) => /\.note\(\s*'([a-z_]+)'/.test(text)).filter(({ text }) => new RegExp(`\\.note\\(\\s*'${kind}'`).test(text));
+    assert.ok(holders.length > 0, `${kind} is declared in SIGNAL_KINDS and never counted anywhere in packages/server/src`);
+  }
+
+  // And the reverse of the reverse: a string counted at a call site must be a
+  // declared kind. `note` would throw at runtime for one, but a whole-file scan
+  // is the only place that catches it without needing the branch to be reached.
+  for (const { name, text } of texts) {
+    for (const m of text.matchAll(/\.note\(\s*'([a-z_]+)'/g)) {
+      assert.ok(SIGNAL_KINDS.includes(m[1] as never), `${name} counts '${m[1]}', which is not a declared kind`);
+    }
+  }
 });
 
 test('merging a stored ledger only ever moves it forward', () => {
