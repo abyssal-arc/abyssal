@@ -218,7 +218,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (277 total)
+npm test           # sim + server + web tests (310 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -826,7 +826,10 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 ## Tests and CI
 
 310 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them on 2026-09-25:
+workspaces report them on 2026-09-25. The runner reports the same 310 and 309 pass
+there (CI run #66, read out of the job log the runner keeps): the one skip is a lock
+that compares a price against `TOKEN_PLAN.md`, which is gitignored and so only ever
+exists in a working copy.
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
@@ -848,15 +851,30 @@ parses, and a gate that parses a file the browser never loads, are both a gate t
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 223 hand-written single-line mutations of
+runs negative verification: a battery of 253 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-223 of 223. The battery itself lives outside the committed tree (it is a working
-tool that rewrites these files in place), and this paragraph is where that is said
-plainly rather than implied by a directory listing.
+253 of 253, in 34.3 minutes of wall clock read off the battery's own per-row
+stamps (15:41:33Z to 16:15:51Z, 253 rows). The battery itself lives outside the
+committed tree (it is a working tool that rewrites these files in place), and this
+paragraph is where that is said plainly rather than implied by a directory listing.
+
+Two of those categories are about the machine, not the tests, and one of them came
+true. A mutation in this batch makes the page reject a promise while it boots, and
+nothing in the harness was listening on the channel a rejection travels on — the
+jsdom virtual console and `window.onerror` were both watched and both empty. The
+inner test went red 150 ms in, and then the file never finished, because an aborted
+test never reaches the line that closes the page it was handed: 240 s of child wall
+clock, twice, and no verdict either way. The fix is a third channel that collects
+rejections like the other two and closes the page it was given before rethrowing,
+which took the same mutant from a killed run to 1.79 s with the throwing line
+named; a per-test bound of 60 s (thirty times the worst legitimate case measured
+here: 6.75 s for a whole file, 1.9 s for one test) stays behind as a backstop for
+the collector itself, since no mutation can pin it — deleting it leaves every test
+green and only the clock longer.
 
 Green on an idle laptop is not the standard, and one push proved the difference: the
 same 292 passed here and failed on the runner. Two tests waited for a day to say
