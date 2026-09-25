@@ -38,8 +38,8 @@ tokens leave circulation.
 
 The interface ships in six languages — English, Français, Deutsch, 中文,
 日本語, 한국어 — from a hand-written dictionary in `packages/web/i18n.js`
-(358 keys per language as measured on 2026-09-25, counted with the same regexes
-the in-step test uses rather than a copy of them, and kept in step by that test).
+(369 keys per language as measured on 2026-09-25, counted as `Object.keys` off the
+loaded dictionary for all six, which is exactly what the in-step test compares).
 
 > Everything in this repository is original work.
 
@@ -160,6 +160,13 @@ board).
 - **Contribution board**: the standing drawer ranks who has burned for the tank,
   with their badges and the faction they rally for, and every intervention zone
   stays signed on the water.
+- **While the tank was unwatched**: the data drawer compares the day book with what
+  this browser last saw and says what moved in between — days closed, species first
+  counted, species gone, the two headcount edges, and the newest day that gained a
+  confirming transaction. The baseline lives on the visitor's device and is spent
+  only when that card is open; a span whose middle the book has already trimmed is
+  said as trimmed, and a day confirmed since the last look is reported as the
+  watermark moving, never as a count of days nobody observed.
 - **Day pass and export**: burning the pass price gates `GET /export`, which
   streams the observation window as `csv`, `replay` or `digest`. Passes expire
   when the day rolls; buying another is the whole subscription model.
@@ -818,24 +825,25 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-293 tests on `node:test`, no test framework dependency:
+310 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them on 2026-09-25:
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 173 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
-| `@abyssal/web` | 61 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
+| `@abyssal/server` | 174 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
+| `@abyssal/web` | 77 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
 against a local server, which is why `@napi-rs/canvas` is there: a canvas that
 cannot measure text cannot lay out a card. GitHub Actions
 (`.github/workflows/ci.yml`) runs four gates on Node 22: `npm run build`,
-`npm run typecheck`, an ESM syntax check over the eight client files the browser
+`npm run typecheck`, an ESM syntax check over the nine client files the browser
 loads, and `npm test`. The syntax gate exists because the client is
 dependency-free ES modules — a stray top-level await should fail in CI rather
 than in a browser — and it lists those files by name, so a web test asserts the
-list still matches the files on disk in both directions: a ninth file that no gate
+list still matches the files on disk in both directions: a tenth file that no gate
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
 
@@ -989,9 +997,13 @@ Three edges are where they are on purpose:
 - Only a *closed* day is in the day book. The row for the day in progress carries
   `committed: false`, so a chart cannot present a number that has no attestation
   behind it.
-- "While you were away" is remembered in the browser that saw the last visit. It is
-  a diff against a previous answer, kept in `localStorage`; the server is not told
-  who looked at what, which is the reason there is no account to sync it from.
+- "While you were away" is remembered in the browser that saw the last visit, in
+  both of its forms: one address's standing, and the tank's own diff over the day
+  book. It is a diff against a previous answer, kept in `localStorage`; the server is
+  not told who looked at what, which is the reason there is no account to sync it
+  from. And the memory is spent when the card that reads it is opened, not when the
+  page loads — an answer nobody looked at cannot use up the one question a baseline
+  is good for.
 - The social preview card is one static image. Naming a creature in it would mean
   generating HTML per request, and `GET /` is served by the asset layer with the
   edge cache in front of it — the Worker never sees that request today.

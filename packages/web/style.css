@@ -946,6 +946,18 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
    than as a sentence: no link is the answer to "is this on chain yet?". */
 #census-pin a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
 #census-pin a:hover { border-bottom-color: var(--accent); }
+/* What closed since this browser last looked, kept apart from the day list above
+   it because it speaks about a stretch of time rather than about a day. The
+   `[hidden]` restatement is load-bearing, not decoration: an author-level
+   `display` outranks the UA stylesheet's, so without it the empty box would keep
+   its margin on screen and read as a gap in the card. */
+#census-worldsince {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: calc(var(--sp) * 2);
+}
+#census-worldsince[hidden] { display: none; }
 
 /* ---------- obituaries ---------- */
 #death-stats { font-size: 10px; color: var(--fg-3); margin-bottom: calc(var(--sp)); }

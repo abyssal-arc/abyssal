@@ -258,14 +258,26 @@ const addressPayload = (addr) => {
  * @returns the page, its canvases, what it asked the server for, what the visitor
  *   copied, and a `close()` that has to be called or the process never exits
  */
-export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null } = {}) {
+let stageTaken = false;
+
+export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null } = {}) {
+  // One page per process, and the reason is measured rather than suspected:
+  // `app.js` is evaluated once and the ESM cache never evaluates it again, so a
+  // second `boot()` hands back a DOM nothing is driving. Checked on this harness —
+  // the second stage's server was asked for the day book 0 times while the first
+  // was asked once, every element sat in its initial state, and `pageErrors` and
+  // `renderThrows` were both empty, so nothing said so. A test built on that stage
+  // fails as "the feature is broken"; the throw says what actually happened.
+  if (stageTaken) throw new Error('boot() already ran in this process — one page per test file');
+  stageTaken = true;
+  const served = book ?? census;
   const reqs = { census: 0, observe: 0 };
   const server = createServer((req, res) => {
     const path = req.url?.split('?')[0] ?? '/';
     res.setHeader('content-type', 'application/json');
     if (path === '/snapshot') res.end(JSON.stringify(snapshot));
     else if (path === '/history') res.end(JSON.stringify({ stats: [] }));
-    else if (path === '/history/census') { reqs.census++; res.end(JSON.stringify(census)); }
+    else if (path === '/history/census') { reqs.census++; res.end(JSON.stringify(served)); }
     else if (path === '/judgments') res.end(JSON.stringify({ judgments: [] }));
     else if (path === '/reports') res.end(JSON.stringify({ reports: [] }));
     else if (path === '/who') res.end(JSON.stringify(who ?? {}));
@@ -347,6 +359,13 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
 
   const renderThrows = [];
   window.addEventListener('error', (e) => renderThrows.push(String(e.error?.stack ?? e.message)));
+  // A rejected promise is neither of the two channels above. jsdom's virtual console
+  // reports exceptions raised inside scripts it ran, and `window.onerror` reports
+  // ErrorEvents — a rejection in a promise chain that started in the window and
+  // settled on Node's microtask queue reaches neither. Measured with a page that
+  // rejects 150ms into its boot: both arrays empty, `boot()` resolved, and the only
+  // witness was the test runner, which aborted the test and left the page open.
+  process.on('unhandledRejection', (err) => pageErrors.push(`unhandled rejection: ${String(err?.stack ?? err)}`));
 
   // The Clipboard API is missing outright in jsdom, and `copyText` treats a
   // missing API as a failure — which is the right product behaviour but would
@@ -363,10 +382,32 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   if (wallet) window.ethereum = { request: async ({ method }) => (method === 'eth_accounts' ? [wallet] : []) };
   // Somebody else's browser starts empty; this one may already remember an answer.
   if (standing) window.localStorage.setItem(`abyssal-standing:${standing.address}`, JSON.stringify(standing));
+  // The world's memory has no address to key on — one browser, one last look at the
+  // book — and a test that seeds it is claiming this device saw an earlier window.
+  if (worldSince) window.localStorage.setItem('abyssal-worldsince', JSON.stringify(worldSince));
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await import(root + 'app.js');
   await sleep(1200);
+
+  // A page that threw while it was coming up is closed here and the error is thrown
+  // instead, because a leaked page is not a failed test — it is a hung one. The
+  // sequence, measured with a boot that rejects at 150ms: the runner attributes the
+  // rejection to the test that is running and aborts it there, which is before
+  // `boot()` returns at 1200ms, so the caller never reaches the line after it that
+  // registers `t.after(() => page.close())`; the server and its sockets then hold the
+  // file's process open until something external kills it (measured: 60s with a
+  // per-test bound on it, and 240s until the battery's own child wall clock killed
+  // the run and left no verdict, for a failure whose stack had already been printed
+  // 1600 times sooner). Closing here releases it: the same mutant went to 1.79s and
+  // one red test naming the line that threw.
+  const thrown = [...pageErrors, ...renderThrows];
+  if (thrown.length) {
+    for (const id of timerIds) { clearInterval(id); clearTimeout(id); }
+    server.close();
+    server.closeAllConnections?.();
+    throw new Error(`the page threw while booting:\n${thrown.join('\n')}`);
+  }
 
   return {
     window,

@@ -359,3 +359,49 @@ test('every client source file is in the syntax gate CI runs', () => {
   for (const file of onDisk) assert.ok(gated.has(file), `${file} is shipped to the browser and never parsed by CI`);
   for (const file of gated) assert.ok(onDisk.includes(file), `${file} is in the gate and not on disk`);
 });
+
+test('nothing the page hides is left visible by an author-level display rule', () => {
+  // The browser's own `[hidden] { display: none }` lives in the UA stylesheet, which
+  // is the weakest thing in the cascade: a single author-level `display: flex` beats
+  // it, and the element is then on screen while every `hidden = true` in the script
+  // reads as if it worked. That is a whole class of bug with no console output, so
+  // each element we hide and style has to restate the hiding beside the styling.
+  // `display: none` never needs restating — it hides either way.
+  const root = new URL('..', import.meta.url);
+  const read = (p) => readFileSync(fileURLToPath(new URL(p, root)), 'utf8');
+  const css = read('style.css');
+  const html = read('index.html');
+  const app = read('app.js');
+  const tags = [...html.matchAll(/<[^>]*\bhidden\b[^>]*>/g)].map((m) => m[0]);
+  const hideable = new Set(tags.flatMap((tag) => [...tag.matchAll(/\bid="([\w-]+)"/g)].map((m) => `#${m[1]}`)));
+  // A script can hide a node the markup never declared hidden, from a variable.
+  for (const m of app.matchAll(/getElementById\('([\w-]+)'\)\.hidden\s*=/g)) hideable.add(`#${m[1]}`);
+  for (const tag of tags) for (const m of tag.matchAll(/\bclass="([^"]*)"/g)) for (const c of m[1].split(/\s+/)) hideable.add(`.${c}`);
+  assert.ok(hideable.size > 10, `${hideable.size} hideable elements found, which says the scan is looking in the wrong place`);
+
+  const pairs = new Set();
+  for (const m of css.matchAll(/([#.][\w-]+)\[hidden\][^{}]*\{([^{}]*)\}/g)) {
+    if (/\bdisplay\s*:\s*none/.test(m[2])) pairs.add(m[1]);
+  }
+  const styled = new Map();
+  // `[^{}]*` for the body, not `[^}]*`: a rule inside `@media` is the inner one, and
+  // letting the body cross a brace turns the at-rule header into the selector.
+  for (const m of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const values = [...m[2].matchAll(/\bdisplay\s*:\s*([^;}]+)/g)].map((v) => v[1].replace(/!important\s*$/, '').trim());
+    if (!values.length || values.every((v) => v === 'none')) continue;
+    for (const sel of m[1].split(',')) {
+      // The subject of a selector is its last compound: `#a .b` styles `.b`, not `#a`.
+      const subject = (sel.trim().split(/[\s>+~]+/).pop() ?? '').match(/^([#.][\w-]+)(?![\w-])/);
+      if (subject && hideable.has(subject[1])) {
+        if (!styled.has(subject[1])) styled.set(subject[1], new Set());
+        styled.get(subject[1]).add(sel.trim());
+      }
+    }
+  }
+  // Eight of them right now, which is the point: a guard over an empty set passes
+  // whether or not the rule it defends is still standing.
+  assert.ok(styled.size > 5, `${styled.size} hidden elements are given a display, which says the scan is looking in the wrong place`);
+  for (const [name, selectors] of styled) {
+    assert.ok(pairs.has(name), `${name} is hidden and laid out by [${[...selectors].join(', ')}] with no ${name}[hidden] rule to hide it again`);
+  }
+});

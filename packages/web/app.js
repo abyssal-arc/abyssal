@@ -30,6 +30,7 @@ import { hsla, shortAddr, fmtUsd } from './src/format.js';
 import { censusEvents, censusSeries, censusTrend } from './src/census.js';
 import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
 import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
+import { diffWorld, worldSeed } from './src/worldsince.js';
 import { venueCoverageNotes } from './src/observe.js';
 
 initI18n();
@@ -3534,6 +3535,10 @@ async function refreshCensus() {
     censusRows = d.rows;
     censusStack = censusSeries(censusRows, ARCHETYPES);
     censusHoverDay = null;
+    // The book in hand is also the new baseline, but only if somebody is looking
+    // at it — see `noteWorldSince`. This sits inside the try because a failed
+    // fetch must not spend the memory of the last book that did arrive.
+    noteWorldSince();
     // A pin the new window no longer holds stops drawing a crosshair but stays in
     // the link and in `censusPinnedDay`: the day exists, our window is simply not
     // deep enough to point at it, and `censusPinAbsent` is where the card says so
@@ -3803,6 +3808,113 @@ function pinCensus(day, row) {
 }
 
 /**
+ * The world's own "what happened while you were away".
+ *
+ * `abyssal-standing:` answers that for one address. This answers it for the tank,
+ * off the day book — the only part of the past here that outlives the reading it
+ * was taken from, which is why the sentences below are about closed days,
+ * headcounts and confirmations rather than about who fought whom: everything else
+ * lives in a ring that has been half-evicted by the time a visitor returns a week
+ * later, and `src/worldsince.js` refuses to speak about what it cannot remember.
+ *
+ * One key, not one per address: the book is the same for everybody, and this is
+ * the story of *this browser's* last look at it. A tank being replaced under a
+ * stored baseline cannot be told apart from a quiet world by anything in the
+ * payload, so the guard is the one `diffWorld` already applies — a book whose
+ * newest day went backwards is refused rather than narrated.
+ */
+const WORLD_SINCE_KEY = 'abyssal-worldsince';
+
+function readWorldSince() {
+  try {
+    const raw = localStorage.getItem(WORLD_SINCE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function writeWorldSince(seed) {
+  try {
+    localStorage.setItem(WORLD_SINCE_KEY, JSON.stringify(seed));
+  } catch { /* private mode, or the quota is full: the book itself still draws */ }
+}
+
+/** `null` is "no memory to compare with"; `[]` is "memory, and nothing closed". */
+let worldSince = null;
+/** The baseline the comparison was made against, kept for the moment it was taken. */
+let worldSinceFrom = null;
+
+const speciesList = (list) => list.join(', ');
+const netWord = (r) => `${r.species} ${r.from}→${r.to}`;
+/** How many species a net line names before counting the rest. */
+const WORLD_SINCE_NET_MAX = 3;
+
+const WORLD_SINCE_LINE = {
+  extinct: (i) => t('worldSinceExtinct', { s: speciesList(i.species) }),
+  // Two sentences rather than one with an optional clause: a window that no
+  // longer holds part of the span says so, and the visitor who was away across a
+  // trim has to be told the gap is ours, not the tank's.
+  days: (i) => t(i.partial ? 'worldSinceDaysTrimmed' : 'worldSinceDays', { n: i.n, from: i.from, to: i.to, trimmed: i.trimmed }),
+  population: (i) => t('worldSincePopulation', { from: i.from, to: i.to }),
+  emerged: (i) => t('worldSinceEmerged', { s: speciesList(i.species) }),
+  // The watermark moved, which is the only confirmation statement two readings can
+  // support — see the comment where `diffWorld` builds the item.
+  anchored: (i) => (i.from === null
+    ? t('worldSinceAnchoredFirst', { to: i.to })
+    : t('worldSinceAnchored', { from: i.from, to: i.to })),
+  net: (i) => {
+    const { shown, more } = trimSince(i.perSpecies, WORLD_SINCE_NET_MAX);
+    const line = t('worldSinceNet', { s: shown.map(netWord).join(', ') });
+    return more ? `${line} · ${t('worldSinceNetMore', { n: more })}` : line;
+  },
+};
+
+/**
+ * Fold the book in hand into the memory of the last one.
+ *
+ * Compare, then write, and only while the card is on screen — the same three
+ * rules the standing memory follows, for the same reason: the analytics drawer is
+ * closed by default and the book is fetched at boot, so noting unconditionally
+ * would spend the visitor's one baseline on a fetch nobody saw, and the honest
+ * answer to "what happened while you were away" would be "nothing" before they
+ * had a chance to look.
+ *
+ * An empty book is not a baseline either: it has no newest day, so storing it
+ * would overwrite a real memory with a nothing-to-compare-with.
+ */
+function noteWorldSince() {
+  if (document.getElementById('drawer-analytics').hidden) return;
+  const next = worldSeed(censusData);
+  if (!Number.isFinite(next.lastDay)) return;
+  const prev = readWorldSince();
+  worldSince = diffWorld(prev, next, censusData.changes);
+  worldSinceFrom = prev;
+  writeWorldSince(next);
+}
+
+function renderWorldSince() {
+  const el = document.getElementById('census-worldsince');
+  if (!el) return;
+  // A first visit draws nothing, and that is the one place this differs from the
+  // standing block: the visitor with no memory has nothing this file can say, and
+  // the coverage line above already states what the window does hold. "Nothing
+  // happened" would be a claim about a stretch of time nobody recorded.
+  if (worldSince === null || !censusData || censusRows.length === 0) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  el.hidden = false;
+  const head = t('worldSinceTitle', { d: worldSinceFrom.lastDay });
+  if (worldSince.length === 0) {
+    el.innerHTML = `<div class="ms-head">${esc(head)}</div>`
+      + `<div class="census-row"><span>${esc(t('worldSinceQuiet'))}</span></div>`;
+    return;
+  }
+  el.innerHTML = `<div class="ms-head">${esc(head)}</div>`
+    + worldSince.map((i) => `<div class="census-row"><span>${esc(WORLD_SINCE_LINE[i.kind]?.(i) ?? i.kind)}</span></div>`).join('');
+}
+
+/**
  * The one paint path for the census: bars and words come from the same rows, so
  * they are always refreshed together. `refreshCensus` chains this rather than the
  * text alone — a book that arrived over the wire but was never redrawn left the
@@ -3812,6 +3924,9 @@ function pinCensus(day, row) {
 function paintCensus() {
   drawCensusChart();
   renderCensusText();
+  // Third on purpose: the memory is read off `censusData`, so it has to be drawn
+  // after the book it describes, from the same rows the chart just used.
+  renderWorldSince();
 }
 
 // The boot fetch sits here rather than beside `pollAux()` where the other pollers
@@ -5400,6 +5515,12 @@ function toggleDrawer(which) {
   setFocus({ drawer: openKey });
   if (which === 'analytics' && !document.getElementById(drawers.analytics).hidden) {
     resize();
+    // Opening the card is the question; the memory of the last book is the only
+    // thing that can answer it. Fetching on open, the way `dock-you` does, would
+    // buy nothing: the book cannot gain a row while the drawer is shut, and the
+    // request carries up to 110 KiB to find out that it did not.
+    noteWorldSince();
+    renderWorldSince();
   }
 }
 document.getElementById('dock-mem').addEventListener('click', () => toggleDrawer('mem'));
