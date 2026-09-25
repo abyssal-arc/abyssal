@@ -341,3 +341,21 @@ test('every test file on disk is in the list the runner is told to run', () => {
     assert.ok(onDisk.includes(entry.replace('test/', '')), `${entry} is in the run list and not on disk`);
   }
 });
+
+test('every client source file is in the syntax gate CI runs', () => {
+  // The same failure in the other direction, one directory over. CI parses each
+  // client file as ESM by name, and a name nobody wrote down is a file that can
+  // carry a syntax error to a browser: `npm test` boots the page index.html loads,
+  // so a module the page does not import yet is never parsed by anything at all.
+  const root = new URL('..', import.meta.url);
+  const ci = readFileSync(fileURLToPath(new URL('../../.github/workflows/ci.yml', root)), 'utf8');
+  const gated = new Set([...ci.matchAll(/node --input-type=module --check < (\S+)/g)].map((m) => m[1]));
+  assert.ok(gated.size > 5, `${gated.size} files in the gate, which says the scan is looking in the wrong place`);
+  const onDisk = [
+    'packages/web/app.js',
+    'packages/web/i18n.js',
+    ...readdirSync(fileURLToPath(new URL('src', root))).map((f) => `packages/web/src/${f}`),
+  ].filter((f) => f.endsWith('.js'));
+  for (const file of onDisk) assert.ok(gated.has(file), `${file} is shipped to the browser and never parsed by CI`);
+  for (const file of gated) assert.ok(onDisk.includes(file), `${file} is in the gate and not on disk`);
+});

@@ -29,10 +29,19 @@
  * The scales are measured, not recalled. `eth_getBalance` and the USDC token's
  * `balanceOf` name the *same* money for one address — the fee layer speaks 18
  * decimals and the token contract speaks 6 — with the relation that the token
- * balance is the fee balance truncated at that boundary (see `unitScaleProblem`).
- * That relation is checked on every read rather than assumed, because the whole
- * module's arithmetic rests on it: a chain that changes how the two layers
- * relate changes what "funded" means.
+ * balance is the fee balance truncated at that boundary **plus whatever this
+ * address has been paid in USDC** (see `unitScaleProblem`). That relation is
+ * checked at every reading rather than assumed, because the whole module's
+ * arithmetic rests on it: a chain that changes how the two layers relate changes
+ * what "funded" means.
+ *
+ * The revenue term is not decoration, and it is the part this file used to get
+ * wrong while describing itself correctly two paragraphs up: gas is paid in the
+ * same money the site earns, because the `payTo` of `GET /data/flows` and the
+ * signer of the daily digest are the same address — read off the live 402 quote
+ * on 2026-09-25, `0x42e60b67…`, which is what `/health` publishes as `signer`.
+ * So the first settled sale moves one side of the comparison and not the other,
+ * and a rule that ignores it turns a customer into an alarm about nothing.
  */
 
 /** Decimals of the native fee unit, which is what `eth_getBalance` returns. */
@@ -172,25 +181,50 @@ export function txFeeUnits(
 /**
  * Whether the fee balance and the token balance still name the same money.
  *
- * `null` when either side is unknown — an unread balance is not a broken scale.
- * Otherwise the rule is that the token balance is the fee balance **truncated to
- * six decimals**, because that is what the chain says: reading the anchor account
- * on 2026-09-24 gave `0x1156fcae4bf3247f0` native (19.991420355) and `0x1310b7c`
- * USDC (19.991420), and 19991420355000000000 / 1e12 is exactly 19991420 with a
- * remainder of 355,000,000,000. A check demanding `native === token × 1e12` is
- * therefore wrong rather than strict: the 18-decimal layer carries sub-USDC dust
- * that the 6-decimal layer cannot show, so equality would fire on the deployed
- * account as soon as it was tried — an alarm about nothing, which is the fastest
- * way to teach whoever reads `/health` to ignore it. What the quotient *does*
- * catch is the thing worth catching: the relationship between the two layers
- * moving, which turns the quotient into a number that is not the token balance.
+ * `null` when any of the three is unknown — an unread balance is not a broken
+ * scale, and neither is a revenue tally that has not been taken. Otherwise the
+ * rule is that the token balance is the fee balance **truncated to six decimals
+ * plus the USDC this address has been paid**, because that is what the chain
+ * says: reading the anchor account on 2026-09-24 gave `0x1156fcae4bf3247f0`
+ * native (19.991420355) and `0x1310b7c` USDC (19.991420) with no sale settled
+ * yet, and 19991420355000000000 / 1e12 is exactly 19991420 with a remainder of
+ * 355,000,000,000. A check demanding `native === token × 1e12` is therefore wrong
+ * rather than strict: the 18-decimal layer carries sub-USDC dust that the
+ * 6-decimal layer cannot show, so equality would fire on the deployed account as
+ * soon as it was tried — an alarm about nothing, which is the fastest way to
+ * teach whoever reads `/health` to ignore it. What the quotient *does* catch is
+ * the thing worth catching: the relationship between the two layers moving, which
+ * turns the quotient into a number that is not the token balance.
+ *
+ * `revenueUnits` is the caller's job to hand over honestly: it is the settled
+ * tally only when that money arrived at *this* address, which is what the call
+ * sites check. Passing the whole tally for a deployment whose `payTo` is a
+ * different account would excuse a real mismatch.
  */
-export function unitScaleProblem(nativeUnits: unknown, tokenUnits: unknown): string | null {
+export function unitScaleProblem(nativeUnits: unknown, tokenUnits: unknown, revenueUnits: unknown): string | null {
   const native = decimalUnits(nativeUnits);
   const token = decimalUnits(tokenUnits);
-  if (native === null || token === null) return null;
-  if (BigInt(native) / ARC_UNIT_SCALE === BigInt(token)) return null;
-  return `${native} fee units is not ${token} USDC units at 1e${ARC_FEE_DECIMALS - USDC_TOKEN_DECIMALS}`;
+  const revenue = decimalUnits(revenueUnits);
+  if (native === null || token === null || revenue === null) return null;
+  if (BigInt(native) / ARC_UNIT_SCALE + BigInt(revenue) === BigInt(token)) return null;
+  return `${native} fee units at 1e${ARC_FEE_DECIMALS - USDC_TOKEN_DECIMALS} plus ${revenue} USDC units paid in is not ${token} USDC units`;
+}
+
+/**
+ * Whether all three terms of that comparison are in hand — the question
+ * `unitScaleProblem` cannot answer, because it returns `null` both for "checked,
+ * and it holds" and for "nothing was checked".
+ *
+ * That collapse is harmless on the path that takes a reading, which has all three
+ * by construction and only wants a sentence to print when they disagree. It is not
+ * harmless where the answer becomes a boolean field: `/health` publishes `scaleOk`,
+ * and a stored reading with no revenue term beside it would publish `true` — the
+ * one claim this module has spent its existence refusing to make without evidence.
+ * So the required-terms list lives here, next to the comparison it describes, and
+ * the caller that has to distinguish the two cases asks both questions.
+ */
+export function scaleTermsKnown(nativeUnits: unknown, tokenUnits: unknown, revenueUnits: unknown): boolean {
+  return decimalUnits(nativeUnits) !== null && decimalUnits(tokenUnits) !== null && decimalUnits(revenueUnits) !== null;
 }
 
 /** How many more days can be committed with what is in the account. */
@@ -243,6 +277,22 @@ export interface AnchorEcon {
   /** Sum of the quoted amounts over those sales, in token units. */
   revenueUnits: string;
   /**
+   * That tally as it stood when the two balances above were read, or null for a
+   * reading that has not happened.
+   *
+   * The comparison in `unitScaleProblem` is between three quantities that have to
+   * describe the same instant, and only two of them come from the chain. Storing
+   * the live tally beside a stale pair of balances would mean the published
+   * `scaleOk` re-litigates yesterday's reading with today's revenue: the first
+   * sale to settle after a reading would disagree with it by exactly its own
+   * amount, and the disagreement would last until the next reading, which on this
+   * product is up to one anchored day away. The race that remains is the narrow
+   * one — a transfer that lands in the block the reading sees a moment before the
+   * settlement call returns — and it is cleared by the next reading rather than
+   * by a second opinion here.
+   */
+  revenueAtRead: string | null;
+  /**
    * Whether the last read found the runway below `RUNWAY_ALARM_ANCHORS`.
    *
    * Stored rather than kept in a closure flag, because the flag's job is to make
@@ -272,6 +322,13 @@ export function anchorEconProblem(a: AnchorEcon): string | null {
     if (value !== null && decimalUnits(value) === null) return `${field} is not a decimal integer string`;
   }
   if (decimalUnits(a.revenueUnits) === null) return 'revenueUnits is not a decimal integer string';
+  // Absent is legal and means "written before this field existed", which is every
+  // ledger that a deployed isolate loads on the first day after a deploy. Refusing
+  // it would drop the economics of an account that had been measuring itself for
+  // weeks, so the load path normalises it to null instead.
+  if (a.revenueAtRead !== undefined && a.revenueAtRead !== null && decimalUnits(a.revenueAtRead) === null) {
+    return 'revenueAtRead is not a decimal integer string';
+  }
   if (!Number.isInteger(a.sales) || a.sales < 0) return 'negative or fractional sales count';
   if (typeof a.lowNoted !== 'boolean') return 'lowNoted is not a boolean';
   if (a.costUnits === null && a.costDay !== null) return 'a cost day with no cost';
@@ -283,6 +340,6 @@ export function anchorEconProblem(a: AnchorEcon): string | null {
 export function newAnchorEcon(at: number): AnchorEcon {
   return {
     at, balanceUnits: null, tokenUnits: null, costUnits: null, costDay: null,
-    sales: 0, revenueUnits: '0', lowNoted: false,
+    sales: 0, revenueUnits: '0', revenueAtRead: null, lowNoted: false,
   };
 }

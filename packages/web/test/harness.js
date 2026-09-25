@@ -145,9 +145,11 @@ export const census = {
 /**
  * `/observe` with the Arc feed live, shaped like the real endpoint: the same keys
  * in the same order of richness, with round synthetic numbers of our own rather
- * than someone's window off the wire. Only `available` matters to the tests that
- * read this file — it is what makes the boot probe *able* to move the visitor,
- * which is the thing the `urlNamedView` guard exists to prevent.
+ * than someone's window off the wire. Two of them are read by name: `available`,
+ * which is what makes the boot probe *able* to move the visitor (the thing the
+ * `urlNamedView` guard exists to prevent), and the `stats.transfers` /
+ * `venueCoverage` pair, which is what the rails panel's coverage sentences are
+ * checked against in `test/observe-boot.test.js`.
  */
 export const FLOW_ADDR = '0x' + 'f6'.repeat(20);
 
@@ -164,14 +166,21 @@ export const observe = {
     { address: '0x' + 'b2'.repeat(20), volume: 640, count: 6, x402: 3 },
   ],
   venues: [
-    { kind: 'x402', count: 10, volume: 20 },
-    { kind: 'swap', count: 40, volume: 3000 },
+    { kind: 'x402', count: 20, volume: 20 },
+    { kind: 'swap', count: 80, volume: 3000 },
   ],
   venueRows: [
-    { kind: 'swap', label: '0x' + 'c3'.repeat(20), address: '0x' + 'c3'.repeat(20), count: 30, volume: 2000 },
-    { kind: 'x402', label: '0x' + 'd4'.repeat(20), address: '0x' + 'd4'.repeat(20), count: 10, volume: 20 },
+    { kind: 'swap', label: '0x' + 'c3'.repeat(20), address: '0x' + 'c3'.repeat(20), count: 80, volume: 2000 },
+    { kind: 'x402', label: '0x' + 'd4'.repeat(20), address: '0x' + 'd4'.repeat(20), count: 20, volume: 20 },
   ],
-  venueCoverage: { windowFlows: 150, attributed: 150, unattributed: 0 },
+  /**
+   * Both shortfalls at once, and arithmetically closed: the ring held 150 of the
+   * window's 900 transfers (`unseen` 750) and read no destination for 50 of those
+   * (`attributed` 100, which is what the rails above add up to). One boot can show
+   * one payload, so this one shows both sentences — otherwise the wiring test
+   * passes with either of them deleted.
+   */
+  venueCoverage: { windowFlows: 150, attributed: 100, unattributed: 50, windowTransfers: 900, unseen: 750 },
   pulse: [
     { t: 1790144250000, count: 120, volume: 9000, x402: 3, resolved: 120 },
     { t: 1790144550000, count: 90, volume: 7000, x402: 2, resolved: 90 },

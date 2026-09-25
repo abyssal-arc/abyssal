@@ -19,6 +19,10 @@ jobs:
       - run: npm run typecheck
       # The web client is dependency-free ES modules; parse it as ESM so a
       # syntax slip (or a stray top-level await) fails here, not in a browser.
+      # Every file the client ships is listed, and
+      # `packages/web/test/pure.test.js` fails if a file on disk is not in this
+      # list, because a hand-written list is the one place "added a file" can go
+      # unrecorded.
       - name: web esm syntax gate
         run: |
           node --input-type=module --check < packages/web/app.js
@@ -28,4 +32,5 @@ jobs:
           node --input-type=module --check < packages/web/src/census.js
           node --input-type=module --check < packages/web/src/deeplink.js
           node --input-type=module --check < packages/web/src/since.js
+          node --input-type=module --check < packages/web/src/observe.js
       - run: npm test

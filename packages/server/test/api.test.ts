@@ -2200,16 +2200,21 @@ const pad = (sel: string) => sel + '00'.repeat(32);
  * `from`, `from+1`, … A poll seeded four blocks back spans exactly four, and the
  * whole span is one chunk — `LOG_CHUNK_BLOCKS` is 400 — so this is also how many
  * flows a test gets, and how many distinct blocks it can vary the body across.
+ * `maxFlows` shrinks the ring below that, which is how a test overflows it without
+ * waiting for a busy chain. `seedBack` is how far behind the head the cursor sits,
+ * and so how many blocks the poll spans: `transfersPerChunk` puts its transfers on
+ * the *lowest* blocks of the range, so a poll narrower than the number of transfers
+ * would answer with logs past the height it indexed, and those get no venue.
  */
-async function pollLive(tx?: StubTxAt, perChunk = 2) {
+async function pollLive(tx?: StubTxAt, perChunk = 2, maxFlows?: number, seedBack = 4) {
   const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
   const HEAD = 8192;
   const { server: rpc } = chainRpcStub(HEAD, perChunk, 0, tx);
   await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
   const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
-  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0 });
+  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 16, pollEveryMs: 0, maxFlows });
   try {
-    feed.importState(feedStateAt(HEAD - 4));
+    feed.importState(feedStateAt(HEAD - seedBack));
     await feed.settle();
     return feed.observePayload();
   } finally {
@@ -2232,6 +2237,60 @@ test('a DEX swap is not a machine payment, however it was submitted', async () =
   const swap = obs.venues.find((v) => v.kind === 'swap');
   assert.equal(swap?.count, obs.stats.resolved, 'the swap tally accounts for everything the poll read');
   assert.equal(obs.venueCoverage.unattributed, 0, 'a live poll resolves every flow it lands, so nothing is left unattributed');
+  // Four blocks of a seeded cursor is a live poll, and the ring is far wider than
+  // the flows it lands, so the window and the ring hold the same set here. The
+  // equality is the payload's own invariant and the client's sentence is built
+  // from these two numbers, so it is checked where both are published.
+  assert.equal(obs.venueCoverage.windowTransfers, obs.stats.transfers, 'the coverage denominator is the heading number, not a second count of something else');
+  assert.equal(obs.venueCoverage.windowFlows, obs.stats.transfers, 'a ring with room left holds every flow in the window');
+  assert.equal(obs.venueCoverage.unseen, 0, 'and says so instead of inventing a shortfall');
+});
+
+test('rails that describe part of the window say which part', async () => {
+  // The failure this guards is invisible in every other number on the panel: the
+  // flow ring is 6,000 places and the stats window is five minutes of chain, which
+  // today runs ~2,500 transfers, so the ring covers the window — *unless the
+  // isolate is young*. The block cursor survives an eviction and suppresses the
+  // backfill that would otherwise refill the ring, so a restored feed serves a
+  // full window of pulse history over a ring that has been filling one poll at a
+  // time since it woke. Measured on the deployed feed at 03:48:16Z on 2026-09-25:
+  // 2,098 transfers in the window and 0 ring flows, with `unattributed` at 0 too,
+  // because a flow the ring never held cannot be unattributed either.
+  const obs = await pollLive(undefined, 8, 3, 8);
+  assert.equal(obs.stats.transfers, 8, 'the poll read eight transfers');
+  assert.equal(obs.venueCoverage.windowFlows, 3, 'the ring kept three of them');
+  assert.equal(obs.venueCoverage.windowTransfers, obs.stats.transfers, 'and the denominator is the number on the heading');
+  assert.equal(obs.venueCoverage.unseen, 5, 'five were never in hand, which is a coverage fact and not a classification fact');
+  assert.equal(obs.venueCoverage.unattributed, 0, 'the three it kept were all resolved, so nothing is unattributed — the old single number reported a clean bill of health');
+  assert.equal(
+    obs.venueCoverage.unseen,
+    Math.max(0, obs.stats.transfers - obs.venueCoverage.windowFlows),
+    'unseen is that subtraction, computed here as well as in the feed so the two cannot drift',
+  );
+});
+
+test('a backfill counts every transfer it read, not the ones the ring kept', async () => {
+  // Same subtraction on the other path. The pulse series used to be rebuilt by
+  // walking the ring after the trim, so a backfill wide enough to overflow it
+  // printed its own survivors as the window's total and then reported no
+  // shortfall at all — the pair stayed self-consistent while both numbers were
+  // short, which is the one shape of this bug no ratio can show.
+  const { ArcUsdcFeed, ARC_USDC_ADDRESS } = await import('../src/arc.js');
+  const HEAD = 8192;
+  const { server: rpc } = chainRpcStub(HEAD, 8);
+  await new Promise<void>((r) => rpc.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(rpc.address() as AddressInfo).port}`;
+  const feed = new ArcUsdcFeed(url, ARC_USDC_ADDRESS, { backfillBlocks: 32, pollEveryMs: 0, maxFlows: 3 });
+  try {
+    await feed.settle();   // cold: this is the backfill
+    const obs = feed.observePayload();
+    assert.equal(obs.stats.transfers, 8, 'the whole backfill is inside the stats window, so all eight belong to it');
+    assert.equal(obs.venueCoverage.windowFlows, 3, 'the ring kept three');
+    assert.equal(obs.venueCoverage.unseen, 5, 'and the window says how much of it the rails do not describe');
+    assert.equal(obs.stats.volume, 8, 'the volume the pulse sums is the same eight transfers (1 USDC each), not the surviving three');
+  } finally {
+    rpc.close();
+  }
 });
 
 test('an EIP-3009 authorization is the only thing counted, and the share names its denominator', async () => {
@@ -3761,7 +3820,7 @@ type HealthBody = {
     };
     lastCost: { feeUnits: string | null; day: number | null };
     runway: { anchors: number | null; unknown: string | null; alarmBelow: number; low: boolean; alarmNoted: boolean; capped: boolean };
-    revenue: { sales: number; quotedUnits: string; unitDecimals: number };
+    revenue: { sales: number; quotedUnits: string; atReadingUnits: string | null; unitDecimals: number };
   };
   data: {
     forSale: boolean;
@@ -5521,24 +5580,43 @@ test('the cost of a day is read from the receipt, in units that cannot round', (
   // answer that has not become a decimal string is not a scale anybody can check.
   // Asserted as a refusal on purpose: this line used to read like a passing scale
   // check while both of its arguments were being discarded inside the function.
-  assert.equal(unitScaleProblem(feeHex(10n ** 18n), dataWord(10n ** 6n)), null, 'hex in is not a claim about the scale');
-  assert.equal(unitScaleProblem('1000000000000000000', '1000000'), null, 'decimal strings work too');
-  assert.match(unitScaleProblem('1000000000000000000', '5000000') ?? '', /is not .* at 1e12/);
+  assert.equal(unitScaleProblem(feeHex(10n ** 18n), dataWord(10n ** 6n), '0'), null, 'hex in is not a claim about the scale');
+  assert.equal(unitScaleProblem('1000000000000000000', '1000000', '0'), null, 'decimal strings work too');
+  assert.match(unitScaleProblem('1000000000000000000', '5000000', '0') ?? '', /at 1e12 plus .* is not/);
   // Both directions, because a one-sided comparison passes for the other half of
   // the mistakes: a fee balance that *overstates* what the token contract reports
   // is the version that promises more anchors than exist.
-  assert.match(unitScaleProblem('2000000000000000000', '1000000') ?? '', /is not .* at 1e12/,
+  assert.match(unitScaleProblem('2000000000000000000', '1000000', '0') ?? '', /at 1e12 plus .* is not/,
     'a fee balance twice the token one is as much a moved scale as half of it');
-  assert.equal(unitScaleProblem(null, '5000000'), null, 'an unread balance is not a broken scale');
+  assert.equal(unitScaleProblem(null, '5000000', '0'), null, 'an unread balance is not a broken scale');
   // The rule is a truncation, not a scaled equality, and the deployed account is
   // what proved it: read on 2026-09-24 it answered `0x1156fcae4bf3247f0` for
   // `eth_getBalance` and `0x1310b7c` for `balanceOf` — the same money, with
   // 355,000,000,000 fee units of dust under the six-decimal boundary. A check that
   // demanded exact equality would have alarmed on the first read after shipping.
-  assert.equal(unitScaleProblem('19991420355000000000', '19991420'), null,
+  assert.equal(unitScaleProblem('19991420355000000000', '19991420', '0'), null,
     'sub-USDC dust in the fee layer is not a moved scale');
-  assert.match(unitScaleProblem('19991420355000000000', '19991421') ?? '', /is not .* at 1e12/,
+  assert.match(unitScaleProblem('19991420355000000000', '19991421', '0') ?? '', /at 1e12 plus .* is not/,
     'but one whole USDC off is');
+  // And one whole USDC off is exactly what a sale is, which is why the third
+  // argument exists. The deployed `payTo` is the address whose two balances are
+  // being compared, so the first customer to pay 0.001 USDC moves the token side of
+  // this comparison by 1,000 units and nothing else — a rule without the revenue
+  // term reads that as the chain having changed its units.
+  assert.equal(unitScaleProblem('19991420355000000000', '19992420', '1000'), null,
+    'revenue paid into this account is part of what its token balance should be');
+  assert.match(unitScaleProblem('19991420355000000000', '19991420', '1000') ?? '', /plus 1000 USDC units paid in is not/,
+    'revenue that is on the tally but not on the chain is still a mismatch');
+  assert.match(unitScaleProblem('19991420355000000000', '19991421', '1000') ?? '', /is not 19991421/,
+    'and the tally does not excuse an unexplained unit');
+  // Three quantities, one instant: an unknown in any of them makes the comparison
+  // not knowable rather than failed.
+  assert.equal(unitScaleProblem('1000000000000000000', '1000000', null), null,
+    'a tally that has not been taken is not a broken scale');
+  assert.equal(unitScaleProblem('19991420355000000000', '19992420', null), null,
+    'and it is not read as a tally of zero either, which would turn the unknown into a mismatch');
+  assert.equal(unitScaleProblem('1000000000000000000', '1000000', '1.5'), null,
+    'and neither is one that is not a count');
 
   assert.equal(addDecimalUnits('1000', '1000'), '2000');
   assert.equal(addDecimalUnits('1000', '0.5'), null, 'half a base unit is not a count');
@@ -5572,6 +5650,7 @@ test('the stored economics object is asked whether it still means what it claims
     ['a token balance that arrived as a number', { ...newAnchorEcon(1), tokenUnits: 7n as unknown as string }],
     ['a cost that arrived as a number', { ...newAnchorEcon(1), costUnits: 5 as unknown as string, costDay: 1 }],
     ['a revenue total that is not a count', { ...newAnchorEcon(1), revenueUnits: '1.5' }],
+    ['the revenue beside a reading that is not a count', { ...newAnchorEcon(1), revenueAtRead: '1e3' }],
     ['a negative sale count', { ...newAnchorEcon(1), sales: -1 }],
     ['an alarm flag that is a string', { ...newAnchorEcon(1), lowNoted: 'yes' as unknown as boolean }],
     ['a cost belonging to no day', { ...newAnchorEcon(1), costUnits: '5', costDay: null }],
@@ -5579,6 +5658,14 @@ test('the stored economics object is asked whether it still means what it claims
     ['an unparseable timestamp', { ...newAnchorEcon(Number.NaN) }],
   ];
   for (const [what, value] of corrupt) assert.ok(anchorEconProblem(value), what);
+
+  // Absent is not corrupt. Every ledger written before `revenueAtRead` existed is in
+  // this set — the deployed one included, on the first day after a deploy — and
+  // refusing one would throw away the cost of every anchored day so far to keep a
+  // bookkeeping rule tidy.
+  const beforeField = { ...newAnchorEcon(1), balanceUnits: '19991420355000000000', tokenUnits: '19991420' };
+  delete (beforeField as { revenueAtRead?: string | null }).revenueAtRead;
+  assert.equal(anchorEconProblem(beforeField as AnchorEcon), null, 'a reading with no tally stored beside it loads');
 });
 
 test('a signal reddens the health light only while it is still happening', () => {
@@ -5868,7 +5955,7 @@ test('a chain that stops naming one money with two units is reported, not absorb
       assert.equal(body.anchor.funded.scaleOk, false);
       assert.equal(body.anchor.funded.bothRead, true);
       assert.equal(body.signals?.counts.arc_unit_scale_unexpected, 1);
-      assert.match(healthDetail(body, 'arc_unit_scale_unexpected') ?? '', /is not .* at 1e12/);
+      assert.match(healthDetail(body, 'arc_unit_scale_unexpected') ?? '', /fee units at 1e12 plus .* is not/);
       assert.match(body.problem ?? '', /arc_unit_scale_unexpected=1/);
       // The figures are still published, with the alarm beside them: a reader who
       // wants the balance gets it and sees that it is distrusted.
@@ -5878,6 +5965,135 @@ test('a chain that stops naming one money with two units is reported, not absorb
   } finally {
     rpc.close();
   }
+});
+
+test('a sale that lands in the checked account is part of that account\u2019s own scale rule', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // One 0.001-USDC sale settled, and the fee layer untouched. This is the exact
+      // state the first customer produces on the deployed world, because the money
+      // arrives at the address whose two balances are being compared: the live 402
+      // quote read on 2026-09-25 names payTo 0x42e60b67…, which is the same account
+      // `/health` publishes as `anchor.signer`. Before this term existed the
+      // comparison ignored it, so a paying customer was reported as the chain having
+      // changed its units.
+      rpc.setBalances('0x1156fcae4bf3247f0', dataWord(19_992_420n));
+      m.seedAnchor({ ...newAnchorEcon(0), sales: 1, revenueUnits: '1000' });
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const app = createApp({
+        seed: 1, store: m.store, rpc: rpc.url, health, sellerKey: process.env.ARC_DIGEST_KEY, ...offlineFeeds,
+      });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 0, 'day 0 confirmed');
+      await app.settleDigest();
+      const { value: body, errors } = await quiet(() => readHealth(app));
+      assert.equal(body.data.forSale, true, 'the seller key reached the object, so the tally is this address\u2019s');
+      assert.equal(body.data.payTo, (body.anchor.signer ?? '').toLowerCase(), 'and it is paid to the checked address');
+      assert.equal(body.anchor.funded.usdcUnits, '19992420');
+      assert.equal(body.anchor.funded.scaleOk, true, 'truncated fee balance plus the revenue that landed here');
+      assert.equal(body.anchor.funded.bothRead, true);
+      assert.equal(body.signals?.counts.arc_unit_scale_unexpected, undefined, 'a customer is not an alarm');
+      assert.ok(errors.every((e) => !/suspect/.test(e)), 'and nothing is printed about it');
+      assert.equal(body.anchor.revenue.quotedUnits, '1000');
+      assert.equal(body.anchor.revenue.atReadingUnits, '1000', 'the third term of the comparison is published beside it');
+      assert.equal(m.anchor()?.revenueAtRead, '1000', 'and it is the reading that is durable, not the page view');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('revenue paid somewhere else excuses nothing about the account being checked', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth();
+  try {
+    await withDigestKey(async () => {
+      // The same chain answer as above, the same tally, and a `payTo` that is a
+      // different account. Handing the comparison the whole tally regardless of
+      // where the money went would excuse a moved scale for any deployment that
+      // sells from a separate treasury, which is the mistake in the other
+      // direction — and the one a reader of `/health` could not see.
+      rpc.setBalances('0x1156fcae4bf3247f0', dataWord(19_992_420n));
+      m.seedAnchor({ ...newAnchorEcon(0), sales: 1, revenueUnits: '1000' });
+      await seedPendingDay(m, 0);
+      rpc.setReceipt({ status: '0x1', transactionHash: DIGEST_TX });
+      const app = createApp({
+        seed: 1, store: m.store, rpc: rpc.url, health,
+        sellerKey: process.env.ARC_DIGEST_KEY,
+        sellerPayTo: '0x1111111111111111111111111111111111111111',
+        ...offlineFeeds,
+      });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      await untilDigest(m.digest, (r) => r.status === 'confirmed' && r.day === 0, 'day 0 confirmed');
+      await app.settleDigest();
+      const body = await readHealth(app);
+      assert.equal(body.data.payTo, '0x1111111111111111111111111111111111111111', 'the money goes elsewhere');
+      assert.equal(body.anchor.funded.scaleOk, false, 'so its token balance is unexplained by this one');
+      assert.equal(body.signals?.counts.arc_unit_scale_unexpected, 1);
+      assert.match(healthDetail(body, 'arc_unit_scale_unexpected') ?? '', /plus 0 USDC units paid in/,
+        'and the reason says which term was counted, because that is the whole question');
+      assert.equal(body.anchor.revenue.quotedUnits, '1000', 'the sales count is still reported as itself');
+      assert.equal(body.anchor.revenue.atReadingUnits, '0');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('a sale that settles after a reading does not re-light that reading\u2019s comparison', async () => {
+  const m = memStore();
+  const health = createHealth();
+  // The balances were read when nothing had been sold; a sale has settled since.
+  // Recomputing `scaleOk` against the live tally would turn that ordinary sequence
+  // into a disagreement lasting until the next reading, which on this product is up
+  // to one anchored day away — long enough to make /health red over a customer.
+  m.seedAnchor({
+    ...newAnchorEcon(1_700_000_000_000),
+    balanceUnits: '19991420355000000000', tokenUnits: '19991420',
+    costUnits: DIGEST_COST_UNITS.toString(), costDay: 3,
+    sales: 3, revenueUnits: '3000', revenueAtRead: '0',
+  });
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value: body } = await quiet(() => readHealth(app));
+  assert.equal(body.anchor.funded.scaleOk, true, 'the stored comparison stands on the stored terms');
+  assert.equal(body.anchor.revenue.quotedUnits, '3000', 'the tally itself is not hidden');
+  assert.equal(body.anchor.revenue.atReadingUnits, '0', 'and the reader is told which one the check used');
+  assert.equal(body.healthy, true, 'nothing went wrong: ' + (body.problem ?? ''));
+});
+
+test('a reading written before the tally field existed is not read as a tally of zero', async () => {
+  const m = memStore();
+  const health = createHealth();
+  // The one ledger this rewrite actually meets in production: two balances stored
+  // by a build that recorded no `revenueAtRead`, and a non-zero tally beside them.
+  // The pair below is consistent with 3,000 units having landed at the checked
+  // address and with nothing having landed there equally badly — only one of the
+  // two answers is true, and the stored reading does not say which. Substituting
+  // `'0'` for the absent term therefore does not report an unknown, it reports a
+  // disagreement, and it reports it for as long as it takes the next day to
+  // confirm: up to 86 minutes of `/health` claiming the account's money stopped
+  // naming itself, because a customer bought something.
+  const stored = {
+    ...newAnchorEcon(1_700_000_000_000),
+    balanceUnits: '19991420355000000000', tokenUnits: '19994420',
+    costUnits: DIGEST_COST_UNITS.toString(), costDay: 3,
+    sales: 3, revenueUnits: '3000',
+  };
+  delete (stored as { revenueAtRead?: string | null }).revenueAtRead;
+  m.seedAnchor(stored);
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { value: body } = await quiet(() => readHealth(app));
+  assert.equal(body.anchor.funded.scaleOk, null, 'the third term is unknown, which is not the same as false');
+  assert.equal(body.anchor.revenue.atReadingUnits, null, 'and the page says so rather than picking a number');
+  assert.equal(body.anchor.revenue.quotedUnits, '3000', 'the tally since then is still reported as itself');
+  assert.equal(body.healthy, true, 'a field an older build never wrote is not a problem: ' + (body.problem ?? ''));
 });
 
 test('the account the chain actually reports has dust in it, and is still believed', async () => {

@@ -30,6 +30,7 @@ import { hsla, shortAddr, fmtUsd } from './src/format.js';
 import { censusEvents, censusSeries, censusTrend } from './src/census.js';
 import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
 import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
+import { venueCoverageNotes } from './src/observe.js';
 
 initI18n();
 
@@ -1517,6 +1518,11 @@ function renderObsStats() {
  * contracts — which is what the old sender-vs-payer heuristic collapsed into a
  * single number it then called x402. The kind chips above the rows carry the
  * totals; a row's own kind tag keeps the two readings connected.
+ *
+ * What the rows do *not* carry is the window. They are counted over the flow ring,
+ * which a young isolate has had no time to fill, so the panel ends with whatever
+ * `src/observe.js` decides the coverage numbers entitle it to say — see the note
+ * there for the six reads that made this a sentence and not a guess.
  */
 function renderObsVenues() {
   const el = document.getElementById('venues');
@@ -1563,9 +1569,15 @@ function renderObsVenues() {
         );
       })
       .join('')}</div>` +
-    (cov && cov.unattributed > 0
-      ? `<div class="vcov">${esc(t('venueUnattributed', { n: cov.unattributed.toLocaleString() }))}</div>`
-      : '');
+    venueCoverageNotes(cov, obsData.stats?.transfers)
+      .map((note) => {
+        // The digits are the panel's business, the sentence is the module's: a
+        // locale that groups thousands differently changes this line and not the
+        // arithmetic it is arguing about.
+        const args = Object.fromEntries(Object.entries(note.args).map(([k, v]) => [k, v.toLocaleString()]));
+        return `<div class="vcov">${esc(t(note.key, args))}</div>`;
+      })
+      .join('');
   el.querySelectorAll('.ep[data-vaddr]').forEach((row) => {
     row.addEventListener('click', () => openAddrCard(row.dataset.vaddr));
   });

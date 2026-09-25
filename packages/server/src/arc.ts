@@ -811,15 +811,23 @@ export class ArcUsdcFeed implements ChainFeed {
       resolved += p.resolved;
     }
     const byTo = new Map<string, { address: string; volume: number; count: number; x402: number }>();
-    // Venues aggregate from the flow ring rather than from the pulse buckets,
-    // the same way `endpoints` below does: a pulse bucket carries one x402 count
-    // and no room for a per-rail breakdown, and a venue table is a ranking over
-    // the window rather than a time series. The ring holds 6000 flows against a
-    // ~2100-flow window at current Arc traffic, so the window is fully covered;
-    // a busier chain that saturates it is why `venueCoverage` reports the ring's
-    // own window total next to the split, so a viewer can see these numbers are
-    // counted over flows rather than over pulse buckets and are not expected to
-    // equal `transfers` above.
+    // Venues aggregate from the flow ring rather than from the pulse buckets, the
+    // same way `endpoints` above does: a pulse bucket carries one x402 count and no
+    // room for a per-rail breakdown, and a venue table is a ranking rather than a
+    // time series. What the ring covers is stated as a ratio rather than assumed to
+    // be the window, because it is not the window. It holds 6000 flows against a
+    // 300-second window, and since the block cursor survives an eviction it refills
+    // one live poll at a time (see the note on `settle()`). Measured on the deployed
+    // feed at 03:48:16Z–03:49:37Z on 2026-09-25, six reads about 16 seconds apart
+    // found 0, 453, 612, 722, 845 and 1,138 ring flows inside windows the pulse was
+    // counting at 2,098 to 2,682 transfers: 0% to 44.5% of the heading number those
+    // same reads printed, and `unattributed` was 0 the whole time, because a flow the
+    // ring never held cannot be unattributed either. So the rails below are printed
+    // under a heading number they may describe a fraction of, and `venueCoverage`
+    // now says which fraction: `windowFlows` is what these tables are counted over,
+    // `windowTransfers` is what the window holds, `unseen` is the difference. A chain
+    // busy enough to saturate the 6000 produces the same shape for a different
+    // reason, and the same three numbers report it.
     const venueTally = emptyTally();
     const venueVolume: VenueTally = emptyTally();
     const byVenue = new Map<string, { kind: VenueKind; address: string | null; volume: number; count: number }>();
@@ -917,7 +925,19 @@ export class ArcUsdcFeed implements ChainFeed {
         volume: Math.round(venueVolume[k] * 100) / 100,
       })),
       venueRows,
-      venueCoverage: { windowFlows, attributed, unattributed: windowFlows - attributed },
+      venueCoverage: {
+        windowFlows,
+        attributed,
+        unattributed: windowFlows - attributed,
+        // The durable count over the same window, and the part of it the ring had
+        // already dropped when this payload was built. `unseen` is not folded into
+        // `unattributed` because the two want different sentences: an unattributed
+        // flow is one this feed resolved to no rail, an unseen one is a flow this
+        // feed never held, and a table that silently describes a fifth of the
+        // window is the second.
+        windowTransfers: transfers,
+        unseen: Math.max(0, transfers - windowFlows),
+      },
       pulse,
       flows: this.flows.slice(-160).map((f) => ({
         t: f.t,
@@ -1142,6 +1162,18 @@ export class ArcUsdcFeed implements ChainFeed {
       let volume = 0;
       let x402Count = 0;
       let resolvedCount = 0;
+      // A backfill's pulse buckets are built here, transfer by transfer, rather
+      // than from `this.flows` afterwards. The ring is trimmed to `maxFlows` below
+      // this loop, so a backfill wide enough to fill it would rebuild the series
+      // from its own survivors and print the shorter count as the window's — the
+      // same trap `venueCoverage.unseen` exists for, one level up: a number that
+      // reads as "what the window held" while being "what the ring kept". It stays
+      // invisible while the window is the part that survives the trim, which at
+      // today's ~2,500 transfers per five minutes against a 6,000-place ring is
+      // exactly what happens; it stops being invisible the moment the window
+      // itself overflows, and the oldest stretch is missing from /history/pulse
+      // either way.
+      const rebuilt = new Map<number, PulseSample>();
       for (const log of logs) {
         if (!Array.isArray(log.topics) || log.topics.length < 3) continue;
         const amount = amountOf(log.data);
@@ -1164,6 +1196,18 @@ export class ArcUsdcFeed implements ChainFeed {
         // than MAX_VENUE_BLOCKS resolves only its newest stretch, and the rest of
         // it is as unknown as any backfilled flow.
         if (kind) resolvedCount++;
+        if (isBackfill) {
+          const key = Math.floor(t / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
+          let b = rebuilt.get(key);
+          if (!b) {
+            b = { t: key, count: 0, volume: 0, x402: 0, resolved: 0 };
+            rebuilt.set(key, b);
+          }
+          b.count++;
+          b.volume += amount;
+          if (x402) b.x402++;
+          if (kind) b.resolved++;
+        }
         if (!isBackfill && this.pendingTxs.length < this.maxPending) {
           this.pendingTxs.push({
             hash: log.transactionHash,
@@ -1176,27 +1220,12 @@ export class ArcUsdcFeed implements ChainFeed {
       if (this.flows.length > this.maxFlows) this.flows.splice(0, this.flows.length - this.maxFlows);
 
       if (isBackfill) {
-        // Rebuild the pulse history from the backfilled flows: fixed 15s
-        // time buckets so backfill and live bars stay comparable.
-        const rebuilt = new Map<number, PulseSample>();
-        for (const f of this.flows) {
-          const key = Math.floor(f.t / PULSE_BUCKET_MS) * PULSE_BUCKET_MS;
-          let b = rebuilt.get(key);
-          if (!b) {
-            b = { t: key, count: 0, volume: 0, x402: 0, resolved: 0 };
-            rebuilt.set(key, b);
-          }
-          b.count++;
-          b.volume += f.amount;
-          if (f.x402) b.x402++;
-          if (f.venue) b.resolved++;
-        }
-        // Merged into the series already in hand rather than replacing it, and
-        // the one already in hand wins every collision. A backfill re-reads
-        // blocks the feed has counted before — that is what makes it a backfill
-        // — so for any stretch a persisted series also covers, these buckets are
-        // a second opinion, and a worse one on two counts: adding them would
-        // count those transfers twice, and a backfill resolves no venues, so
+        // Merge the buckets built above into the series already in hand rather
+        // than replacing it, and the one already in hand wins every collision. A
+        // backfill re-reads blocks the feed has counted before — that is what makes
+        // it a backfill — so for any stretch a persisted series also covers, these
+        // buckets are a second opinion, and a worse one on two counts: adding them
+        // would count those transfers twice, and a backfill resolves no venues, so
         // every bucket it builds arrives with `resolved: 0` and would trade a
         // reading the feed actually took for one it did not. What the rebuild
         // contributes is the stretch nobody had polled yet, which is the gap

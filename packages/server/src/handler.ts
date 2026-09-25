@@ -28,7 +28,7 @@ import {
 import { ArcUsdcFeed, ARC_USDC_ADDRESS, whalePosition } from './arc.js';
 import {
   addDecimalUnits, anchorEconProblem, anchorRunway, hexDataToDecimalUnits, hexToDecimalUnits, newAnchorEcon,
-  RUNWAY_ALARM_ANCHORS, txFeeUnits, unitScaleProblem, ARC_FEE_DECIMALS, USDC_TOKEN_DECIMALS,
+  RUNWAY_ALARM_ANCHORS, scaleTermsKnown, txFeeUnits, unitScaleProblem, ARC_FEE_DECIMALS, USDC_TOKEN_DECIMALS,
   type AnchorCost, type AnchorEcon,
 } from './econ.js';
 import { SyntheticFeed, type ChainFeed, type ChainTx, type FeedState } from './chain.js';
@@ -895,10 +895,21 @@ export function createApp(options: AppOptions = {}) {
     // record written before the field list existed is coherent, untrusted, and
     // never gets as far as the gate that would have counted it.
     const mismatch = digest && !(await verifyPayload(digest.payload)) ? 'digest_payload_mismatch' : null;
-    // The two derived economics figures, computed from the stored readings rather
+    // The three derived economics figures, computed from the stored readings rather
     // than stored beside them: a runway is a quotient, and a stored quotient is one
-    // more number that can disagree with the two it came from.
-    const econScale = unitScaleProblem(anchorEcon.balanceUnits, anchorEcon.tokenUnits);
+    // more number that can disagree with the two it came from. The scale check takes
+    // the revenue tally as it stood at the reading for the same reason — it is the
+    // third quantity the stored pair was compared against when it was taken. And it
+    // takes it as absent-when-absent: a reading written before that field existed
+    // recorded no tally, which is not the same event as a tally of zero. Answering
+    // the unknown with `'0'` would publish `scaleOk: false` for up to a day about a
+    // customer who did nothing wrong, on precisely the deployments that had sales —
+    // and `unitScaleProblem` already has the honest answer for a term it cannot see.
+    const econScale = unitScaleProblem(anchorEcon.balanceUnits, anchorEcon.tokenUnits, anchorEcon.revenueAtRead);
+    // Asked separately, because `unitScaleProblem` is silent about the difference
+    // between a comparison that holds and one that never ran, and `scaleOk` is one
+    // boolean that a reader takes as the second when it is told the first.
+    const econScaleKnown = scaleTermsKnown(anchorEcon.balanceUnits, anchorEcon.tokenUnits, anchorEcon.revenueAtRead);
     const econRunway = anchorRunway(anchorEcon.balanceUnits, anchorEcon.costUnits);
     const stale = view ? staleSignals(view) : [];
     const parts = [problem, mismatch].filter((p): p is string => Boolean(p));
@@ -968,9 +979,12 @@ export function createApp(options: AppOptions = {}) {
           usdcDecimals: USDC_TOKEN_DECIMALS,
           // Whether the fee balance and the token balance were both read this time,
           // and whether they still name the same money. `scaleOk: null` is "not
-          // knowable", which is not the same answer as `false`.
+          // knowable", which is not the same answer as `false` — and with a third
+          // term in the comparison it is not the same answer as `true` either, which
+          // is what a two-term gate would say about a reading whose third term never
+          // arrived.
           bothRead: anchorEcon.balanceUnits !== null && anchorEcon.tokenUnits !== null,
-          scaleOk: anchorEcon.balanceUnits === null || anchorEcon.tokenUnits === null ? null : econScale === null,
+          scaleOk: !econScaleKnown ? null : econScale === null,
         },
         lastCost: { feeUnits: anchorEcon.costUnits, day: anchorEcon.costDay },
         runway: {
@@ -990,6 +1004,11 @@ export function createApp(options: AppOptions = {}) {
         revenue: {
           sales: anchorEcon.sales,
           quotedUnits: anchorEcon.revenueUnits,
+          // The same tally as the reading that produced `scaleOk` above saw it. It
+          // is the third term of that comparison, and without it published the
+          // figure is not one a reader can redo — which is the entire standard this
+          // block is held to.
+          atReadingUnits: anchorEcon.revenueAtRead,
           unitDecimals: USDC_TOKEN_DECIMALS,
         },
       },
@@ -1155,6 +1174,25 @@ export function createApp(options: AppOptions = {}) {
       payTo: options.sellerPayTo ?? readEnv('SELLER_PAY_TO'),
       baseUrl: options.facilitatorUrl ?? readEnv('FACILITATOR_URL'),
     });
+  }
+
+  /**
+   * How much of the durable revenue tally is money the checked address holds.
+   *
+   * The comparison in `unitScaleProblem` is between two balances of one address
+   * and a count of payments, and the count only belongs in it if those payments
+   * landed at that address. On the deployed world they do: the live 402 quote read
+   * on 2026-09-25 names `payTo` 0x42e60b67…, which is the same account
+   * `digestSigner()` derives, so a settled sale raises `balanceOf` under the feet
+   * of a rule that would otherwise call that a moved scale. A deployment that
+   * points `SELLER_PAY_TO` somewhere else gets `'0'` here, which is the honest
+   * answer — its revenue is real, it just is not this balance's business.
+   */
+  function revenuePaidToSigner(): string {
+    const signer = digestSigner();
+    const tier = dataTier();
+    if (!signer || !tier || tier.payTo !== signer.toLowerCase()) return '0';
+    return anchorEcon.revenueUnits;
   }
 
   /**
@@ -1455,11 +1493,13 @@ export function createApp(options: AppOptions = {}) {
    * Read what the anchor costs and what it is funded with, and file the answer.
    *
    * Called once per confirmed day. That schedule is the whole design: it is the
-   * only moment a measured cost exists to divide a balance by, it is two reads a
-   * day against an account that moves about once a day, and it is on a path that
-   * has already committed the day — so nothing here can delay or damage a
-   * commitment, and every failure path ends in a counter plus a `/health` field
-   * that says how old its numbers are.
+   * only moment a measured cost exists to divide a balance by, it is two reads per
+   * anchored day — and an anchored day was measured 79 min 58 s to 86 min 54 s
+   * apart over thirteen consecutive closes ending 2026-09-25 — against an account
+   * that moves about once a day, and it is on a path that has already committed
+   * the day — so nothing here can delay or damage a commitment, and every failure
+   * path ends in a counter plus a `/health` field that says how old its numbers
+   * are.
    *
    * Two failures, answered differently on purpose. A node that *refuses* — an error
    * answer, a dead endpoint, a reverted call — changes nothing but the counter, so
@@ -1511,7 +1551,12 @@ export function createApp(options: AppOptions = {}) {
       options.health?.note('anchor_econ_unreadable', err);
       return;
     }
-    const scale = unitScaleProblem(balanceUnits, tokenUnits);
+    // Taken after the awaits rather than passed in, because the instant that
+    // matters is the one the balances were read at: a sale that settles during the
+    // two RPC calls would otherwise be counted here and not on chain, and the
+    // comparison below is only true of a single instant. See `revenueAtRead`.
+    const revenueAtRead = revenuePaidToSigner();
+    const scale = unitScaleProblem(balanceUnits, tokenUnits, revenueAtRead);
     if (scale) {
       // Every quantity in `/health` below is converted across that ratio, so a
       // mismatch gets its own signal instead of being absorbed: the runway number
@@ -1524,6 +1569,7 @@ export function createApp(options: AppOptions = {}) {
       at: Date.now(),
       balanceUnits,
       tokenUnits,
+      revenueAtRead,
       costUnits: cost?.units ?? anchorEcon.costUnits,
       costDay: cost ? day : anchorEcon.costDay,
     };
@@ -2769,7 +2815,13 @@ export function createApp(options: AppOptions = {}) {
         if (problem) {
           console.error(`stored anchor economics refused: ${problem}`);
           options.health?.note('anchor_econ_rejected', problem);
-        } else anchorEcon = s.anchor;
+        } else {
+          // A ledger written before `revenueAtRead` existed loads with the third
+          // term unknown rather than zero. That reading did record two balances, and
+          // the build that took it compared them without any revenue term at all, so
+          // whatever tally was true then is not nothing the stored pair can say.
+          anchorEcon = { ...s.anchor, revenueAtRead: s.anchor.revenueAtRead ?? null };
+        }
       }
     })();
     return hydrated;
