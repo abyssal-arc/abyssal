@@ -914,6 +914,15 @@ probed 2026-09-25 — the paid historical-data route settled in USDC, the free
 social layer, six languages, and the Durable Object tank ticking on a one-minute
 Cron Trigger with zero viewers.
 
+What earns the words *live in production* here: every client file the edge serves is
+compared byte for byte against the working tree — one sha256 per file, the list read
+out of CI's own file list rather than typed. The comparison exists because it was
+needed. The previous deploy was created 2026-09-25T09:08:42Z; this page's own code
+commit is from 16:35Z the same day. Five commits and seven hours and 27 minutes of
+pushed work, one of them a file the browser had never received, sat in that gap, and
+no line anywhere said so. Pushed is not deployed, and a status section that cannot
+tell the two apart is a list of intentions.
+
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
 anybody can recompute, and `GET /history/census` serves the book of those days —
