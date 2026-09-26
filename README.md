@@ -976,10 +976,12 @@ reading its two newest rows (day 63, 373 bytes, `0xdd6e40d2…`; day 64, 374 byt
 the route serves, landing on the hash printed beside them. A cap that is only correct in a
 test run is a cap that will be wrong in production while looking right here. Every docs
 commit that records these readings changed no served byte — the twelve-file comparison
-against the working tree was re-run after each and came back twelve `same` (CI #73, #74
-and #75, all `success`) — and each was deployed anyway, the last of them at 11:41:04Z as
-`20327c00`, so that "what is live" and "what `main` says is live" are the same artifact
-rather than two claims that have to be reconciled later.
+against the working tree was re-run after each and came back twelve `same`, with CI
+`success` on each sha — and each was deployed anyway, so that "what is live" and "what
+`main` says is live" are the same artifact rather than two claims that have to be
+reconciled later. No version id is quoted for that reason: the last one I deployed has
+already been superseded by the commit describing it, and a sentence that goes stale by
+being correct is a sentence that should not carry a number.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
