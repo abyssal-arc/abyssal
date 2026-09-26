@@ -219,7 +219,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (362 total)
+npm test           # sim + server + web tests (374 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -673,7 +673,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/history` | Per-tick stats for charts: `?window=<n>` sets the depth (default and max 2000), `?slots=<n>` decimates server-side to the chart's point budget |
 | GET | `/history/pulse` | Time-travel for the OBSERVE pulse: `?range=1h\|24h` returns re-bucketed USDC volume columns |
 | GET | `/history/census` | The day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; `?days=<n>` for the newest n. The in-progress day carries `committed: false`. The answer carries the storage `cap` and, beside it, `rules`: the hash rule table keyed by version, so a row's `v` says which entry recomputes its `hash` and a reader needs no build of ours to check one. `coverage.first` is where a truncated book admits where it starts |
-| GET | `/verify?tx=0x…` | Recompute an anchored day straight off the chain: read the transaction's calldata and its receipt from the node, rebuild the pre-image under the rule the row's `v` names, and return one of seven verdicts — `verified` (the bytes are intact; a reverted receipt still verifies the record it carries, and the revert is reported beside it), `mismatch`, `uncheckable` (a rule this build never published — a fact about the build, not the day), `pending`, `not-found` (a node that answered "no such transaction" — evidence), `unreadable`, or `unknown` (a node that did not answer at all — not evidence, and never folded into `not-found`). The status is the verdict: 200 for a confirmed check (`s-maxage=60`, a confirmed transaction's calldata can never change), 409 a mismatch, 404 a not-found, 202 a pending (`no-store`, the next second may be the answer), 502 an unknown. Every answer publishes what it was computed against — chain id, the endpoint asked, whether the chain answered, the signer, the whole rule table, the book's cap and coverage, and a do-it-yourself sentence that reduces the trust to `sha256sum` |
+| GET | `/verify?tx=0x…` | Recompute an anchored day straight off the chain: read the transaction's calldata and its receipt from the node, rebuild the pre-image under the rule the row's `v` names, and return one of seven verdicts — `verified` (the bytes are intact; a reverted receipt still verifies the record it carries, and the revert is reported beside it), `mismatch`, `uncheckable` (a rule this build never published — a fact about the build, not the day), `pending`, `not-found` (a node that answered "no such transaction" — evidence), `unreadable`, or `unknown` (a node that did not answer at all — not evidence, and never folded into `not-found`). The status is the verdict: 200 for a confirmed check (`s-maxage=60`, a confirmed transaction's calldata can never change), 409 a mismatch, 404 a not-found, 202 a pending (`no-store`, the next second may be the answer), 502 an unknown. Every answer publishes what it was computed against — chain id, the endpoint asked, whether the chain answered, the signer, the whole rule table, the book's cap and coverage, and a do-it-yourself sentence that reduces the trust to `sha256sum`. The day-book widget on a stamped row reads from it: the `Verify independently` button, the ten-state projection in `packages/web/src/verify.js`, and the seven verdicts the browser paints |
 | GET | `/judgments` | Cull records, each tagged `type: "harvest" \| "judgment"`; filter with `?type=` |
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
@@ -827,8 +827,8 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-362 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-26T14:34:35Z: 59 + 210 + 93,
+374 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-26T18:15:55Z: 59 + 210 + 105,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
@@ -841,46 +841,66 @@ and the one row CI never runs is named in the log rather than missing in silence
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
 | `@abyssal/server` | 210 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say"), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, the bytes each of those fields costs against its own row and the footprint of a book filled to the cap it derives, the size published at every point the stored array changes and the watermark that fires once when the book outgrows its share, a legacy row that is named once because the name is saved with it, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept; and the seven-verdict `/verify` recomputation — that a chain which did not answer is `unknown` and never the evidence-bearing `not-found`, that any transaction is not assumed to be ours, that a reverted receipt still verifies the record it carries, that the row comparison checks the fields and not only the hash, that an unpublished rule is called `uncheckable` rather than corrupt and a real mismatch never softened into it, that a mismatch is a 409 and a pending is never cached, and that the outage `unknown` reports is counted once per failure and cleared on the first answer |
-| `@abyssal/web` | 93 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
+| `@abyssal/web` | 105 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the ten-state `/verify` widget on a stamped row and a page whose pin moves off the row mid-flight (the panel is cleared by the pair, not the calendar: a fresh paint keeps the last verdict on a newly pinned row only when the hash still matches), the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
 against a local server, which is why `@napi-rs/canvas` is there: a canvas that
 cannot measure text cannot lay out a card. GitHub Actions
 (`.github/workflows/ci.yml`) runs four gates on Node 22: `npm run build`,
-`npm run typecheck`, an ESM syntax check over the ten client files the browser
+`npm run typecheck`, an ESM syntax check over the eleven client files the browser
 loads, and `npm test`. The syntax gate exists because the client is
 dependency-free ES modules — a stray top-level await should fail in CI rather
 than in a browser — and it lists those files by name, so a web test asserts the
-list still matches the files on disk in both directions: an eleventh file that no gate
+list still matches the files on disk in both directions: a twelfth file that no gate
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 313 hand-written single-line mutations of
+runs negative verification: a battery of 331 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-313 of 313 in one pass, over 44 minutes 12 seconds read off the battery's own
-per-row stamps (13:14:54Z to 13:59:06Z, 313 rows), 0 missed and 0 without a verdict,
+331 of 331 in one pass, over 41 minutes 55 seconds read off the battery's own
+per-row stamps (17:23:37Z to 18:05:32Z, 331 rows), 0 missed and 0 without a verdict,
 and that run is the final tree — no verdict here is inherited from a state a later
-edit had already changed. The battery grew to 313 rows with ten mutants this batch
-(M303–M312), all aimed at the seven `/verify` verdicts rather than re-pinnings: an
-unreached chain reported as the evidence-bearing `not-found` (M303), any transaction
-assumed to be ours (M304), a reverted receipt read as confirmed (M305), a row
-comparison checking only the hash and not the fields (M306), an unknown rule claimed
-to be known (M307) and a real mismatch softened to `uncheckable` (M308), a mismatch
-served as a green 200 (M309) and a pending verification cached as if final (M310),
-and the outage note degenerating from an edge to a level (M311) or never clearing
-after recovery (M312). Two pre-existing anchors, M162 and M279, were re-pinned — not
-because they broke but because this batch introduced a second line identical to the
-one each quoted (`verify.ts`'s `rpcObject` throws what the balance reader throws, and
-the `/verify` context publishes `rules:` at an indent the 8-space census anchor
-substring-matched), and a mutant that anchors twice is skipped rather than judged.
-`--check` reads 313/313 anchors pointing at exactly one line each. The pass before
-it — the day-book-bytes batch — caught 303 of 303 over 55 minutes 23 seconds
+edit had already changed. The battery grew to 331 with eighteen mutants this batch
+(M313–M330), all aimed at the `/verify` widget rather than the endpoint under it:
+`not-found` folding into `unknown` on the client (M313), `uncheckable` sharing the
+mismatch headline (M314), the reverted note either never firing (M315) or folded
+into the headline state (M316), the pre-image dropped from the technical block
+(M317), a disagreement showing chain-side twice (M318), loading reporting the
+confident headline (M319), a client-side fetch failure reading as a chain verdict
+(M320) and losing its explorer link (M321), and an unrecognised body read as
+verified (M322). Six are on the wiring: the button never offered (M323), the
+button carrying the digest hash instead of the transaction hash (M324), the click
+listener bound to the canvas instead of the pin (M325), the fetch never rendering
+its answer back into the panel (M326), the paint guard reduced to `if
+(!verifyState)` so a stale verdict stays beside a newly pinned row (M327), and
+`paintCensus` losing its fourth call (M328). Two are in the dictionary:
+`verifyCheck` missing from Korean (M329) and `verifyReverted` dropped from the
+shared key set (M330). One pre-existing anchor, M243, was re-pinned — not because
+it broke but because the fourth step in `paintCensus` moved the closing brace its
+3-line anchor quoted, and a mutant that anchors nowhere is skipped rather than
+judged; the preflight caught it in under a second, which is exactly what
+`--check` exists for. `--check` reads 331/331 anchors pointing at exactly one line
+each. The pass before it — the `/verify` endpoint's own batch, seven verdicts and
+all server-side — grew the battery to 313 with ten mutants (M303–M312): an
+unreached chain reported as the evidence-bearing `not-found` (M303), any
+transaction assumed to be ours (M304), a reverted receipt read as confirmed
+(M305), a row comparison checking only the hash and not the fields (M306), an
+unknown rule claimed to be known (M307) and a real mismatch softened to
+`uncheckable` (M308), a mismatch served as a green 200 (M309) and a pending
+verification cached as if final (M310), and the outage note degenerating from an
+edge to a level (M311) or never clearing after recovery (M312); two pre-existing
+anchors, M162 and M279, were re-pinned because that batch introduced a second line
+identical to the one each quoted (`verify.ts`'s `rpcObject` throws what the balance
+reader throws, and the `/verify` context publishes `rules:` at an indent the
+8-space census anchor substring-matched). That pass ran 313/313 over 44 minutes 12
+seconds (13:14:54Z to 13:59:06Z). And the pass before that one — the
+day-book-bytes batch — caught 303 of 303 over 55 minutes 23 seconds
 (06:32:25Z to 07:27:48Z), grew to 303 with ten mutants (M293–M302, two of them
 re-pinnings: M293 restoring the width that batch falsified, M284's target the
 fixture-cap arithmetic that replaced the old literal), and after its pass four
