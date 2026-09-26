@@ -957,10 +957,12 @@ tell the two apart is a list of intentions.
 
 Deploying a changed *derivation* is the case where that distinction has teeth, so the
 first reading after a deploy is taken from the service rather than from the local
-suite. `bfb7fbf` went out as version `b1872afc` at 08:42:07Z and CI #72 came back
-`success` on that sha at 08:41:10Z; `/health` answered at 08:44:32Z from an isolate
-whose `isolateStartedAt` equalled its own `serverTime` — a cold start on the new code —
-and published `census: {days: 36, cap: 349, bytes: 13355, maxRowBytes: 374, budget:
+suite. `bfb7fbf` went out as version `b1872afc` at 08:42:05Z (the deployment list's own
+timestamp for it) and CI #72 came back `success` on that sha at 08:41:10Z; `/health`
+answered two minutes later, at 08:44:32Z, from an isolate that had itself just begun —
+and the code it was running is not inferred from that, it is read off the answer: `cap:
+349` is a number only this build derives, and `census.bytes` is a field only this build
+writes. It published `census: {days: 36, cap: 349, bytes: 13355, maxRowBytes: 374, budget:
 131072}`, `healthy: true`, no `census_past_budget` and no `census_days_dropped`, with
 `census_rule_backfilled` still counting one: the repair fired once, on 04:53:30Z, and a
 fresh isolate that relabelled anything would have moved that number. The same 36 rows
@@ -968,7 +970,12 @@ were then re-added up outside the worker — `13,318` bytes of rows plus 35 comm
 brackets is `13,355`, the figure the route claimed — and the book's newest row (day 62,
 370 bytes, `0x91114ee5…`) was re-hashed from its own published `v` and the `rules` table
 the route serves, landing on the hash printed beside it. A cap that is only correct in a
-test run is a cap that will be wrong in production while looking right here.
+test run is a cap that will be wrong in production while looking right here. The docs
+commit that records this reading (`5218d84`, CI #73 `success`) changed no served byte —
+the twelve-file byte comparison against the working tree was re-run after it and came
+back twelve `same` — and was itself deployed anyway, at 08:58:15Z as `079d0b9f`, so that
+"what is live" and "what `main` says is live" are the same artifact rather than two
+claims that have to be reconciled later.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
