@@ -271,6 +271,39 @@ const addressPayload = (addr) => {
 };
 
 /**
+ * A `/verify` response shaped the way the route shapes it. Written out and not
+ * assembled by an imported helper — a fixture a module builds can agree with a
+ * buggy module no matter how wrong both are, which is the failure this whole
+ * harness exists to prevent. `verified` for the default: the fixture is a body
+ * a boot test can render *without* asserting anything about the seven verdicts
+ * (the data-layer test does that directly against `verifyView`), and a page that
+ * boots a mismatch chip no test asked for is a page a mutation can hide behind.
+ *
+ * The shape follows `TxCheck` in `packages/server/src/verify.ts` field by field;
+ * the numbers are the day 66 anchor this project has live proof of, so a reader
+ * comparing the fixture against `curl /verify?tx=0x655815…` sees the same bytes.
+ */
+export const verifiedResponse = (txHash) => ({
+  txHash,
+  txFound: true,
+  chain: { from: '0x42e60b67b525dd029d5d5c4e747fe27595023c15', to: '0x42e60b67b525dd029d5d5c4e747fe27595023c15', blockNumber: '22866530', ours: true, payloadHexLength: 472 },
+  receipt: { status: 'confirmed', blockNumber: '22866530', blockHash: '0x' + 'c1'.repeat(32), feeUnits: '615060000000000', gasUsed: '30600', gasPrice: '20100000000' },
+  found: 'on-chain',
+  payload: { v: 1, day: 4, hash: 'ab'.repeat(32), ts: 1700000344000, fields: { v: 1, day: 4 } },
+  decodeProblem: null,
+  ruleKnown: true,
+  hashOutcome: 'verified',
+  hashProblem: null,
+  preImage: 'abyssal-day-digest|1|4|76800|6|340|128|60|24|APE:7',
+  book: null,
+  rowAgreement: 'same',
+  disagreements: [],
+  verdict: 'verified',
+  problem: null,
+  context: { chainId: 5042, rpc: 'https://verify.test', chainAnswered: true, signer: '0x42E60B67b525DD029D5d5c4E747fE27595023C15', rules: { 1: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'] }, book: { cap: 349, days: 4, coverage: { first: 0, last: 4 } }, doItYourself: 'GET /history/census …' },
+});
+
+/**
  * Boot one page against one in-process server.
  *
  * @param {object} [opts]
@@ -281,12 +314,17 @@ const addressPayload = (addr) => {
  * @param {object} [opts.standing] a previous `/who` row already in this browser's memory
  * @param {object|null} [opts.digestChain] the anchor record to put in `/snapshot`'s state;
  *   absent leaves the fixture as the other tests expect it, `null` is "no record"
+ * @param {object|'fail'} [opts.verify] what `/verify` should answer: a payload to
+ *   serve verbatim, `'fail'` to make the fetch reject (the socket is destroyed
+ *   before a byte comes back), or absent for the canonical `verified` body. The
+ *   route is served in every boot, so a test that never clicks the button still
+ *   sees `reqs.verify === 0` rather than an unmatched path returning `{}`.
  * @returns the page, its canvases, what it asked the server for, what the visitor
  *   copied, and a `close()` that has to be called or the process never exits
  */
 let stageTaken = false;
 
-export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain } = {}) {
+export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain, verify } = {}) {
   // One page per process, and the reason is measured rather than suspected:
   // `app.js` is evaluated once and the ESM cache never evaluates it again, so a
   // second `boot()` hands back a DOM nothing is driving. Checked on this harness —
@@ -305,10 +343,23 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   const servedSnapshot = digestChain === undefined
     ? snapshot
     : { ...snapshot, state: { ...snapshot.state, digestChain } };
-  const reqs = { census: 0, observe: 0 };
+  const reqs = { census: 0, observe: 0, verify: 0 };
   const server = createServer((req, res) => {
     const path = req.url?.split('?')[0] ?? '/';
     res.setHeader('content-type', 'application/json');
+    if (path === '/verify') {
+      // Every branch counts the request before deciding what to do with it, so a
+      // test can assert not just *what* the panel says but that the reader's click
+      // actually reached the wire — a mutation that drops the fetch and short-
+      // circuits to `verified` locally otherwise looks identical in the DOM.
+      reqs.verify++;
+      const qs = new URLSearchParams(req.url?.split('?')[1] ?? '');
+      const tx = qs.get('tx') ?? '';
+      if (verify === 'fail') { req.socket.destroy(); return; }
+      const body = verify === null || verify === undefined ? verifiedResponse(tx) : verify;
+      res.end(JSON.stringify(body));
+      return;
+    }
     if (path === '/snapshot') res.end(JSON.stringify(servedSnapshot));
     else if (path === '/history') res.end(JSON.stringify({ stats: [] }));
     else if (path === '/history/census') { reqs.census++; res.end(JSON.stringify(served)); }

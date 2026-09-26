@@ -264,6 +264,11 @@
           </div>
           <canvas id="census"></canvas>
           <div id="census-pin" hidden></div>
+          <!-- The independent recomputation of the pinned day, filled only once the
+               reader asks for it. Hidden by default rather than showing a grey
+               chip: an untouched panel is "nobody checked", which is neither of the
+               seven verdicts the panel itself can report. -->
+          <div id="census-verify" hidden></div>
           <div id="census-trends" class="census-rows"></div>
           <div id="census-events" class="census-rows"></div>
           <!-- What closed since this browser last looked. Absent until there is a

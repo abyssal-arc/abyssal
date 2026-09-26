@@ -35,4 +35,5 @@ jobs:
           node --input-type=module --check < packages/web/src/worldsince.js
           node --input-type=module --check < packages/web/src/observe.js
           node --input-type=module --check < packages/web/src/anchor.js
+          node --input-type=module --check < packages/web/src/verify.js
       - run: npm test

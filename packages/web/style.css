@@ -946,6 +946,53 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
    than as a sentence: no link is the answer to "is this on chain yet?". */
 #census-pin a { color: var(--accent); text-decoration: none; border-bottom: 1px solid transparent; }
 #census-pin a:hover { border-bottom-color: var(--accent); }
+/* The independent-verification button is written as a button and made to look
+   like the link it stands beside, not the other way around: it triggers a fetch
+   and repaints this page (it does not navigate), so a keyboard-activated `<a
+   href="#">` would lie about what happens next. Making it visually a sibling of
+   the explorer link keeps "two affordances, one sentence" readable, and `border:
+   none; background: transparent` is what keeps a UA box from breaking the line. */
+#census-pin .census-verify-btn {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+#census-pin .census-verify-btn:hover { border-bottom-color: var(--accent); }
+/* What the site concluded about the pinned day's transaction, in the site's own
+   words. The block is hidden until the reader asks for it, so an author-level
+   `display: flex` needs the `[hidden]` restatement — same reason as the worldsince
+   card below, and the same failure mode if it is dropped. */
+#census-verify {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: calc(var(--sp));
+  font-size: 10px;
+  color: var(--fg-2);
+}
+#census-verify[hidden] { display: none; }
+#census-verify .verify-head { font-family: var(--font-display); font-weight: 600; }
+#census-verify.verify-ok .verify-head { color: var(--accent); }
+#census-verify.verify-bad .verify-head { color: var(--danger); }
+#census-verify.verify-warn .verify-head { color: var(--amber); }
+#census-verify.verify-pending .verify-head { color: var(--fg-3); font-style: italic; }
+#census-verify .verify-note { color: var(--amber); }
+/* The server's own numbers and words: block height, chain id, the pre-image a
+   reader can pipe into `sha256sum`, the field-level disagreements, the
+   route's `problem` sentence. Monospace and one shade quieter than the
+   headline because these are artefacts of the check, not the check's conclusion. */
+#census-verify .verify-tech {
+  font-family: monospace;
+  color: var(--fg-3);
+  overflow-wrap: anywhere;
+}
+#census-verify .verify-tech a { color: var(--fg-3); text-decoration: underline; }
 /* What closed since this browser last looked, kept apart from the day list above
    it because it speaks about a stretch of time rather than about a day. The
    `[hidden]` restatement is load-bearing, not decoration: an author-level

@@ -33,6 +33,7 @@ import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js'
 import { diffWorld, worldSeed } from './src/worldsince.js';
 import { anchorLabel } from './src/anchor.js';
 import { venueCoverageNotes } from './src/observe.js';
+import { verifyView } from './src/verify.js';
 
 initI18n();
 
@@ -3703,6 +3704,29 @@ censusCanvas.addEventListener('click', () => {
   paintCensus();
 });
 
+// One listener for a button that has not been built yet. `pinCensus` rewrites the
+// container's innerHTML every repaint, so a listener bound to the button would
+// need rebinding on every repaint and one forgotten rebind shows up as a click
+// that does nothing on the *second* day the reader pins. Delegating on the
+// container is the same one line either way, and the mutation battery already
+// knows that removing a `renderVerify()` is a fail — this is the other half of
+// that pair, and a listener wired to the wrong node is a whole feature gone.
+{
+  const pinEl = document.getElementById('census-pin');
+  pinEl?.addEventListener('click', (ev) => {
+    // Duck-typed rather than `ev.target instanceof Element`: in the browser the
+    // constructor check reads better, but the test harness evaluates this module
+    // as a Node one and only copies a subset of `window`'s globals onto
+    // `globalThis`, so `Element` is undefined and a strict `instanceof` throws
+    // before the callback can do anything. Text nodes have no `closest` and
+    // short-circuit here for the same price.
+    const btn = typeof ev.target?.closest === 'function' ? ev.target.closest('button[data-verify]') : null;
+    if (!btn) return;
+    const hash = btn.getAttribute('data-verify');
+    if (typeof hash === 'string' && hash) runVerify(hash);
+  });
+}
+
 /**
  * The same book in words, because a stacked area cannot answer "is anything
  * dying?" — it shows total height, and a species going extinct inside a growing
@@ -3751,6 +3775,21 @@ function renderCensusText() {
 }
 
 /**
+ * The pinned day's independent recomputation, held here rather than on the DOM
+ * because a repaint has to be able to redraw it without refetching, and the
+ * fetch itself takes longer than any one paint. `null` means "the reader has not
+ * asked about this row", which is neither `loading` nor any of the seven verdicts
+ * the panel can display — the container has to stay hidden rather than show a
+ * grey chip that would read as "checked, nothing wrong".
+ *
+ * Bound to the `txHash` we asked about, not to the day: two days can pin the same
+ * hash (a retry reuses its payload by design), and a stale verdict about a
+ * different transaction is a lie about the row now on screen. That is why the
+ * clear in `renderVerify` compares hashes rather than days.
+ */
+let verifyState = null;
+
+/**
  * The pinned day in words, so that a shared `?day=` states what it points at
  * rather than leaving it as a pixel a viewer has to hover to discover. When the
  * day is real but outside the window we fetched, it says that too: an absent row
@@ -3775,10 +3814,93 @@ function pinCensus(day, row) {
     return;
   }
   const words = t('censusPin', { day: row.day, pop: row.population, hash: row.hash.slice(0, 12) });
+  // Two affordances, on purpose: the explorer link is the chain's own page for
+  // this record, and the button is *our* recomputation of it from that record.
+  // A reader who trusts neither still has both to compare, and a reader whose
+  // browser cannot reach the explorer sees the button remain usable.
   el.innerHTML = row.txHash
     ? `${esc(words)} · <a href="${esc(explorerTxUrl + row.txHash)}" title="${esc(row.txHash)}" `
       + `target="_blank" rel="noopener">${esc(t('txVerify'))}</a>`
+      + ` · <button type="button" class="census-verify-btn" data-verify="${esc(row.txHash)}">${esc(t('verifyCheck'))}</button>`
     : esc(words);
+}
+
+/**
+ * Ask the site's own `/verify` route about a transaction and put the answer in
+ * `verifyState`, whichever of the three channels it arrives on: a body, a
+ * rejected fetch, or a body the widget cannot name a verdict for. Each of the
+ * three has to be distinguishable in the UI because each has a different fix —
+ * a chain that returned nothing, a browser that could not reach the site, and a
+ * build whose shape this client does not know are not the same bug.
+ *
+ * Called from a click handler, so the returned promise is intentionally dropped:
+ * nothing on the page waits for this, and a rejection here would go out through
+ * the harness's `unhandledRejection` channel as a boot error rather than to the
+ * reader, who has already seen the button.
+ */
+function runVerify(txHash) {
+  verifyState = { txHash, phase: 'loading', res: null, error: null };
+  renderVerify();
+  fetch(`/verify?tx=${encodeURIComponent(txHash)}`)
+    .then(async (r) => {
+      // A non-2xx still carries a body the route shaped on purpose (`400`, `404`,
+      // `409` and `502` all return one), and the verdict inside that body is what
+      // the reader needs — treating a `404` as a client failure would replace
+      // "no such transaction on the chain" with "we could not ask", which is the
+      // exact collapse `verify.js` is written to keep apart.
+      let res = null;
+      try { res = await r.json(); } catch { res = null; }
+      verifyState = { txHash, phase: 'done', res, error: null };
+    })
+    .catch((error) => {
+      verifyState = { txHash, phase: 'error', res: null, error };
+    })
+    .finally(() => renderVerify());
+}
+
+/**
+ * The panel beside the pinned day. Called from `paintCensus` (so a repaint after
+ * a fresh book redrew the same verdict without refetching), from `runVerify` (so
+ * a click is acknowledged immediately and again when the answer lands), and from
+ * nowhere else — the state is deliberately the only source of what the reader
+ * sees, so a mutation that removes a `renderVerify()` shows up as an empty panel
+ * rather than as an out-of-date one.
+ */
+function renderVerify() {
+  const el = document.getElementById('census-verify');
+  if (!el) return;
+  const pinnedRow = censusRows.find((r) => r.day === censusPinnedDay) ?? null;
+  const pinnedHash = pinnedRow?.txHash ?? null;
+  // Three ways the panel should not speak: no day is pinned, the pinned day was
+  // never on chain, or the verdict we hold is about a different transaction than
+  // the row now on screen. All three clear it rather than leave the last answer
+  // up — a stale green chip is the specific lie this file exists not to tell.
+  if (!verifyState || !pinnedHash || verifyState.txHash !== pinnedHash) {
+    el.hidden = true;
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  const view = verifyView(verifyState.res, {
+    loading: verifyState.phase === 'loading',
+    fetchFailed: verifyState.phase === 'error',
+    txHash: pinnedHash,
+    explorerTxUrl,
+    error: verifyState.error,
+  });
+  el.hidden = false;
+  el.className = view.cls;
+  el.setAttribute('data-state', view.state);
+  const head = `<div class="verify-head">${esc(t(view.headlineKey))}</div>`;
+  const notes = view.notes.map((n) => `<div class="verify-note">${esc(t(n.key))}</div>`).join('');
+  const tech = view.tech.map((line) => `<div class="verify-tech">${esc(line)}</div>`).join('');
+  // The link lives inside the technical block, not beside the headline: the
+  // headline is what the site concluded, and the explorer is the reader's way to
+  // check that conclusion. Same bytes, different trust level, so same visual tier.
+  const link = view.link
+    ? `<div class="verify-tech"><a href="${esc(view.link.href)}" title="${esc(view.link.title)}" target="_blank" rel="noopener">${esc(view.link.title)}</a></div>`
+    : '';
+  el.innerHTML = head + notes + tech + link;
 }
 
 /**
@@ -3901,6 +4023,11 @@ function paintCensus() {
   // Third on purpose: the memory is read off `censusData`, so it has to be drawn
   // after the book it describes, from the same rows the chart just used.
   renderWorldSince();
+  // Fourth: the verdict beside the pinned day is a fourth view of the same rows,
+  // and it has to be repainted when the pin changes (a hash that no longer
+  // matches clears the panel), when the book changes (a row newly gains its
+  // `txHash`), and never from a path that would refetch behind the reader's back.
+  renderVerify();
 }
 
 // The boot fetch sits here rather than beside `pollAux()` where the other pollers
