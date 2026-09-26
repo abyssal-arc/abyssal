@@ -12,9 +12,13 @@
  * about 2^16 — tens of thousands of candidate worlds, an afternoon on a laptop.
  * A number that cheap to collide is not a commitment, and the entire purpose of
  * broadcasting this to a blockchain is to make the value expensive to deny.
- * Nothing had been anchored when this changed (the signing key has never been
- * configured in any environment), so version 1 of the rule is the only rule
- * there is and no previously published digest is invalidated by it.
+ * Nothing had been anchored when the FNV-1a digest was replaced, so version 1 is
+ * the only rule this project has ever published — and that sentence now describes
+ * real records rather than a hypothetical: thirty-one days are on Arc under rule 1
+ * (thirty of them pointed at by a row of the day book), each re-hashed from the
+ * outside and matching. That is precisely why the table above exists: the rule can
+ * only ever be added to, because a number already on a public chain cannot be
+ * re-hashed and must not be re-interpreted.
  *
  * Every field in the hash pre-image also ships in the payload, and the field
  * list is published as `DIGEST_HASH_FIELDS`. The old code hashed `world.tick`
@@ -211,15 +215,25 @@ export async function sha256Hex(text: string): Promise<string> {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export async function digestHash(stats: DigestStats): Promise<string> {
-  const pre = digestPreImage({ v: DIGEST_V, ...stats });
-  // Unreachable by construction: `DIGEST_V` is typed as a key of the rule table,
-  // and the test "every field the payload publishes is inside the commitment"
-  // asserts that the current rule's names are exactly the fields a payload this
-  // build produces carries. That leaves this branch open only for a rule grown
-  // without growing the stats — and refusing there is right, because the
-  // alternative is hashing a hole into a commitment on a public chain.
-  if ('problem' in pre) throw new Error(`the current digest rule is not satisfiable: ${pre.problem}`);
+/**
+ * The hash of a day *under the rule that day names*.
+ *
+ * The version arrives as part of the argument instead of being read off this
+ * build, for the reason the whole batch exists: a function that takes a stored
+ * row and hashes it with whatever rule the newest build happens to use is how an
+ * honest on-chain record gets called corrupt. Callers previewing a commitment not
+ * yet made say `DIGEST_V` out loud; callers reading a row pass the row, which
+ * carries its own answer.
+ */
+export async function digestHash(stats: DigestStats & { v: number }): Promise<string> {
+  const pre = digestPreImage(stats);
+  // Reachable in exactly one way: a payload naming a version this build has no
+  // rule for. Throwing is still right here, because the alternative is hashing a
+  // hole into a commitment on a public chain — and this is not where that case is
+  // *answered*: `verifyPayload` turns the same problem into `uncheckable`, which
+  // is what a reader of the route needs. A caller that has to ask which of the two
+  // applies is calling the wrong function.
+  if ('problem' in pre) throw new Error(`no rule to hash a v=${String(stats.v)} payload with: ${pre.problem}`);
   return sha256Hex(pre.preImage);
 }
 
@@ -309,7 +323,22 @@ export function encodeDigest(p: DigestPayload): `0x${string}` {
  * the headcounts as our report of the same tick, which is exactly what they are.
  */
 export interface CensusDay extends DigestStats {
-  /** The commitment made for this day: `digestHash({ v: DIGEST_V, ...stats })`. */
+  /**
+   * Which rule hashed this row — a key of `DIGEST_RULES`, and the same number the
+   * pre-image carries as its second field.
+   *
+   * The row has to name it because the row outlives the build. `hashed` on the
+   * route is whichever rule *this* build was compiled with, so a book served by a
+   * later build would tell a reader to re-hash a day-30 row with the day-60 rule
+   * and report the honest record as corrupt — the exact failure the three-way
+   * verdict in `verifyPayload` was written against, one layer down. With the
+   * version on the row, the answer to "how was this made" is in the record.
+   *
+   * Rows written before this field existed carry no `v` in storage; `nameRowRule`
+   * gives them one on the way in, and says there why the answer is 1.
+   */
+  v: number;
+  /** The commitment made for this day: `digestHash({ v: row.v, ...stats })`. */
   hash: string;
   /** Headcount per archetype, counted off the world the stats came from. */
   byArchetype: Record<string, number>;
@@ -366,14 +395,64 @@ export function headcountByArchetype(w: DigestWorldView): Record<string, number>
  * world that may have ticked since the numbers were taken. Handing over
  * `censusReading`'s two values is what keeps "the same reading" true in the code
  * rather than in a comment.
+ *
+ * The version is taken *from the payload* rather than from `DIGEST_V`, and that
+ * is the whole point of the third parameter being an object instead of a hash
+ * string: a row whose `v` came from the build and whose `hash` came from the
+ * payload is a row that can name the wrong rule for its own number, which is the
+ * one mistake this field exists to make impossible.
+ *
+ * Written with `v` after the spread, not before: a caller that hands over a stats
+ * object which itself carries a version (a payload, a stored row, a fixture) would
+ * otherwise have that stale number win by key order, in the one function whose job
+ * is to keep the row and the payload on the same side.
  */
 export function censusRow(
   stats: DigestStats,
   byArchetype: Record<string, number>,
-  hash: string,
-  ts: number,
+  payload: Pick<DigestPayload, 'v' | 'hash' | 'ts'>,
 ): CensusDay {
-  return { ...stats, byArchetype, hash, ts };
+  return { ...stats, v: payload.v, byArchetype, hash: payload.hash, ts: payload.ts };
+}
+
+/**
+ * The rule a row written before rows carried one was hashed under.
+ *
+ * `1`, and the reason is not that it is the only row of `DIGEST_RULES`: it is
+ * that the version is *inside* the pre-image (second field, so that a rule change
+ * cannot be silent), and the only value any build has ever put there is 1. Every
+ * row in the live book was hashed by code that wrote `v: DIGEST_V` with
+ * `DIGEST_V === 1`, which an outsider can confirm without reading this file —
+ * re-hashing all thirty stamped rows with `v: 1` reproduces all thirty hashes.
+ *
+ * So this is a repair of a missing label, not a reinterpretation of a rule: what
+ * the loader refuses to do is the same job with a row that *names* a version, and
+ * gets to keep the three-way verdict for that.
+ */
+export const LEGACY_RULE_VERSION = 1;
+
+/** What `nameRowRule` did: the row to keep, and whether it had to say anything. */
+export interface NamedRule {
+  row: CensusDay;
+  /** True when the stored row carried no `v` and this function supplied one. */
+  backfilled: boolean;
+}
+
+/**
+ * A row as storage can hold it. `CensusDay` describes what this build writes;
+ * what a cold start reads back may also be a row written by a build that had no
+ * such field, and only `nameRowRule` gets to tell those two apart.
+ */
+export type StoredRow = Omit<CensusDay, 'v'> & { v?: number };
+
+/** Give a stored row the rule its hash was made under, if it does not already name one. */
+export function nameRowRule(row: StoredRow): NamedRule {
+  // Absence is the only thing repaired. A stored `v` that is a string, or `0`, or
+  // a fraction arrives with a claim already attached, and renaming it to the
+  // legacy version would be this function inventing a rule for a record it was
+  // never told about — so it goes to `censusProblem` as found and is refused.
+  if (row.v === undefined) return { row: { ...row, v: LEGACY_RULE_VERSION } as CensusDay, backfilled: true };
+  return { row: row as CensusDay, backfilled: false };
 }
 
 /**
@@ -396,6 +475,12 @@ export function censusProblem(row: CensusDay): string | null {
   // next cold start. Shape only, not re-hashing: `verifyPayload` is the place a
   // hash is checked against its numbers, and it is run on the payload.
   if (!/^[0-9a-f]{64}$/.test(row.hash ?? '')) return 'hash is not a SHA-256 hex digest';
+  // A row that names a rule is accepted whatever that number is — a `v` this build
+  // has no rule for is `uncheckable`, not invalid, and dropping the record is how
+  // a rollback would erase history. A row whose version is not a version at all
+  // (a string, a fraction, NaN from a truncated write) cannot be looked up in the
+  // table by anyone, so it is refused here rather than served as a puzzle.
+  if (!Number.isInteger(row.v) || (row.v as number) < 1) return `v ${String(row.v)} is not a rule version`;
   if (!Number.isInteger(row.day) || row.day < 0) return `day ${String(row.day)} is not a day number`;
   if (row.population < 0 || row.totalEnergy < 0) return 'negative population or energy';
   // Cumulative counters only run one way in one world. A decrease means the
@@ -461,11 +546,14 @@ export function censusChanges(rows: readonly CensusDay[]): CensusChange[] {
  *
  * The `a day book row is as small as its comment claims` test re-measures this
  * on a real row from a real day — four archetypes alive, a 64-character digest,
- * thirteen digits of wall clock, and the 78 bytes of `,"txHash":"0x…"` that a
- * confirmed day carries — and asserts equality, so a row that grows anywhere
- * fails there instead of quietly overspending the cap below.
+ * thirteen digits of wall clock, the two digits of `v` that say which rule made
+ * that digest, and the 78 bytes of `,"txHash":"0x…"` that a confirmed day
+ * carries — and asserts equality, so a row that grows anywhere fails there
+ * instead of quietly overspending the cap below. The measurement reads 267 bytes
+ * unstamped and 345 stamped; the same test asserts the 78-byte difference
+ * separately, so growth in the body cannot hide inside a matching total.
  */
-export const CENSUS_ROW_BYTES = 339;
+export const CENSUS_ROW_BYTES = 345;
 
 /**
  * The share of the ledger value the day book is allowed to take.
@@ -479,11 +567,15 @@ export const CENSUS_BUDGET_BYTES = 128 * 1024;
 
 /**
  * Days kept in the book, derived from the two numbers above rather than picked:
- * 386 rows inside 128 KiB. That is not the long run of history it sounds like —
- * the tank advances on wall clock, four ticks a second, so a day is about 81
- * minutes and the whole book is just over three weeks of a busy world. The rate
- * is measured against the deployed tank rather than read off the interval: 3.97
- * ticks/s over a 90-second window while this was written.
+ * 379 rows inside 128 KiB. That is not the long run of history it sounds like —
+ * the anchor's own clock says a day is longer than the four-ticks-a-second
+ * arithmetic suggests, because the digest waits for the chain to confirm before
+ * the next row opens. Measured on the deployed tank, over the 29 gaps between
+ * consecutive days of a 31-day book: 79m 58s to 90m 03s, mean 82m 56s. At that
+ * mean the whole book is 21.8 days — just over three weeks of a busy world. The
+ * six bytes this batch added to a row cost seven days of that history: the cap
+ * went 386 → 379, which is what `CENSUS_CAP` being derived rather than typed is
+ * for.
  *
  * There is no byte alarm on this array, on purpose: the ledger is stored as an
  * object, so its encoded size is not a number this code can produce honestly —

@@ -6,6 +6,7 @@ import {
   mulberry32, hashSeed, mixSeed, unitNoise,
 } from '../src/geom.js';
 import { fmtUsd, shortAddr, hsla } from '../src/format.js';
+import { census } from './harness.js';
 
 test('mulberry32 is deterministic and stays in [0,1)', () => {
   const a = mulberry32(7);
@@ -404,4 +405,30 @@ test('nothing the page hides is left visible by an author-level display rule', (
   for (const [name, selectors] of styled) {
     assert.ok(pairs.has(name), `${name} is hidden and laid out by [${[...selectors].join(', ')}] with no ${name}[hidden] rule to hide it again`);
   }
+});
+
+test('the census fixture is self-consistent the way the route is required to be', () => {
+  // The server asserts this about the real response (every row names a rule, the
+  // response publishes them all). The browser's model of that response has to hold
+  // it too: a fixture that drifts from the wire turns every boot test that loads it
+  // into a reading of a transport the server does not produce, which is how a client
+  // suite stays green while the page shows visitors the wrong thing.
+  for (const row of census.rows) {
+    assert.ok(Object.hasOwn(census.rules, String(row.v)),
+      `row ${row.day} names v=${row.v}, and the fixture publishes no rule by that name`);
+    assert.deepEqual(census.rules[String(row.v)], census.hashed,
+      'every row here hashes under the field list this fixture publishes beside it');
+  }
+  // Measured off the deployed route on 2026-09-24, and the reason it is written out
+  // here rather than derived: a `today` that carries a hash, a timestamp or a version
+  // is a reading dressed as a commitment, and the page can only be blamed for
+  // rendering it as one.
+  assert.deepEqual(Object.keys(census.today).sort(), [
+    'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator',
+    'byArchetype', 'committed',
+  ].sort(), 'the live reading is the stats, the headcount and the flag — and nothing that belongs to a commitment');
+  // The cap is copied from the server rather than imported, so the arithmetic that
+  // derives it is restated here: a stamped row measures 345 bytes, the ledger gives
+  // the book 128 KiB, and a stale copy of either number fails this line.
+  assert.equal(census.cap, Math.floor((128 * 1024) / 345), 'the fixture cap is 128 KiB over the measured stamped row');
 });

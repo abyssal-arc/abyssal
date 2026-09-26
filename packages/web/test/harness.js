@@ -112,6 +112,10 @@ export const censusRow = (day, byArchetype, txHash) => ({
   died: 40 + day * 5,
   predations: 12 + day * 3,
   topPredator: 'APE:7',
+  // The rule this row's hash was made under, written as `1` and not looked up
+  // from anywhere: the browser never reads it, so the only thing it can be here
+  // is a faithful copy of what the server puts on the wire.
+  v: 1,
   byArchetype,
   hash: 'ab'.repeat(32),
   ts: 1700000000000 + day * 86400000,
@@ -121,13 +125,17 @@ export const censusRow = (day, byArchetype, txHash) => ({
 });
 
 export const census = {
-  // Mirrors the server's derived cap (128 KiB over a measured row width). Written
-  // out rather than imported because the browser has no access to the module that
-  // computes it, and nothing on this side reads it.
-  cap: 386,
+  // Mirrors the server's derived cap (128 KiB over a measured row width of 345
+  // bytes for a stamped row). Written out rather than imported because the browser
+  // has no access to the module that computes it, and nothing on this side reads it.
+  cap: 379,
   book: 4,
   coverage: { first: 0, last: 4, days: 4 },
   hashed: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
+  // Every rule the server can check, keyed by the `v` a row names — the same table
+  // the route publishes, so a fixture that drifts from the wire is a test that
+  // stops meaning anything.
+  rules: { 1: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'] },
   rows: [
     censusRow(0, { APE: 2, WHALE: 1, ALGO: 1, INSIDER: 1 }, `0x${'cc'.repeat(32)}`),
     censusRow(1, { APE: 3, WHALE: 1, ALGO: 1, INSIDER: 1 }),
@@ -139,7 +147,17 @@ export const census = {
     { day: 2, tick: 38400, population: 6, populationDelta: 0, born: 7, died: 5, predations: 3, lost: ['INSIDER'], gained: [] },
     { day: 4, tick: 76800, population: 6, populationDelta: 0, born: 14, died: 10, predations: 6, lost: [], gained: ['CRAB'] },
   ],
-  today: { ...censusRow(4, { APE: 2, WHALE: 2, ALGO: 1, CRAB: 1 }), committed: false },
+  // The live reading, shaped the way the route shapes it. Measured off
+  // `https://www.abyssal-arc.com/history/census` on 2026-09-24: `today` carries the
+  // eight hashed stats, the headcount and `committed`, and nothing that belongs to a
+  // commitment — no `hash`, no `ts`, no `v`, because nothing was committed and a row
+  // cannot name a rule for a number it never made. `censusRow` builds a *stored* row,
+  // so the three fields the route withholds are taken back out here instead of being
+  // left on the fixture for the client to invent a meaning for.
+  today: (() => {
+    const { hash: _hash, ts: _ts, v: _v, ...reading } = censusRow(4, { APE: 2, WHALE: 2, ALGO: 1, CRAB: 1 });
+    return { ...reading, committed: false };
+  })(),
 };
 
 /**

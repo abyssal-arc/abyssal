@@ -21,18 +21,19 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import {
-  buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestStats, encodeDigest, newDigestRecord,
+  buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestPreImage, digestStats, encodeDigest, newDigestRecord,
   markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
   nextDigestAction, coherenceProblem, verifyPayload, verifiesOrNull, isSettled,
   CENSUS_CAP, CENSUS_BUDGET_BYTES, CENSUS_ROW_BYTES,
   censusReading, censusRow, headcountByArchetype, type DigestWorldView,
   DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
-  DIGEST_RETRY_MS, DIGEST_RULE_TABLE, DIGEST_V, stampAnchor,
-  type CensusChange, type CensusDay, type DigestPayload, type DigestRecord,
+  DIGEST_RETRY_MS, DIGEST_RULE_TABLE, DIGEST_V, stampAnchor, nameRowRule, LEGACY_RULE_VERSION,
+  DIGEST_RULES,
+  type CensusChange, type CensusDay, type DigestPayload, type DigestRecord, type StoredRow,
 } from '../src/digest.js';
 import { BURN_SINK, DEAD_SINK, TRANSFER_TOPIC } from '../src/payments.js';
 import {
-  createHealth, healthProblem, PROBLEM_WINDOW_MS, receiptsValueBytes, SIGNAL_KINDS, staleSignals,
+  advisorySignals, ADVISORY_KINDS, createHealth, healthProblem, PROBLEM_WINDOW_MS, receiptsValueBytes, SIGNAL_KINDS, staleSignals,
   type HealthView,
 } from '../src/health.js';
 import {
@@ -1329,7 +1330,7 @@ function memStore() {
      * wrote it, which is the whole difference between a history and a session.
      */
     dayBook: () => state.dayBook,
-    seedDayBook: (rows: CensusDay[]) => { state = { ...state, dayBook: structuredClone(rows) }; },
+    seedDayBook: (rows: StoredRow[]) => { state = { ...state, dayBook: structuredClone(rows) }; },
     /** The anchor's economics, for the same reason: they are read back by a later isolate. */
     anchor: () => state.anchor,
     seedAnchor: (a: AnchorEcon) => { state = { ...state, anchor: structuredClone(a) }; },
@@ -3141,6 +3142,11 @@ const readState = async (app: ReturnType<typeof createApp>): Promise<StateWithDi
   (await (await app.fetch(new Request('http://localhost/state'))).json()) as StateWithDigest;
 
 const STATS = {
+  // Written as `1` and not `DIGEST_V`, in the file whose job is to notice a rule
+  // change: the two golden hashes below were produced by a stranger's SHA-256
+  // over a pre-image that starts `…|1|7|12345|…`, so a build that quietly hashed
+  // its own new version into them would fail here rather than disagree with chain.
+  v: 1,
   day: 7, tick: 12345, population: 44, totalEnergy: 8123,
   born: 500, died: 480, predations: 311, topPredator: 'ghast:12',
 };
@@ -3163,7 +3169,7 @@ test('the pre-image is a fixed published string, so a stranger can reproduce the
   // Positional, not serialization-dependent: a verifier who rebuilds the object
   // in a different key order must still agree.
   const shuffled = {
-    topPredator: STATS.topPredator, born: STATS.born, totalEnergy: STATS.totalEnergy,
+    topPredator: STATS.topPredator, v: STATS.v, born: STATS.born, totalEnergy: STATS.totalEnergy,
     predations: STATS.predations, died: STATS.died, population: STATS.population,
     tick: STATS.tick, day: STATS.day,
   };
@@ -3715,7 +3721,14 @@ test('the preview a viewer watches all day is the computation the anchor uses', 
   // life of the feature; both sides now call the same two functions, which is
   // the only arrangement that cannot drift back apart.
   assert.equal(state.dayAnchor.day, Math.floor(app.world.tick / state.ticksPerDay));
-  assert.equal(state.dayAnchor.digest, await digestHash(digestStats(state.dayAnchor.day, app.world)));
+  // Compared against what the pump would broadcast rather than against a second
+  // call to `digestHash`: the preview's promise is about the transaction, and the
+  // only honest way to check a promise about the future is to ask the code that
+  // produces it. This also locks the rule version on both sides — a preview that
+  // hashed under one rule and broadcast under another would agree with itself and
+  // disagree with the chain.
+  const stats = digestStats(state.dayAnchor.day, app.world);
+  assert.equal(state.dayAnchor.digest, (await buildPayload(stats, 1)).hash);
   assert.match(state.dayAnchor.digest, /^[0-9a-f]{64}$/, 'a SHA-256, not eight hex digits');
 });
 
@@ -3752,13 +3765,25 @@ test('a signal ledger counts, keeps the reason, and refuses a name nobody declar
     'a typo at a call site is a bug, not a place to lose a count',
   );
 
-  // Every declared kind has to be usable and has to reach `problem`: dropping
-  // one from the list would otherwise turn that guard back into a log line.
+  // Every declared kind has to be usable and has to reach a reader: dropping one
+  // from the list would otherwise turn that guard back into a log line. The
+  // advisory kinds reach that reader through `advisorySignals` rather than
+  // `healthProblem`, so the two have to be checked together — a kind that is
+  // counted, never alarming and not named as advisory is a number nobody
+  // publishes, which is the exact failure this module exists to remove.
   const all = createHealth(1);
   for (const kind of SIGNAL_KINDS) all.note(kind);
   assert.deepEqual(Object.keys(all.view().counts).sort(), [...SIGNAL_KINDS].sort());
   const reported = healthProblem(all.view())?.split(' ') ?? [];
-  assert.equal(reported.length, SIGNAL_KINDS.length, 'nothing is counted and then left unsaid');
+  const advised = advisorySignals(all.view());
+  assert.equal(reported.length, SIGNAL_KINDS.length - ADVISORY_KINDS.length, 'nothing is counted and then left unsaid');
+  assert.equal(advised.length, ADVISORY_KINDS.length, 'and the exempt ones are said somewhere, not nowhere');
+  assert.deepEqual(advised.map((entry) => entry.split('=')[0]).sort(), [...ADVISORY_KINDS].sort(),
+    'the advisory list is exactly the kinds exempted above, no more and no other');
+  // Every counted kind lands in exactly one list, so `problem: null` never has to
+  // be read as "the ledger is empty".
+  for (const kind of ADVISORY_KINDS) assert.ok(!reported.includes(`${kind}=1`), `${kind} is exempt and still holds the light red`);
+  assert.deepEqual(staleSignals(all.view()), [], 'a signal this fresh cannot be out of window');
 
   // A detail is capped, because this object is written to storage: an error
   // carrying a 1 MB SQL statement must not become a 1 MB health record. And the
@@ -3957,6 +3982,8 @@ type HealthBody = {
   census: { days: number; cap: number; first: number | null; last: number | null };
   /** Signals that have fired and fallen out of the window that reddens the light. */
   stale: string | null;
+  /** Counted and current, but exempt from alarming — see `ADVISORY_KINDS`. */
+  advisory: string | null;
   anchor: {
     signer: string | null;
     readAt: number;
@@ -4280,9 +4307,12 @@ type CensusBody = {
   book: number;
   coverage: { first: number; last: number; days: number } | null;
   hashed: string[];
+  rules: Record<string, readonly string[]>;
   rows: CensusDay[];
   changes: CensusChange[];
-  today: Omit<CensusDay, 'hash' | 'ts'> & { committed: boolean };
+  // `v` is omitted here because `today` has no hash and so names no rule: a
+  // reading that was never committed cannot claim it was committed under one.
+  today: Omit<CensusDay, 'hash' | 'ts' | 'v'> & { committed: boolean };
 };
 
 const readCensus = async (
@@ -4308,6 +4338,10 @@ function censusFixture(
 ): CensusDay {
   const population = sumHeads({ byArchetype });
   return {
+    // The rule this fixture claims its hash was made under. `1` is written out
+    // rather than taken from `DIGEST_V` so that a build which starts publishing a
+    // second rule cannot quietly re-label every fixture in this file.
+    v: 1,
     day,
     tick: (day + 1) * 19_200,
     population,
@@ -4343,7 +4377,10 @@ test('a closed day is written into the book and still there when it is read back
       const rec = await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
       const book = m.dayBook() ?? [];
       assert.equal(book.length, 1, 'the row and the record land in one write, so one without the other is a bug');
-      const row = book[0];
+      // Storage holds a `StoredRow`; the loader is what turns it back into a row
+      // that names its own rule, so every assertion below is about the row a later
+      // isolate would actually serve.
+      const row = nameRowRule(book[0]).row;
       assert.equal(row.day, 0, 'the day that closed');
       assert.match(row.hash, /^[0-9a-f]{64}$/, 'bare digest hex, the shape `digestHash` emits — not a `0x` tx hash');
       assert.equal(await digestHash(row), row.hash, 'the stored row is still the pre-image its hash was taken from');
@@ -4397,7 +4434,7 @@ test('the tank keeps living while its day is filed, and the day still tells one 
       });
       const book = m.dayBook() ?? [];
       assert.equal(book.length, 1, 'the day is filed');
-      const row = book[0];
+      const row = nameRowRule(book[0]).row;
       assert.equal(sumHeads(row), row.population,
         'and its headcount is the population it was counted with, not the one standing when the hash landed');
       assert.equal(await digestHash(row), row.hash, 'the row still hashes to what went on chain');
@@ -4430,9 +4467,9 @@ test('one reading answers both questions, and two readings do not', () => {
   };
   const reading = censusReading(7, w);
   assert.equal(sumHeads(reading), reading.stats.population, 'one look answers both questions');
-  assert.equal(censusProblem(censusRow(reading.stats, reading.byArchetype, 'ab'.repeat(32), 1)), null,
+  assert.equal(censusProblem(censusRow(reading.stats, reading.byArchetype, { v: 1, hash: 'ab'.repeat(32), ts: 1 })), null,
     'and the row built from it is a row the guard accepts');
-  const twice = censusRow(digestStats(7, w), headcountByArchetype(w), 'ab'.repeat(32), 1);
+  const twice = censusRow(digestStats(7, w), headcountByArchetype(w), { v: 1, hash: 'ab'.repeat(32), ts: 1 });
   assert.match(censusProblem(twice) ?? '', /is not the population/,
     'two reads of one world are the split this fixture can produce, and the guard exists for it');
 });
@@ -4496,7 +4533,7 @@ test('a day that makes it on chain is told so, in its own row', async () => {
       await tickTimes(second, 4);
       await untilDigest(m.digest, (r) => r.status === 'confirmed', 'confirmed');
 
-      const row = m.dayBook()![0];
+      const row = nameRowRule(m.dayBook()![0]).row;
       assert.equal(row.txHash, DIGEST_TX, 'the row names the transaction that carries it');
       assert.equal(row.hash, sent.payload.hash, 'stamping a row cannot change what it commits');
       assert.equal(await digestHash(row), row.hash, 'the new field sits outside the hash, like `ts` does');
@@ -4581,6 +4618,8 @@ test('an anchored day the book cannot match is counted rather than guessed at', 
 
 test('a stamp joins one row to one transaction and refuses every other pair', () => {
   const row = (day: number, hash: string, txHash?: string): CensusDay => ({
+    // `STATS` carries the `v`, which is the point of the fixture having one: a row
+    // here is a row a reader could pull off the route, version and all.
     ...STATS, day, tick: day * 4, byArchetype: { APE: STATS.population },
     hash, ts: 1_700_000_000_000 + day,
     ...(txHash ? { txHash } : {}),
@@ -4690,13 +4729,24 @@ test('a stored row whose headcount contradicts its population is dropped and cou
 
 test('a ledger over the cap is trimmed on the way in, keeping the newest days', async () => {
   const m = memStore();
+  const health = createHealth(1);
   m.seedDayBook(Array.from({ length: CENSUS_CAP + 2 }, (_, i) => censusFixture(i)));
-  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
   const body = await readCensus(app);
   assert.equal(body.book, CENSUS_CAP);
   assert.equal(body.rows[0].day, 2, 'the two oldest days are what it forgot');
   assert.equal(body.coverage?.last, CENSUS_CAP + 1);
   assert.equal((await readCensus(app, '?days=9999')).rows.length, CENSUS_CAP, 'asking for more than exists is not an error');
+  // Forgetting on the way in is the same loss as forgetting on the way out, and a
+  // build that lowers the cap reaches this line with a book it never wrote — this
+  // batch does exactly that, 386 → 379. Counted, because otherwise the days a cap
+  // change throws away leave no trace at all: the console line is the channel that
+  // is never delivered, and `/history/census` just looks like a shorter history.
+  const h = await readHealth(app);
+  assert.equal(h.signals?.counts.census_days_dropped, 1, 'the load side says so too');
+  assert.match(h.signals?.last?.census_days_dropped?.detail ?? '',
+    new RegExp(`2 stored row\\(s\\) over a cap of ${CENSUS_CAP} fell out at load, oldest dropped day 0`),
+    'and says how many went out of a book of what size');
 });
 
 test('a book at the cap forgets the oldest day instead of growing, and says so', async () => {
@@ -4804,6 +4854,128 @@ test('a day book row is as small as its comment claims', async () => {
     CENSUS_CAP * stamped < CENSUS_BUDGET_BYTES,
     `the cap must stay inside its storage budget: ${CENSUS_CAP * stamped} B of ${CENSUS_BUDGET_BYTES}`,
   );
+});
+
+/* ---------- which rule made this row, and who is allowed to say ---------- */
+
+test('a row takes its rule from the payload it was built with, not from the build', async () => {
+  const heads = { APE: STATS.population };
+  const payload = await buildPayload(STATS, 1_800_000_000_000);
+  const row = censusRow(STATS, heads, payload);
+  assert.equal(row.v, payload.v, 'one payload, one version: the row cannot name a rule its hash was not made under');
+  // The sentence above is only worth anything if the two numbers can disagree.
+  assert.equal(DIGEST_V, 1, 'this build ships exactly one rule');
+  const borrowed = censusRow(STATS, heads, { v: 2, hash: payload.hash, ts: payload.ts });
+  assert.equal(borrowed.v, 2, 'a row built from a payload naming 2 says 2 — `v: DIGEST_V` here would pass every test in this file and still be a lie');
+  await assert.rejects(() => digestHash(borrowed), /no published rule for v=2/,
+    'and a rule this build has no table for is refused out loud rather than hashed under the nearest one');
+});
+
+test('the pre-image names the rule it was built under, and the hash follows it', async () => {
+  // The version is the second field of the pre-image, so "which rule" is inside
+  // the number that goes on chain. The literal below is the pre-image read off
+  // this call and then hashed by a stranger's SHA-256 (`printf '%s' '…' | shasum
+  // -a 256`), which is the same digest the golden test above publishes for this
+  // day: two independent tools agreeing on `|1|` is what `LEGACY_RULE_VERSION`
+  // rests on, and a build that hashed the version out of the pre-image would break
+  // both of them at once.
+  assert.deepEqual(digestPreImage({ ...STATS, v: 1 }), {
+    preImage: 'abyssal-day-digest|1|7|12345|44|8123|500|480|311|ghast:12',
+  });
+  assert.equal(await digestHash({ ...STATS, v: 1 }), await digestHash(STATS), 'the same day under the same name');
+  assert.deepEqual(digestPreImage({ ...STATS, v: 2 }), { problem: 'no published rule for v=2' },
+    'a version with no rule is a question this build can only refuse — the lookup is by the argument, never by the build');
+  await assert.rejects(() => digestHash({ ...STATS, v: 99 }), /no published rule for v=99/,
+    'and refusing is said out loud instead of hashing a hole into a public chain');
+});
+
+test('a row naming a rule this build cannot check is kept, and a row with no rule to look up is refused', () => {
+  const row = censusFixture(3);
+  assert.equal(censusProblem({ ...row, v: 3 }), null,
+    'v=3 is a fact about a future build, not a defect in this row — refusing it would let a rollback erase history');
+  for (const v of [0, -1, 1.5, NaN, '1', null, undefined]) {
+    const problem = censusProblem({ ...row, v: v as unknown as number });
+    assert.match(problem ?? '', /is not a rule version/, `a \`v\` of ${String(v)} cannot be looked up in the table by anybody`);
+  }
+});
+
+test('a row that arrives with a version of the wrong shape is not renamed', () => {
+  const stringy = { ...censusFixture(2), v: '1' } as unknown as StoredRow;
+  const named = nameRowRule(stringy);
+  assert.equal(named.backfilled, false, 'absence is the only thing this repairs');
+  assert.equal(named.row.v, '1', 'a stored claim is passed through as found');
+  assert.match(censusProblem(named.row) ?? '', /is not a rule version/,
+    'and the guard is where it is answered: silently relabelling it would be this build inventing a rule for a record it was never told about');
+  const absent = nameRowRule({ ...censusFixture(2), v: undefined } as unknown as StoredRow);
+  assert.equal(absent.backfilled, true, 'a row with no version at all is the case the repair exists for');
+  assert.equal(absent.row.v, LEGACY_RULE_VERSION);
+});
+
+/**
+ * The case this batch was written for, run against real bytes rather than against
+ * the function that reads them: storage out there today holds rows written before
+ * a row carried a `v`, and a cold start has to serve them — labelled, verified,
+ * and without dropping a single one. The order of the two steps is the whole
+ * risk: judge first and every legacy row fails the guard, which is how a published
+ * book empties itself on the next isolate nobody watched.
+ */
+test('a stored book from before rows carried a version comes back named and unchanged', async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth(1);
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+      await tickTimes(app, 4);
+      await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
+      const written = m.dayBook()![0];
+      assert.equal(written.v, DIGEST_V, 'what this build writes names its own rule');
+      // Turn the storage back into the storage this batch replaces: the same
+      // bytes, minus the label that was not written then.
+      const { v: _dropped, ...legacy } = written;
+      m.seedDayBook([legacy as StoredRow]);
+
+      const second = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      const body = await readCensus(second);
+      assert.equal(body.rows.length, 1, 'the row survived its own label being read');
+      assert.equal(body.rows[0].v, LEGACY_RULE_VERSION, 'and the loader is the one that said which rule made it');
+      assert.equal(await digestHash(body.rows[0]), body.rows[0].hash,
+        'labelling a row cannot change its hash, because the version was already inside the pre-image');
+      assert.equal(verifiesOrNull(await verifyPayload(body.rows[0] as unknown as DigestPayload)), true,
+        'a day on chain under rule 1 still verifies under rule 1: the label names the rule, it does not replace it');
+      const h = await readHealth(second);
+      assert.equal(h.signals?.counts.census_row_rejected, undefined, 'nothing was refused on the way in');
+      assert.equal(h.signals?.counts.census_rule_backfilled, 1, 'the repair is a claim about real records, so it is counted');
+      assert.match(h.signals?.last?.census_rule_backfilled?.detail ?? '', /1 row\(s\) of 1 arrived with no v; named 1/);
+      // The claim this leaves for the deployed tank: a book that has to be repaired
+      // on every read is counted and published, and is not an alarm — 32 legacy
+      // rows against a cap of 379 is about three weeks of cold starts, and a red
+      // light with no off switch for three weeks is why the next one gets skipped.
+      assert.equal(h.healthy, true, 'a cold start that repaired the book is not a failing one');
+      assert.equal(h.problem, null);
+      assert.equal(h.advisory, 'census_rule_backfilled=1', 'said out loud, just not as a fault');
+    });
+  } finally {
+    rpc.close();
+  }
+});
+
+test('the route publishes every rule it can check, and each row names one of them', async () => {
+  const m = memStore();
+  const named = censusFixture(3);
+  const { v: _dropped, ...legacy } = censusFixture(4);
+  m.seedDayBook([named, legacy as StoredRow]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const body = await readCensus(app);
+  assert.deepEqual(body.rules, DIGEST_RULE_TABLE, 'the whole table, keyed as JSON can key it');
+  assert.deepEqual(body.rules[String(DIGEST_V)], [...body.hashed], '`hashed` is the current rule and nothing else');
+  assert.equal(body.rows.length, 2);
+  for (const row of body.rows) {
+    assert.deepEqual(body.rules[String(row.v)], [...DIGEST_RULES[row.v as keyof typeof DIGEST_RULES]],
+      `a reader holding row ${row.day} can look its version up in this same response`);
+  }
+  assert.ok(!('v' in body.today), 'the live reading committed nothing, so it names no rule');
 });
 
 /* ---------- how a signing key reaches the code that has to sign with it ---------- */
@@ -5841,6 +6013,40 @@ test('a signal reddens the health light only while it is still happening', () =>
 });
 
 /**
+ * The other half of the same rule: a count that describes the records on disk
+ * rather than a fault that started and stopped. The deployed book is made of rows
+ * this loader labels on every cold start, and `ADVISORY_KINDS` carries the
+ * measurement of how long that goes on — about three weeks of filed days. Under
+ * the window rule alone that is a red light that cannot go out, which is the
+ * condition under which a red light stops being read.
+ */
+test('an advisory signal is counted, published, and never holds the light red', () => {
+  const T = 1_700_000_000_000;
+  const h = createHealth(T);
+  h.note('census_rule_backfilled', '32 row(s) of 32 arrived with no v; named 1');
+  assert.equal(healthProblem(h.view(), T + 1000), null, 'one second after firing, and still no alarm');
+  assert.deepEqual(advisorySignals(h.view()), ['census_rule_backfilled=1']);
+
+  // No window, because the claim is not about recency: the same total is what a
+  // reader wants a year from now, and dropping it out of sight on a schedule is
+  // how the number that explains `census.days` stops being published.
+  const ancient: HealthView = {
+    startedAt: T,
+    counts: { census_rule_backfilled: 4 },
+    last: { census_rule_backfilled: { at: T - 365 * PROBLEM_WINDOW_MS, detail: '4 row(s) of 32 arrived with no v; named 1', count: 4 } },
+  };
+  assert.deepEqual(advisorySignals(ancient), ['census_rule_backfilled=4'], 'published at any age');
+  assert.deepEqual(staleSignals(ancient, T), [], 'and in exactly one list, not in two');
+  assert.equal(healthProblem(ancient, T), null);
+
+  // An advisory exempts itself, not the ledger: a real fault beside it is still
+  // news, still red, and named alone.
+  h.note('census_row_rejected', 'headcount does not add up');
+  assert.equal(healthProblem(h.view(), T + 1000), 'census_row_rejected=1', 'the advisory drops out of the problem, the fault does not');
+  assert.deepEqual(advisorySignals(h.view()), ['census_rule_backfilled=1'], 'and stays where it was');
+});
+
+/**
  * Drive one already-broadcast day to confirmation and hand back what `/health`
  * says. `balanceLatencyMs` holds up the pump's tail so a caller can tell waiting
  * for it from getting lucky; the default of 0 leaves every other test in this
@@ -5886,6 +6092,7 @@ test('/health reports a repaired defect as history, not as a present failure', a
   assert.equal(body.healthy, true, 'clean for longer than the window, which is what healthy means');
   assert.equal(body.problem, null);
   assert.equal(body.stale, 'census_row_rejected=2', 'and the total is still there to be read');
+  assert.equal(body.advisory, null, 'nothing was counted without being either alarmed or named advisory');
   assert.equal(body.signals?.counts.census_row_rejected, 2);
 
   // The same kind firing again is news again: a window is not a mute button.

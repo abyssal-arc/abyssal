@@ -37,11 +37,11 @@ import {
   buildPayload, censusChanges, censusProblem, censusReading, censusRow, coherenceProblem,
   digestHash, digestStats, encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
-  newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
-  CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS,
-  type CensusDay, type DigestRecord,
+  nameRowRule, newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
+  CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS, DIGEST_RULE_TABLE, DIGEST_V, LEGACY_RULE_VERSION,
+  type CensusDay, type DigestRecord, type StoredRow,
 } from './digest.js';
-import { healthProblem, staleSignals, type Health } from './health.js';
+import { advisorySignals, healthProblem, staleSignals, type Health } from './health.js';
 import {
   ABYS_PRICES,
   ABYS_PRICE_LEGENDARY_NAME,
@@ -214,8 +214,13 @@ export interface LedgerSnapshot {
    * reason the digest record is — a cold isolate that cannot read its own history
    * back has no past to chart, and re-deriving one from a world that has moved on
    * would be invention. Bounded by `CENSUS_CAP` on both sides of the write.
+   *
+   * Typed as `StoredRow` rather than `CensusDay` because this is the shape of
+   * bytes written by *whichever build was running that day*: a row from before
+   * `v` existed is exactly as durable as one from after it, and the loader, not
+   * the type, is what decides what to call it. See `nameRowRule`.
    */
-  dayBook?: CensusDay[];
+  dayBook?: StoredRow[];
   /**
    * What the anchor costs, what funds it, and what selling data has brought in.
    * Optional because every ledger written before the field existed is still a
@@ -243,8 +248,10 @@ export interface LedgerLoad {
   feedState?: FeedState;
   /** Absent in ledgers written before the digest was made durable. */
   digest?: DigestRecord;
-  /** Absent in ledgers written before the tank kept a day book. */
-  dayBook?: CensusDay[];
+  /** Absent in ledgers written before the tank kept a day book. `StoredRow`
+   * rather than `CensusDay` because a row written before a row carried its own
+   * rule is still on disk, and the loader is what decides what to call it. */
+  dayBook?: StoredRow[];
   /** Absent in ledgers written before the anchor's economics were measured. */
   anchor?: AnchorEcon;
 }
@@ -801,8 +808,11 @@ export function createApp(options: AppOptions = {}) {
         // The same two calls the on-chain record makes, so a viewer watching
         // this number all day is watching the value that gets committed when
         // the day closes. It used to be a separate FNV over a different field
-        // list, under a label promising otherwise.
-        digest: await digestHash(digestStats(day, world)),
+        // list, under a label promising otherwise. `DIGEST_V` is spelled out here
+        // because this is the one place a hash is taken over a day that has not
+        // been committed yet: the rule it will use is a fact about this build, and
+        // saying so is what keeps the preview honest when the build changes.
+        digest: await digestHash({ v: DIGEST_V, ...digestStats(day, world) }),
       },
       population: world.creatures.length,
       totalEnergy: round1(world.creatures.reduce((s, c) => s + c.energy, 0)),
@@ -924,6 +934,7 @@ export function createApp(options: AppOptions = {}) {
     const econScaleKnown = scaleTermsKnown(anchorEcon.balanceUnits, anchorEcon.tokenUnits, anchorEcon.revenueAtRead);
     const econRunway = anchorRunway(anchorEcon.balanceUnits, anchorEcon.costUnits);
     const stale = view ? staleSignals(view) : [];
+    const advisory = view ? advisorySignals(view) : [];
     const parts = [problem, mismatch, unpublished].filter((p): p is string => Boolean(p));
     return {
       // `null` when no ledger is wired at all — the honest difference between
@@ -934,6 +945,11 @@ export function createApp(options: AppOptions = {}) {
       // information: this response distinguishes "clean for a day" from "clean,
       // ever" without the reader having to know that the two are different claims.
       stale: stale.length ? stale.join(' ') : null,
+      // Counted, current, and exempt from alarming — the third of the three states
+      // a signal can be in, and published for the same reason as the one above: a
+      // reader who is told `healthy: true` has to be able to see that the ledger
+      // still holds something they were not given a red light for.
+      advisory: advisory.length ? advisory.join(' ') : null,
       signals: view ? { counts: view.counts, last: view.last } : null,
       storage: options.metrics?.() ?? null,
       digest: digest ? {
@@ -1319,7 +1335,7 @@ export function createApp(options: AppOptions = {}) {
         // filed and is counted instead: writing a self-contradictory day and
         // letting hydrate drop it later is how the history goes missing with
         // nobody the wiser, and this way the number says when it starts.
-        const row = censusRow(reading.stats, reading.byArchetype, payload.hash, ts);
+        const row = censusRow(reading.stats, reading.byArchetype, payload);
         const unsound = censusProblem(row);
         if (unsound) {
           console.error(`day ${prevDay} was not filed: ${unsound}`);
@@ -2204,6 +2220,11 @@ export function createApp(options: AppOptions = {}) {
         // Which fields of a row travelled to the chain. The headcounts did not,
         // and a reader who assumes otherwise is trusting the wrong artifact.
         hashed: [...DIGEST_HASH_FIELDS],
+        // Every rule this build can check, keyed by the `v` a row names. `hashed`
+        // alone is the current build's rule, which is the wrong thing to hand a
+        // reader of a day written under another one: the book is expected to
+        // outlive the code that wrote a row, and a rule can only be added to.
+        rules: DIGEST_RULE_TABLE,
         // A row's `txHash`, when it carries one, is the transaction that brought
         // the commitment above to the chain: outside the hash, so verifiable
         // against it rather than guaranteed by it. Its absence is also an answer
@@ -2853,19 +2874,54 @@ export function createApp(options: AppOptions = {}) {
       // the exact shape that would sit in a chart for a year looking like a fact.
       if (Array.isArray(s.dayBook)) {
         const rows: CensusDay[] = [];
-        for (const row of s.dayBook) {
-          const problem = row ? censusProblem(row) : 'not a row at all';
-          if (problem) {
-            console.error(`stored census row rejected: ${problem} (day ${row?.day ?? 'unknown'})`);
+        let unnamed = 0;
+        for (const stored of s.dayBook) {
+          // Labelled *before* being judged, and the order is not cosmetic: a row
+          // written before rows carried a `v` has no `v`, so a guard that reads
+          // the field first refuses every one of them and the published book
+          // empties itself on the next cold start. `nameRowRule` only supplies a
+          // version when the field is absent, so a stored row that names a
+          // nonsense one still reaches the guard with its claim intact.
+          const named = stored ? nameRowRule(stored) : null;
+          const problem = named ? censusProblem(named.row) : 'not a row at all';
+          if (problem || !named) {
+            console.error(`stored census row rejected: ${problem} (day ${stored?.day ?? 'unknown'})`);
             // Counted per hydrate, like the digest record: a row that cannot be
             // read back fails on every cold start until a new day replaces it, so
             // a growing count is the sound of the book being rewritten from zero.
             // The reason travels with the count for the same reason it does next
             // door — the console line this would have been is never delivered.
             options.health?.note('census_row_rejected', problem);
-          } else rows.push(row);
+            continue;
+          }
+          // Rows written before a row carried its own rule are labelled here and
+          // nowhere else, so that the one place which has to decide "which rule
+          // made this" is the place that can say it out loud and be counted.
+          if (named.backfilled) unnamed += 1;
+          rows.push(named.row);
         }
-        dayBook = rows.length > CENSUS_CAP ? rows.slice(rows.length - CENSUS_CAP) : rows;
+        if (unnamed) {
+          // Not an error and not an alarm either: a repair was applied to
+          // `unnamed` stored records, on every cold start, until the last of them
+          // ages out of the cap — which the deployed book says is about three
+          // weeks of filed days. Counted because the repair is a claim (see
+          // `LEGACY_RULE_VERSION`), published because a number that starts growing
+          // again means a snapshot arrived from a build older than this one, and
+          // exempt from `healthProblem` because a red light that cannot go out for
+          // three weeks stops being read (see `ADVISORY_KINDS`).
+          options.health?.note('census_rule_backfilled', `${unnamed} row(s) of ${s.dayBook.length} arrived with no v; named ${LEGACY_RULE_VERSION}`);
+        }
+        // The cap is derived from a measured row width, so a build can lower it
+        // without touching a single stored byte — and then the book read back from
+        // storage is already over budget. Trimming it here is the same loss of
+        // history that `noteDayBook` counts when it trims on write, so it is
+        // counted with the same kind: without this, the days a cap change throws
+        // away would leave no trace at all.
+        if (rows.length > CENSUS_CAP) {
+          console.error(`stored census book over cap: ${rows.length} rows, cap ${CENSUS_CAP}`);
+          options.health?.note('census_days_dropped', `${rows.length - CENSUS_CAP} stored row(s) over a cap of ${CENSUS_CAP} fell out at load, oldest dropped day ${rows[0].day}`);
+          dayBook = rows.slice(rows.length - CENSUS_CAP);
+        } else dayBook = rows;
       }
       // The anchor's economics, asked the same question as the rows above: does
       // this still mean what it claims. A bad object is dropped rather than

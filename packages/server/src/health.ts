@@ -37,7 +37,10 @@
 /**
  * Everything worth counting, named after the consequence rather than the
  * function that noticed. `*_past_budget` entries are warnings: the write still
- * worked, and the point of counting them is the day it stops working.
+ * worked, and the point of counting them is the day it stops working. Whether a
+ * warning reddens the light is decided by `ADVISORY_KINDS` below, not by this
+ * list — counting and alarming are two questions and only one of them is "is
+ * this a fault".
  */
 export const SIGNAL_KINDS = [
   'receipt_not_stored',
@@ -131,6 +134,19 @@ export const SIGNAL_KINDS = [
    */
   'census_days_dropped',
   /**
+   * A stored day-book row arrived with no `v` — written before a row carried the
+   * rule its own hash was made under — and the loader named that rule for it. A
+   * warning in the `*_past_budget` sense: nothing failed, no history was lost, and
+   * the count exists because the repair is a *claim* (see `LEGACY_RULE_VERSION` on
+   * why the answer is 1 rather than a guess) being applied to real records. The
+   * `detail` says how many rows and which version. It is the only member of
+   * `ADVISORY_KINDS` — counted, published, and deliberately not an alarm, for the
+   * reason measured there. Once the last legacy row has aged out of the cap this
+   * stops firing for good, so a count that starts again means a snapshot arrived
+   * from a build older than the one reading it.
+   */
+  'census_rule_backfilled',
+  /**
    * A payer did the wallet work and the money could not be taken. Counted
    * because nothing else can see it: the buyer gets a 402 back and moves on, and
    * the only record of a lost sale would be a log line nobody tails.
@@ -148,6 +164,38 @@ export const SIGNAL_KINDS = [
 ] as const;
 
 export type SignalKind = (typeof SIGNAL_KINDS)[number];
+
+/**
+ * Kinds that are counted and published but never redden the light.
+ *
+ * The list has to exist because `healthProblem` answers one question — has this
+ * happened inside the window — while not every counted fact is a fault. The
+ * member below is a repair applied to records that predate the field it fills in:
+ * correct on every read, so it fires on every read, for as long as those records
+ * are in the book.
+ *
+ * How long that is is measured rather than assumed. `/history/census` on
+ * 2026-09-26 published 32 rows, day 27 through day 58, and not one of them
+ * carried a `v`: every row in the deployed book was written by a build that had
+ * no such field. The cap this deploy sets is 379, so the first of them cannot age
+ * out for 347 more filed days and the last not for 379 — and the gaps between
+ * those same rows' own `ts` values measure 1 h 19 m 59 s to 1 h 30 m 04 s around
+ * a mean of 1 h 23 m 09 s, which puts the end of the window 21.9 days out. A red
+ * light that cannot go out for three weeks is not an alarm; it is the reason the
+ * next real alarm does not get read.
+ *
+ * Advisory kinds stay in `counts`, stay in `last` with their detail, and are
+ * named by `advisorySignals`, so the exemption costs no information — the same
+ * bargain `staleSignals` makes about the freshness window.
+ */
+export const ADVISORY_KINDS = ['census_rule_backfilled'] as const satisfies readonly SignalKind[];
+
+export type AdvisoryKind = (typeof ADVISORY_KINDS)[number];
+
+const ADVISORY: ReadonlySet<string> = new Set<string>(ADVISORY_KINDS);
+
+/** Whether this kind is counted without ever holding the light red. */
+export const isAdvisoryKind = (kind: string): boolean => ADVISORY.has(kind);
 
 export interface SignalEvent {
   at: number;
@@ -265,11 +313,12 @@ export function createHealth(startedAt: number = Date.now(), onChange?: (v: Heal
  *
  * Deliberately blunt in every other respect: a monitoring caller should not have
  * to reproduce the rules for which kinds count, so there is one window and it
- * applies to all of them.
+ * applies to all of them. The one exception is `ADVISORY_KINDS`, which is exempt
+ * for the reason argued there — and stays published through `advisorySignals`.
  */
 export function healthProblem(v: HealthView | null | undefined, now: number = Date.now()): string | null {
   if (!v || typeof v.counts !== 'object' || v.counts === null) return 'no health view';
-  const flagged = Object.entries(v.counts).filter(([kind, n]) => (typeof n === 'number' && n > 0) && isFresh(v, kind, now));
+  const flagged = Object.entries(v.counts).filter(([kind, n]) => (typeof n === 'number' && n > 0) && !isAdvisoryKind(kind) && isFresh(v, kind, now));
   if (!flagged.length) return null;
   return flagged
     .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
@@ -300,16 +349,37 @@ function isFresh(v: HealthView, kind: string, now: number): boolean {
 }
 
 /**
- * Kinds that have fired and are now out of window, as `kind=count` strings.
+ * Kinds that have fired, are not advisory, and are now out of window, as
+ * `kind=count` strings.
  *
  * Published next to `problem` so the recency rule costs no information: a reader
  * sees what is wrong now and what was wrong lately, in the same response, without
- * having to know that the two are produced by different rules.
+ * having to know that the two are produced by different rules. Advisory kinds are
+ * left out because they are reported by `advisorySignals` whatever their age, so
+ * filing them here too would put one number in two lists that a reader takes to
+ * mean different things — with those two functions, every counted kind appears in
+ * exactly one of `problem`, `stale` and `advisory`.
  */
 export function staleSignals(v: HealthView | null | undefined, now: number = Date.now()): string[] {
   if (!v || typeof v.counts !== 'object' || v.counts === null) return [];
   return Object.entries(v.counts)
-    .filter(([kind, n]) => typeof n === 'number' && n > 0 && !isFresh(v, kind, now))
+    .filter(([kind, n]) => typeof n === 'number' && n > 0 && !isAdvisoryKind(kind) && !isFresh(v, kind, now))
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .map(([k, n]) => `${k}=${n}`);
+}
+
+/**
+ * Kinds that have fired and are exempt from alarming, as `kind=count` strings.
+ *
+ * No `now` and no window, because the claim is different in kind: `stale` says
+ * "this happened, and it is no longer happening", while an advisory says "this is
+ * a standing fact about the records on disk". The totals are what a reader wants
+ * from it, and the timestamps are already beside them in `signals.last`.
+ */
+export function advisorySignals(v: HealthView | null | undefined): string[] {
+  if (!v || typeof v.counts !== 'object' || v.counts === null) return [];
+  return Object.entries(v.counts)
+    .filter(([kind, n]) => typeof n === 'number' && n > 0 && isAdvisoryKind(kind))
     .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
     .map(([k, n]) => `${k}=${n}`);
 }
