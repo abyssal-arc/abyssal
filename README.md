@@ -962,20 +962,24 @@ timestamp for it) and CI #72 came back `success` on that sha at 08:41:10Z; `/hea
 answered two minutes later, at 08:44:32Z, from an isolate that had itself just begun —
 and the code it was running is not inferred from that, it is read off the answer: `cap:
 349` is a number only this build derives, and `census.bytes` is a field only this build
-writes. It published `census: {days: 36, cap: 349, bytes: 13355, maxRowBytes: 374, budget:
-131072}`, `healthy: true`, no `census_past_budget` and no `census_days_dropped`, with
-`census_rule_backfilled` still counting one: the repair fired once, on 04:53:30Z, and a
-fresh isolate that relabelled anything would have moved that number. The same 36 rows
-were then re-added up outside the worker — `13,318` bytes of rows plus 35 commas plus 2
-brackets is `13,355`, the figure the route claimed — and the book's newest row (day 62,
-370 bytes, `0x91114ee5…`) was re-hashed from its own published `v` and the `rules` table
-the route serves, landing on the hash printed beside it. A cap that is only correct in a
-test run is a cap that will be wrong in production while looking right here. The docs
-commit that records this reading (`5218d84`, CI #73 `success`) changed no served byte —
-the twelve-file byte comparison against the working tree was re-run after it and came
-back twelve `same` — and was itself deployed anyway, at 08:58:15Z as `079d0b9f`, so that
-"what is live" and "what `main` says is live" are the same artifact rather than two
-claims that have to be reconciled later.
+writes. At 11:34:24Z, from the artifact of the latest commit (`f388490`, deployed as
+`915972ec` at 11:33:38Z), the same route answered
+`days: 38, cap: 349, bytes: 14104, maxRowBytes: 374` — the book had grown two rows and
+the measurement grew with it, which is the only behaviour a witness is supposed to have.
+Neither reading shows `census_past_budget` or `census_days_dropped`, and
+`census_rule_backfilled` still counts one: the repair fired once, on 04:53:30Z, and a
+fresh isolate that relabelled anything would have moved that number. The 36 rows of the
+first reading were then re-added up outside the worker — `13,318` bytes of rows plus 35
+commas plus 2 brackets is `13,355`, the figure the route claimed — and at the second
+reading its two newest rows (day 63, 373 bytes, `0xdd6e40d2…`; day 64, 374 bytes,
+`0x31e30588…`) were each re-hashed from their own published `v` against the `rules` table
+the route serves, landing on the hash printed beside them. A cap that is only correct in a
+test run is a cap that will be wrong in production while looking right here. Both docs
+commits that record these readings changed no served byte — the twelve-file comparison
+against the working tree was re-run after each and came back twelve `same` — and both
+were deployed anyway (CI #73 and #74, both `success`), so that "what is live" and "what
+`main` says is live" are the same artifact rather than two claims that have to be
+reconciled later.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
@@ -1097,7 +1101,14 @@ takes to be superseded. Redoing it is also the only way the *balance* stays
 checkable, so the audit asks for that address's balance itself: at
 2026-09-26T07:35:44Z, forty-nine minutes after the reading it judges, both nodes
 still answered 19,971,133,495,347,684,640 — the recorded figure to the unit,
-because no day confirmed in between and nothing else spends this account. An
+because no day confirmed in between and nothing else spends this account. Three days
+later the same arithmetic was still the only arithmetic involved: the reading taken
+for day 64 at 2026-09-26T10:54:33Z holds 19,969,291,379,347,684,640 against a day
+that cost 612,800,000,000,000, and the first divided by the second, truncated, is the
+`32,586` published beside them — re-divided here, agreeing. What the two balances
+(61's and 64's) differ by is 1,842,116,000,000,000, which is *exactly* two days at
+615,060,000,000,000 plus the day 64's own 612,800,000,000,000: three confirmations,
+three published receipt costs, one subtraction with no residue. An
 older pair is quoted because it is where that subtraction was first demonstrated,
 and it is kept rather than overwritten: the reading for day 46 (taken
 2026-09-25T09:59:25Z) held 19,980,353,015,540,751,440 against a day that had just
@@ -1108,8 +1119,9 @@ runway did not change between the two readings — but the pair has a second che
 in it, because what the two balances differ by is *exactly* the
 615,060,000,000,000 the newer receipt says that day cost. A gas price read off a
 receipt and a balance read off the node agree to the fee unit, and nothing else
-has spent from that account in between: the same subtraction, three times over now
-(days 35→36 and 42→43 are quoted below). Thirty-three gaps between the thirty-four
+has spent from that account in between: the same subtraction, four times over now
+(days 35→36 and 42→43 are quoted below, and 61→64 above is a three-day instance).
+Thirty-three gaps between the thirty-four
 consecutive confirmations of the book's own rows put the distance from one anchored
 day to the next between 79 minutes 58 seconds and 90 minutes 3 seconds, mean 83
 minutes 9 seconds; at that mean the
