@@ -428,7 +428,16 @@ test('the census fixture is self-consistent the way the route is required to be'
     'byArchetype', 'committed',
   ].sort(), 'the live reading is the stats, the headcount and the flag — and nothing that belongs to a commitment');
   // The cap is copied from the server rather than imported, so the arithmetic that
-  // derives it is restated here: a stamped row measures 345 bytes, the ledger gives
-  // the book 128 KiB, and a stale copy of either number fails this line.
-  assert.equal(census.cap, Math.floor((128 * 1024) / 345), 'the fixture cap is 128 KiB over the measured stamped row');
+  // derives it is restated here: 128 KiB of share, 374 bytes for the widest stamped
+  // row the deployed book holds, and the separators — `375n + 1 ≤ 131072`, because a
+  // book is an array and not a concatenation. Restating the formula only checks the
+  // copy, and this line was written with the separator-free version one edit before
+  // the server's own arithmetic was found to be wrong, so the number that pins the
+  // arithmetic is the footprint of a cap-full book in `api.test.ts`, measured in
+  // bytes. What this line is good for is the thing it can actually see: a fixture
+  // left at an old cap.
+  assert.equal(
+    census.cap, Math.floor((128 * 1024 - 1) / (374 + 1)),
+    'the fixture cap is 128 KiB over the widest deployed row, commas and brackets counted',
+  );
 });

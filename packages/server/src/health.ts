@@ -34,6 +34,8 @@
  *     through on every signal rather than on a schedule.
  */
 
+import { SNAPSHOT_BUDGET } from '@abyssal/sim';
+
 /**
  * Everything worth counting, named after the consequence rather than the
  * function that noticed. `*_past_budget` entries are warnings: the write still
@@ -128,11 +130,27 @@ export const SIGNAL_KINDS = [
    * The day book reached its cap and a day fell out of the front of it. A warning
    * in the `*_past_budget` sense: nothing failed, the write worked, and the point
    * of counting it is that history silently stops being complete from here on.
-   * The cap is what three weeks of a busy tank measures out (see `CENSUS_CAP`),
+   * The cap is what just over 20 days of a busy tank measures out (see `CENSUS_CAP`),
    * so a growing count is a world that has been running a while and a signal to
-   * go publish the part about to be forgotten.
+   * go publish the part about to be forgotten. The byte watermark beside it is
+   * alarming rather than advisory because it says the ceiling has been crossed,
+   * not that it is nearly.
    */
   'census_days_dropped',
+  /**
+   * The day book measures bigger than the slice of the ledger value it was given,
+   * counted on the rows it actually holds rather than on the row width the cap was
+   * derived from. Alarming where `census_days_dropped` is a warning, because the
+   * two fail differently: a row count at the cap says the book is full, while a
+   * *wider* row over-spends the same budget with the count nowhere near it — and
+   * that is not hypothetical, it is the arithmetic this build's own comment got
+   * wrong (345 bytes claimed against 374 measured, a cap of 379 rows that would
+   * have cost 142,126 bytes of a 131,072 share). Nothing breaks at the crossing:
+   * the write still goes in, and the platform's own ceiling is far above. What
+   * breaks is the claim that the book fits its budget, which is the claim the cap
+   * exists to keep.
+   */
+  'census_past_budget',
   /**
    * A stored day-book row arrived with no `v` — written before a row carried the
    * rule its own hash was made under — and the loader named that rule for it. A
@@ -140,10 +158,12 @@ export const SIGNAL_KINDS = [
    * the count exists because the repair is a *claim* (see `LEGACY_RULE_VERSION` on
    * why the answer is 1 rather than a guess) being applied to real records. The
    * `detail` says how many rows and which version. It is the only member of
-   * `ADVISORY_KINDS` — counted, published, and deliberately not an alarm, for the
-   * reason measured there. Once the last legacy row has aged out of the cap this
-   * stops firing for good, so a count that starts again means a snapshot arrived
-   * from a build older than the one reading it.
+   * `ADVISORY_KINDS` — counted, published, and deliberately not an alarm, because
+   * serving a record that predates a field is what the loader is for. It fires once
+   * per legacy snapshot: the label is saved back with the row, so the next cold
+   * start finds a book that already names its rule (measured by the
+   * `a row named at load is saved named` test). A count that starts growing again
+   * therefore means a snapshot arrived from a build older than the one reading it.
    */
   'census_rule_backfilled',
   /**
@@ -169,20 +189,24 @@ export type SignalKind = (typeof SIGNAL_KINDS)[number];
  * Kinds that are counted and published but never redden the light.
  *
  * The list has to exist because `healthProblem` answers one question — has this
- * happened inside the window — while not every counted fact is a fault. The
- * member below is a repair applied to records that predate the field it fills in:
- * correct on every read, so it fires on every read, for as long as those records
- * are in the book.
+ * happened inside the window — while not every counted fact is a fault. The member
+ * below is a repair applied to records that predate the field it fills in: correct
+ * on every read that finds such a record, and not a failure on any of them.
  *
- * How long that is is measured rather than assumed. `/history/census` on
- * 2026-09-26 published 32 rows, day 27 through day 58, and not one of them
- * carried a `v`: every row in the deployed book was written by a build that had
- * no such field. The cap this deploy sets is 379, so the first of them cannot age
- * out for 347 more filed days and the last not for 379 — and the gaps between
- * those same rows' own `ts` values measure 1 h 19 m 59 s to 1 h 30 m 04 s around
- * a mean of 1 h 23 m 09 s, which puts the end of the window 21.9 days out. A red
- * light that cannot go out for three weeks is not an alarm; it is the reason the
- * next real alarm does not get read.
+ * What it costs to keep it alarming is measured, not argued. The field went out in
+ * a build deployed on 2026-09-26 and the first cold start after it reported
+ * `33 row(s) of 33 arrived with no v; named 1`, timestamped 04:53:30Z. `/health` at
+ * 07:14:39Z still reads exactly `1` — and the isolate that answered had itself just
+ * started, its `isolateStartedAt` equal to the `serverTime` of the same response, so
+ * this is a cold start that found the label already stored rather than a tank that
+ * never woke up. A red light for a day over a book that loaded correctly is still a
+ * red light nobody can act on, and it would sit on top of whatever else happened in
+ * those 24 hours.
+ *
+ * The window this signal can re-open is the age of the snapshot, not of the book: a
+ * ledger imported from a build older than the field would fire again, and the
+ * book's own rows stay servable for 349 filed days — 20.2 days at the mean of the
+ * 34 gaps the 07:15Z book measures (1 h 19 m 59 s to 1 h 30 m 04 s).
  *
  * Advisory kinds stay in `counts`, stay in `last` with their detail, and are
  * named by `advisorySignals`, so the exemption costs no information — the same
@@ -400,4 +424,27 @@ export function advisorySignals(v: HealthView | null | undefined): string[] {
  */
 export function receiptsValueBytes(n: number): number {
   return n <= 0 ? 2 : 69 * n + 1;
+}
+
+/**
+ * Whether a stored collection has just crossed its budget, and whether that is news.
+ *
+ * The state machine behind both snapshot watermarks in `worker.ts` and the day book's
+ * in `handler.ts`, so it lives with the counters it feeds rather than with one of the
+ * three callers. Extracted and exported because no world built by legal means can
+ * reach the snapshot's line: the sim's caps, every one of them full, come to about
+ * 1.15 MiB against a budget of 1.5 MiB on purpose — a budget that worst case already
+ * violates would warn on every save and then be ignored. The day book's line is
+ * reachable by legal means (its rows are free-form numbers) but sits 196 bytes under
+ * its budget at the cap, so the same rule is tested by handing it numbers here.
+ * Crossing up announces once, staying over does not repeat, and dropping back re-arms
+ * it.
+ */
+export function budgetCrossed(
+  bytes: number,
+  wasOver: boolean,
+  budget: number = SNAPSHOT_BUDGET,
+): { over: boolean; announce: boolean } {
+  const over = bytes > budget;
+  return { over, announce: over && !wasOver };
 }

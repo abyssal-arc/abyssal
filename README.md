@@ -219,7 +219,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (327 total)
+npm test           # sim + server + web tests (338 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -672,7 +672,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/snapshot` | Combined world + state + events + txRain in one request: `?since=<seq>` for unseen events, `?tail=<n>` caps the cold-start event replay, `?tx=<hash>` returns only meteors newer than that hash |
 | GET | `/history` | Per-tick stats for charts: `?window=<n>` sets the depth (default and max 2000), `?slots=<n>` decimates server-side to the chart's point budget |
 | GET | `/history/pulse` | Time-travel for the OBSERVE pulse: `?range=1h\|24h` returns re-bucketed USDC volume columns |
-| GET | `/history/census` | The day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; `?days=<n>` for the newest n. The in-progress day carries `committed: false` |
+| GET | `/history/census` | The day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; `?days=<n>` for the newest n. The in-progress day carries `committed: false`. The answer carries the storage `cap` and, beside it, `rules`: the hash rule table keyed by version, so a row's `v` says which entry recomputes its `hash` and a reader needs no build of ours to check one. `coverage.first` is where a truncated book admits where it starts |
 | GET | `/judgments` | Cull records, each tagged `type: "harvest" \| "judgment"`; filter with `?type=` |
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
@@ -690,7 +690,7 @@ reading says nothing about whether the digest commit is configured — check
 | DELETE | `/adopt` | Release an adoption: `{addr, creatureId}` |
 | POST | `/cheer` | Rally for a species: `{addr, species}`; free, one vote per known address, one change a minute |
 | POST | `/tick` | Debug only: 404 unless `ALLOW_DEBUG_TICK=1`; not part of the public API |
-| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure, the snapshot and receipt budget watermarks, the state of the anchor (including what a day costs, how long the account funds it, the settled revenue tally as of the reading the scale check was computed from, the version of the hash rule the stored payload names and the problem text behind a verdict that is not `true` — `digest.payloadV`, `digest.verifyProblem`), of the data tier, and of the feed (`feed.indexedUpTo`, `feed.head`, `feed.lagBlocks`, `feed.tag` — the tag that bounds the indexed height is named in the answer, and the whole block is null when running on the offline rain). Never cached |
+| GET | `/health` | Self-observation: the counters and what they last saw, the signals that are out of the 24-hour window as history rather than as a present failure (`stale`), and the ones that are counted and current but exempt from reddening the light (`advisory` — see `ADVISORY_KINDS` for the measured reason), the snapshot and receipt budget watermarks and the day book's own footprint (`census.bytes`, `census.maxRowBytes`, `census.budget`, measured on the stored array rather than derived from the cap), the state of the anchor (including what a day costs, how long the account funds it, the settled revenue tally as of the reading the scale check was computed from, the version of the hash rule the stored payload names and the problem text behind a verdict that is not `true` — `digest.payloadV`, `digest.verifyProblem`), of the data tier, and of the feed (`feed.indexedUpTo`, `feed.head`, `feed.lagBlocks`, `feed.tag` — the tag that bounds the indexed height is named in the answer, and the whole block is null when running on the offline rain). Never cached |
 | GET | `/ui` | Redirects to `/` |
 
 `OPTIONS` on any path answers 204 with permissive CORS headers; the write routes
@@ -826,22 +826,21 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-327 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-26T02:09:18Z: 59 + 176 + 92,
+338 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-26T08:10:26Z: 59 + 186 + 93,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
 so a job log reads one pass short of the totals here rather than a different
-count: run #69, the commit this batch stands on, logs 327 tests and 326 passes
-with exactly that skip and no failure. That is the shape to expect from any run
-whose log is opened next: the totals above are the working copy's, and the one
-row CI never runs is named in the log rather than missing in silence.
+count: that is the shape run #69 made when these suites held 327 (327 tests, 326
+passes, exactly that skip and no failure). The totals above are the working copy's,
+and the one row CI never runs is named in the log rather than missing in silence.
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 176 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say"), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
-| `@abyssal/web` | 92 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
+| `@abyssal/server` | 186 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say"), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, the bytes each of those fields costs against its own row and the footprint of a book filled to the cap it derives, the size published at every point the stored array changes and the watermark that fires once when the book outgrows its share, a legacy row that is named once because the name is saved with it, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept |
+| `@abyssal/web` | 93 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
@@ -857,28 +856,38 @@ parses, and a gate that parses a file the browser never loads, are both a gate t
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 271 hand-written single-line mutations of
+runs negative verification: a battery of 303 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-271 of 271 in one pass, over 34 minutes 40 seconds read off the battery's own
-per-row stamps (18:52:35Z to 19:27:15Z, 271 rows), 0 missed and 0 without a
-verdict. One line of prose in one of these files changed after that pass — a header
-comment, which no mutant quotes, and the battery's `--check` mode reads every
-mutant's anchor to answer exactly that question in a second (271/271 point at
-exactly one line).
+303 of 303 in one pass, over 55 minutes 23 seconds read off the battery's own
+per-row stamps (06:32:25Z to 07:27:48Z, 303 rows), 0 missed and 0 without a
+verdict. The battery grew to 303 rows with ten mutants this batch (M293–M302), two
+of them re-pinnings rather than new ideas: M293 restores the width this batch
+falsified, and M284's target is the fixture-cap arithmetic that replaced the old
+literal. Those ten, plus M120 and M294–M302, were first caught in a targeted
+13-line pass at 06:28:43Z to 06:29:58Z, and then judged again in the 303-row run
+above — no verdict here is inherited from a tree a later edit had already changed.
+What changed after the 303 pass is prose and one test: four
+comments in these files said numbers that turned out to be wrong (see the day-book
+measurement above), a fifth claimed a repair fires on every read when the label
+turns out to be saved with the row, and the test that now measures that
+(`a row named at load is saved named`) went in with the correction. No source
+behaviour changed, `--check` still reads 303/303 anchors pointing at exactly one
+line each, and the eight mutants whose expected test is one of the passages touched
+were re-run and caught 8 of 8 (64 seconds, 08:16:45Z to 08:17:49Z).
 
-A pass before it caught 267 of 271 and *refused* to judge four, and the reason is
-worth the sentence: a mutant is pinned to the source it rewrites by quoting a line
-of it, and this batch rewrote all four places those four quoted, so the battery
-printed `anchor matched 0 times` rather than guess — and a mutant that was never
-applied cannot be reported as caught. Those four were re-pinned by hand to the text
-that replaced theirs and caught 4 of 4 (18:43:10Z to 18:43:39Z); the 271 above is
-the run that happened afterwards, so no verdict here is inherited from a tree that
-no longer exists. One of the eighteen mutants this batch added was first written in
-a shape that did not compile — `if (false && …)`, whose narrowing TypeScript then
+The pass before that one caught 267 of 271 and *refused* to judge four, and the
+reason is worth the sentence: a mutant is pinned to the source it rewrites by quoting
+a line of it, and the J-2a batch rewrote all four places those four quoted, so the
+battery printed `anchor matched 0 times` rather than guess — and a mutant that was
+never applied cannot be reported as caught. Those four were re-pinned by hand to the
+text that replaced theirs and caught 4 of 4 (18:43:10Z to 18:43:39Z); the 271 above is
+the run that happened afterwards, so no verdict here is inherited from a tree that no
+longer exists. One of the eighteen mutants that batch added was first written in a
+shape that did not compile — `if (false && …)`, whose narrowing TypeScript then
 rejected at a line further down the same file — and a mutant that cannot build has
 no verdict either, so it was rewritten to delete the gate through a constant of the
 same type and then caught like the rest. The battery itself lives outside the
@@ -981,11 +990,13 @@ shows are not the only way out: `/health` publishes `digest.payloadV` beside
 version has no rule without anybody opening the site.
 
 That recomputation has been run over the whole book rather than a sample of it:
-the pre-image of each of its thirty stamped rows — rebuilt from the fields the row
-publishes, plus the `v` it does not, supplied there by assumption — hashes back to
-the hash printed beside it, thirty for thirty, in a run dated 2026-09-26T02:02:59Z
-that also asked two nodes for every transaction in the sample and found them in
-agreement on all thirty-one receipts. That run is a script which, like the mutation
+the pre-image of each of its thirty-four stamped rows — rebuilt from the fields the
+row publishes, the `v` included now that the row carries it, so every record is
+judged by the rule it names rather than by an assumption made here — hashes back to
+the hash printed beside it, thirty-four for thirty-four, in a run dated
+2026-09-26T07:35:44Z that also asked two nodes for every transaction in the book
+plus the day-15 anchor and found them in agreement on all thirty-five receipts. That
+run is a script which, like the mutation
 battery, lives outside the committed tree, and every figure quoted below it is its
 output; the book grows by one row a day, which is why re-deriving them is a step
 rather than a copy-paste. Recomputing failed once, usefully: the day-15 hash in the
@@ -993,6 +1004,46 @@ first draft of that script had been typed from notes instead of read off disk, a
 what surfaced it was both nodes answering *no receipt* for the bytes I had written.
 A check that fails loudly is worth more than a check that is merely run, and a
 reader who wants to redo any of this needs `/history/census`, a node and sha256.
+
+The book's own size is capped by a measured row width, and that measurement was
+wrong once in the direction that matters, so the number is worth its paragraph:
+it read 339, then 345, because it was taken on a day-zero tank — `day: 0`,
+`tick: 4`, a population in the forties. The deployed book answered 35 rows
+(day 27 through day 61) at 2026-09-26T07:15Z, and the widest of its 34 stamped
+rows measures **374 bytes**: seven digits of tick and six digits of counters.
+At the cap the 345 implied (379) the array would have spent 142,126 bytes of a
+131,072 budget — 8% over, and over from the first day the cap filled, since
+every row the world serves is wider than the constant it was sized against. The
+cap is now 349 rows, 130,876 of the budget with 196 to spare, and the derivation
+counts the array and not just the rows: `n` rows of 374 bytes encode as
+`375n + 1`, because a book is written as JSON with a comma between neighbours and
+brackets around the lot. That punctuation is what the previous derivation —
+`budget / width`, the one that produced 386, 379 and 350 in three separate
+batches — left out, and the last of those three was 131,251 bytes, over by 179;
+the error was found by writing the function that measures the book for real and
+comparing what it returns with the number the comment claimed. The 78 bytes of
+`,"txHash":"0x…"` and the 6 of `,"v":1` are asserted as separate sums on *one*
+row rather than differenced across two, which is the other mistake this paragraph
+made out loud: 367 is a *different* row's width (day 32's, from the build before,
+which carried no `v`), and subtracting one row from another measures the world's
+growth as well as the field's cost — day 32 in this build's book is 373, so the
+field costs its 6 there too. Measured on the book's own `ts` values — 34 gaps,
+1 h 19 m 59 s to 1 h 30 m 04 s, mean 1 h 23 m 15 s — 349 rows is 20.1 days, just
+under three weeks of a busy world. The guard test measures a copy of the widest
+row that was ever served, one that hashes back to the hash printed beside it, so
+it cannot be typed from notes the way the last one was, and it re-measures a
+cap-full book in bytes rather than trusting the arithmetic above.
+
+And there is now a witness beside the cap, because a cap sized from a *measured
+maximum* is only true until the world's rows grow: `/health` publishes
+`census.bytes` and `census.maxRowBytes`, measured on the stored array wherever the
+book changes — a day closing, a confirmation stamping 78 bytes into a row without
+adding one, a cold start loading the whole thing back — and crossing
+`census.budget` is an alarming `census_past_budget`, edge-triggered once per
+fall rather than once a day. The two say different things, which is the reason
+there are two: `census_days_dropped` says a day fell out of the front of the book,
+which is what a full one does, and `census_past_budget` says the array over-spends
+the share it was given, which a full book is not supposed to do.
 
 The bookkeeping the anchor needed outlived its first draft: `lastCommittedDay` and the
 outstanding transaction moved into the ledger, because an eviction between two day
@@ -1003,27 +1054,27 @@ assumed. Each confirmed day is priced from its own receipt, read off the chain
 rather than quoted, and every receipt the book points at has been fetched back
 and multiplied out — twice, from two nodes, which had to agree on `status`,
 `gasUsed`, `effectiveGasPrice` and `blockNumber` before either answer counted.
-Thirty of the book's thirty-one rows carry a transaction hash — the
+Thirty-four of the book's thirty-five rows carry a transaction hash — the
 first row, day 27, is timestamped 2026-09-24T07:35:11Z, under ten minutes before
 the commit that taught the poll to record one, and its absence is kept rather
-than filled in after the fact. Those thirty, with the day-15 anchor that
-predates the book (`0xcc60e690…`) added, span 30,440 to 30,600 gas: the gas a
-day burns is not a constant. Neither is the price — eleven prices have appeared
-across those thirty-one receipts (20, 20.0001, 20.001, 20.1, 20.115,
+than filled in after the fact. Those thirty-four, with the day-15 anchor that
+predates the book (`0xcc60e690…`) added, span 30,440 to 30,640 gas: the gas a
+day burns is not a constant. Neither is the price — twelve prices have appeared
+across those thirty-five receipts (20, 20.000000001, 20.0001, 20.001, 20.1, 20.115,
 20.131747031, 20.141795011, 20.1520875, 20.19900952, 20.25 and 21 gwei) — which
 puts a day at 611,200,000,000,000 to 640,920,000,000,000 fee units, `0.0006` of
-the money, the cheapest and the dearest of those thirty-one separated by 4.9%. The
+the money, the cheapest and the dearest of those thirty-five separated by 4.9%. The
 newest of those measured costs is what the balance gets divided by, and the pair
 moves with every confirmation. The reading on record when this paragraph was last
-re-derived — taken 2026-09-26T01:07:54Z, for day 57 — holds
-19,973,592,279,347,715,280 fee units against a day that cost 616,653,877,500,000,
-and the first divided by the second, truncated, is the `32,390` published beside
+re-derived — taken 2026-09-26T06:46:48Z, for day 61 — holds
+19,971,133,495,347,684,640 fee units against a day that cost 615,060,000,000,000,
+and the first divided by the second, truncated, is the `32,470` published beside
 them: a division anybody can redo from the two figures published next to it,
 which is the only way this figure stays checkable through the ~83 minutes it
 takes to be superseded. Redoing it is also the only way the *balance* stays
 checkable, so the audit asks for that address's balance itself: at
-2026-09-26T02:02:59Z, fifty-five minutes after the reading it judges, both nodes
-still answered 19,973,592,279,347,715,280 — the recorded figure to the unit,
+2026-09-26T07:35:44Z, forty-nine minutes after the reading it judges, both nodes
+still answered 19,971,133,495,347,684,640 — the recorded figure to the unit,
 because no day confirmed in between and nothing else spends this account. An
 older pair is quoted because it is where that subtraction was first demonstrated,
 and it is kept rather than overwritten: the reading for day 46 (taken
@@ -1036,11 +1087,11 @@ in it, because what the two balances differ by is *exactly* the
 615,060,000,000,000 the newer receipt says that day cost. A gas price read off a
 receipt and a balance read off the node agree to the fee unit, and nothing else
 has spent from that account in between: the same subtraction, three times over now
-(days 35→36 and 42→43 are quoted below). Twenty-nine gaps between the thirty
+(days 35→36 and 42→43 are quoted below). Thirty-three gaps between the thirty-four
 consecutive confirmations of the book's own rows put the distance from one anchored
-day to the next between 79 minutes 58 seconds and 90 minutes 3 seconds, mean 82
-minutes 56 seconds; at that mean the
-runway above is 5.11 years, and across the spread of those gaps 4.92 to 5.55. The
+day to the next between 79 minutes 58 seconds and 90 minutes 3 seconds, mean 83
+minutes 9 seconds; at that mean the
+runway above is 5.13 years, and across the spread of those gaps 4.94 to 5.56. The
 day-15 anchor is in the cost sample and *not* in that distribution, and the
 reason it needs a sentence is that the first draft of the audit had it in both:
 it sits 18 hours 15 minutes 35 seconds before the first row of the book, so

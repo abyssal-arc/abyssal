@@ -38,10 +38,11 @@ import {
   digestHash, digestStats, encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
   nameRowRule, newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
-  CENSUS_CAP, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS, DIGEST_RULE_TABLE, DIGEST_V, LEGACY_RULE_VERSION,
+  CENSUS_BUDGET_BYTES, CENSUS_CAP, CENSUS_ROW_BYTES, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS, DIGEST_RULE_TABLE, DIGEST_V, LEGACY_RULE_VERSION,
+  censusFootprint,
   type CensusDay, type DigestRecord, type StoredRow,
 } from './digest.js';
-import { advisorySignals, healthProblem, staleSignals, type Health } from './health.js';
+import { advisorySignals, budgetCrossed, healthProblem, staleSignals, type Health } from './health.js';
 import {
   ABYS_PRICES,
   ABYS_PRICE_LEGENDARY_NAME,
@@ -1055,6 +1056,13 @@ export function createApp(options: AppOptions = {}) {
         cap: CENSUS_CAP,
         first: dayBook.length ? dayBook[0].day : null,
         last: dayBook.length ? dayBook[dayBook.length - 1].day : null,
+        // The two numbers the cap's derivation is made of, measured on the book that
+        // is actually stored: a reader can check `bytes` against the route's own rows
+        // and `maxRowBytes` against the constant, which is how the 345-byte claim got
+        // falsified here — by comparing it to a deployed row rather than to a fixture.
+        bytes: censusBytes,
+        maxRowBytes: censusMaxRowBytes,
+        budget: CENSUS_BUDGET_BYTES,
       },
       world: {
         tick: world.tick,
@@ -1152,6 +1160,51 @@ export function createApp(options: AppOptions = {}) {
   let dayBook: CensusDay[] = [];
 
   /**
+   * The book's measured footprint, refreshed by `measureDayBook`.
+   *
+   * Kept as state rather than computed inside `/health` because the crossing has to
+   * be announced when it happens, not the next time somebody asks: the book changes
+   * twice a day, and a watermark that is only read once a week says nothing about
+   * the week it missed. `maxRowBytes` is published beside it for the reason the
+   * last four numbers in this file were wrong: `CENSUS_ROW_BYTES` is a measured
+   * maximum, and the only way to notice reality outgrowing it is to keep measuring.
+   */
+  let censusBytes = 0;
+  let censusMaxRowBytes = 0;
+  let censusOver = false;
+
+  /**
+   * Size the book on the rows it holds and say once, on the crossing, that the
+   * share is gone. Called from every place the array changes: `noteDayBook`, the
+   * stamp in the pump, and the load — the three assignments a `dayBook` value can
+   * arrive at, which the footprint test in `api.test.ts` re-measures independently
+   * after each one so a fourth site cannot be forgotten quietly.
+   */
+  function measureDayBook(): void {
+    const at = censusFootprint(dayBook);
+    censusBytes = at.bytes;
+    censusMaxRowBytes = at.maxRowBytes;
+    const crossed = budgetCrossed(at.bytes, censusOver, CENSUS_BUDGET_BYTES);
+    censusOver = crossed.over;
+    if (crossed.announce) {
+      options.health?.note(
+        'census_past_budget',
+        `${at.bytes} bytes of day book over a share of ${CENSUS_BUDGET_BYTES}: ${dayBook.length} rows, `
+        + `widest ${at.maxRowBytes} against a claimed ${CENSUS_ROW_BYTES}`,
+      );
+      console.error(
+        `day book past budget: ${at.bytes} of ${CENSUS_BUDGET_BYTES} bytes, `
+        + `${dayBook.length} rows, widest ${at.maxRowBytes} vs CENSUS_ROW_BYTES ${CENSUS_ROW_BYTES}`,
+      );
+    }
+  }
+
+  // Sized before anything changes it, because a world whose storage holds no day book
+  // is still asked for `census.bytes`, and the honest answer for an empty array is the
+  // two brackets it encodes as rather than the zero the variable starts at.
+  measureDayBook();
+
+  /**
    * Append one day to the book.
    *
    * One row per day is the invariant the charts depend on, and the day is the
@@ -1170,6 +1223,7 @@ export function createApp(options: AppOptions = {}) {
       // the world's past, discovered by whoever notices the first day missing.
       options.health?.note('census_days_dropped', `day ${row.day} closed a book of ${CENSUS_CAP}`);
     }
+    measureDayBook();
   }
 
   /**
@@ -1477,6 +1531,10 @@ export function createApp(options: AppOptions = {}) {
         // transactions are deliberately not stamped, two branches below.
         const stamp = stampAnchor(dayBook, current.day, r.txHash, current.payload.hash);
         dayBook = stamp.rows;
+        // A stamp changes a row's bytes without changing the row count, so this is
+        // the one place the book grows while the cap stays put: 78 bytes go into the
+        // stored value on the day a transaction confirms.
+        measureDayBook();
         if (!stamp.stamped) {
           // A day is on chain and the book cannot say which transaction carried
           // it. Nothing the viewer sees is wrong — the absence of a link is the
@@ -2902,13 +2960,15 @@ export function createApp(options: AppOptions = {}) {
         }
         if (unnamed) {
           // Not an error and not an alarm either: a repair was applied to
-          // `unnamed` stored records, on every cold start, until the last of them
-          // ages out of the cap — which the deployed book says is about three
-          // weeks of filed days. Counted because the repair is a claim (see
+          // `unnamed` stored records — once per legacy snapshot, not on every read,
+          // because the label goes back out with the row on the next save. That is
+          // what the `a row named at load is saved named` test keeps true; the
+          // sentence before this one used to claim the opposite about a save path it
+          // had never run. Counted because the repair is a claim (see
           // `LEGACY_RULE_VERSION`), published because a number that starts growing
           // again means a snapshot arrived from a build older than this one, and
-          // exempt from `healthProblem` because a red light that cannot go out for
-          // three weeks stops being read (see `ADVISORY_KINDS`).
+          // exempt from `healthProblem` because naming the rule a record was honestly
+          // written under is not a fault (see `ADVISORY_KINDS`).
           options.health?.note('census_rule_backfilled', `${unnamed} row(s) of ${s.dayBook.length} arrived with no v; named ${LEGACY_RULE_VERSION}`);
         }
         // The cap is derived from a measured row width, so a build can lower it
@@ -2922,6 +2982,7 @@ export function createApp(options: AppOptions = {}) {
           options.health?.note('census_days_dropped', `${rows.length - CENSUS_CAP} stored row(s) over a cap of ${CENSUS_CAP} fell out at load, oldest dropped day ${rows[0].day}`);
           dayBook = rows.slice(rows.length - CENSUS_CAP);
         } else dayBook = rows;
+        measureDayBook();
       }
       // The anchor's economics, asked the same question as the rows above: does
       // this still mean what it claims. A bad object is dropped rather than

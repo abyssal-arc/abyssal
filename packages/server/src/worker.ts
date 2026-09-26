@@ -17,7 +17,7 @@
  */
 import { createApp, type WorldStore, type LedgerLoad } from './handler.js';
 import { setBurnLedger } from './payments.js';
-import { createHealth, receiptsValueBytes, type HealthView } from './health.js';
+import { createHealth, budgetCrossed, receiptsValueBytes, type HealthView } from './health.js';
 import { toJSON, SNAPSHOT_BUDGET, DO_VALUE_LIMIT } from '@abyssal/sim';
 
 interface DoStorage {
@@ -81,24 +81,6 @@ const INSTANCE_KEY = 'instance';
 const HEALTH_KEY = 'health';
 const SAVE_EVERY_MS = 30_000;
 
-/**
- * Whether a snapshot has just crossed the budget line, and whether that is news.
- *
- * Extracted and exported because no world built by legal means can reach it: the
- * sim's caps, every one of them full, come to about 1.15 MiB, and the line is at
- * 1.5 MiB on purpose — a budget that worst case already violates would warn on
- * every save and then be ignored. So the only honest way to test this state
- * machine is to hand it the numbers directly. Crossing up announces once,
- * staying over does not repeat, and dropping back re-arms it.
- */
-export function budgetCrossed(
-  bytes: number,
-  wasOver: boolean,
-  budget: number = SNAPSHOT_BUDGET,
-): { over: boolean; announce: boolean } {
-  const over = bytes > budget;
-  return { over, announce: over && !wasOver };
-}
 /** Internal path the cron handler pokes; never linked, never served to a viewer. */
 const CRON_PATH = '/__cron';
 
@@ -207,7 +189,10 @@ export class AbyssalWorld {
         // per-value limit; this one goes in as an object and Cloudflare sizes it
         // with a serializer we cannot invoke. Printing `JSON.stringify(s).length`
         // and calling it the stored size would be a number that is neither the
-        // bytes on the wire nor a bound on them.
+        // bytes on the wire nor a bound on them. The day book inside this object
+        // is sized anyway, one field at a time, in `measureDayBook` — which is the
+        // measurement `census_past_budget` is raised from, and the reason that alarm
+        // speaks of a share of the budget rather than of the value's encoded size.
         void this.ctx.storage.put('ledger', s).catch((err: unknown) => {
           // What an eviction now loses: the feed cursor (so blocks already
           // counted get re-read), the day passes, and who burned what.

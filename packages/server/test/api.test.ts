@@ -24,7 +24,7 @@ import {
   buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestPreImage, digestStats, encodeDigest, newDigestRecord,
   markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
   nextDigestAction, coherenceProblem, verifyPayload, verifiesOrNull, isSettled,
-  CENSUS_CAP, CENSUS_BUDGET_BYTES, CENSUS_ROW_BYTES,
+  CENSUS_CAP, CENSUS_BUDGET_BYTES, CENSUS_ROW_BYTES, censusFootprint,
   censusReading, censusRow, headcountByArchetype, type DigestWorldView,
   DIGEST_HASH_FIELDS, DIGEST_MAGIC, DIGEST_MAX_ATTEMPTS, DIGEST_POLL_MS,
   DIGEST_RETRY_MS, DIGEST_RULE_TABLE, DIGEST_V, stampAnchor, nameRowRule, LEGACY_RULE_VERSION,
@@ -2817,7 +2817,7 @@ test('a write fired without awaiting still says which one broke', async () => {
 });
 
 test('the snapshot budget announces a crossing, not a condition', async () => {
-  const { budgetCrossed } = await import('../src/worker.js');
+  const { budgetCrossed } = await import('../src/health.js');
   const { SNAPSHOT_BUDGET, DO_VALUE_LIMIT } = await import('@abyssal/sim');
 
   // No legally built world reaches this line — every cap full is about 1.15 MiB
@@ -2838,6 +2838,15 @@ test('the snapshot budget announces a crossing, not a condition', async () => {
   assert.equal(budgetCrossed(B + 1, false).announce, true, 'the default budget is the imported one');
   assert.ok(B < DO_VALUE_LIMIT, 'the alarm sits inside the wall, not on it');
   assert.ok(DO_VALUE_LIMIT - B >= 512 * 1024, 'and leaves at least half a megabyte of lead time to act on');
+
+  // The day book asks this same function about its own, much smaller ceiling. That
+  // is the reason the function moved to `health.js` rather than growing a second
+  // copy in `handler.js`: an edge implemented twice is an edge that can be wrong in
+  // one of the two places, and the census wiring below only proves the crossing is
+  // reported for a budget of 128 KiB if the state machine is the one tested above.
+  const C = CENSUS_BUDGET_BYTES;
+  assert.deepEqual(budgetCrossed(C, false, C), { over: false, announce: false }, 'the book at exactly its share is not past it');
+  assert.deepEqual(budgetCrossed(C + 1, true, C), { over: true, announce: false }, 'and over it, staying over is still one event');
 });
 
 /* ---------- the day digest: what is promised, and what may be claimed ---------- */
@@ -3979,7 +3988,11 @@ type HealthBody = {
     verifyProblem: string | null;
     signer: string | null;
   } | null;
-  census: { days: number; cap: number; first: number | null; last: number | null };
+  census: {
+    days: number; cap: number; first: number | null; last: number | null;
+    /** The stored book measured in bytes, brackets included — see `censusFootprint`. */
+    bytes: number; maxRowBytes: number; budget: number;
+  };
   /** Signals that have fired and fallen out of the window that reddens the light. */
   stale: string | null;
   /** Counted and current, but exempt from alarming — see `ADVISORY_KINDS`. */
@@ -4401,7 +4414,11 @@ test('a closed day is written into the book and still there when it is read back
       assert.deepEqual(reread.coverage, { first: 0, last: 0, days: 1 });
       const h = await readHealth(again);
       assert.equal(h.signals?.counts.census_row_rejected, undefined, 'a sound row is not refused on the way in');
-      assert.deepEqual(h.census, { days: 1, cap: CENSUS_CAP, first: 0, last: 0 });
+      assert.deepEqual(
+        h.census,
+        { days: 1, cap: CENSUS_CAP, first: 0, last: 0, ...censusFootprint(reread.rows), budget: CENSUS_BUDGET_BYTES },
+        'the block says how far back it goes and how big it is, the second measured on the rows the route just served',
+      );
     });
   } finally {
     rpc.close();
@@ -4738,10 +4755,11 @@ test('a ledger over the cap is trimmed on the way in, keeping the newest days', 
   assert.equal(body.coverage?.last, CENSUS_CAP + 1);
   assert.equal((await readCensus(app, '?days=9999')).rows.length, CENSUS_CAP, 'asking for more than exists is not an error');
   // Forgetting on the way in is the same loss as forgetting on the way out, and a
-  // build that lowers the cap reaches this line with a book it never wrote — this
-  // batch does exactly that, 386 → 379. Counted, because otherwise the days a cap
-  // change throws away leave no trace at all: the console line is the channel that
-  // is never delivered, and `/history/census` just looks like a shorter history.
+  // build that lowers the cap reaches this line with a book it never wrote — the
+  // cap went 386 → 379 → 350 inside this batch, once for each time a row width was
+  // measured rather than assumed. Counted, because otherwise the days a cap change
+  // throws away leave no trace at all: the console line is the channel that is never
+  // delivered, and `/history/census` just looks like a shorter history.
   const h = await readHealth(app);
   assert.equal(h.signals?.counts.census_days_dropped, 1, 'the load side says so too');
   assert.match(h.signals?.last?.census_days_dropped?.detail ?? '',
@@ -4826,34 +4844,213 @@ test('the route publishes what the hash covers, and today is marked uncommitted'
   assert.ok('GET /history/census' in api.endpoints, 'a route nobody can discover is a route nobody uses');
 });
 
-test('a day book row is as small as its comment claims', async () => {
-  // The comment on `CENSUS_CAP` states byte counts and does the arithmetic for
-  // the whole cap from them, which makes it a claim about the code. Measured here
-  // on a real row from a real day — four archetypes present, so this is a full
-  // row and not the thinnest one the tank can produce — in both shapes a row can
-  // have, because the cap has to hold the wider one: a day that anchors grows a
-  // transaction hash long after it was written.
+test('a day book row is as wide as the deployed book says it is', async () => {
+  // The widest row `GET /history/census` served from the deployed tank at
+  // 2026-09-26T04:21Z, copied out of the response rather than written by hand: day
+  // 59, in a world whose counters have six and seven digits. This is the shape the
+  // cap has to hold, and it is not the shape a fresh local tank makes — which is
+  // exactly how `CENSUS_ROW_BYTES` came to state 345 for rows that measure 374, and
+  // a cap of 379 of them to over-spend its budget by 8%.
+  const live: CensusDay = {
+    day: 59, tick: 1_152_224, population: 143, totalEnergy: 10_381, born: 233_832, died: 233_689,
+    predations: 218_898, topPredator: 'WHALE:44019', byArchetype: { WHALE: 69, INSIDER: 22, APE: 30, ALGO: 22 },
+    hash: '050b0817cfd0c56c0339e66a57be28aef2c9e90c4707e86b6f4ae27b62749577',
+    ts: 1_790_395_308_249,
+    txHash: '0xcd6ee61c02d1287131e64acb7941a19c09c08fda44e742c2c24f336a48dd0258',
+    v: 1,
+  };
+  // The paste is checked against itself before anything is measured with it: a
+  // hand-copied row that does not hash to its own digest would make every byte
+  // count below a statement about a row that has never existed. One such mistake is
+  // already on record in the audit script this fixture is borrowed from.
+  assert.equal(await digestHash(live), live.hash, 'the row pasted here reproduces the hash printed beside it');
+  assert.equal(censusProblem(live), null, 'and it is a row the guard accepts, so the measurement is of a served row');
+  assert.equal(Object.keys(live.byArchetype).length, 4, 'all four archetypes alive, so nothing is missing from the measurement');
+  const encoded = JSON.stringify(live);
+  assert.match(encoded, /^[\x20-\x7e]*$/, 'every character is ASCII, which is what makes a string length a byte count');
+  assert.equal(
+    encoded.length, CENSUS_ROW_BYTES,
+    `the widest deployed row measures ${encoded.length} bytes and CENSUS_ROW_BYTES says ${CENSUS_ROW_BYTES}; the cap is derived from that number, so it is not a comment to leave behind`,
+  );
+  // The other half of the same measurement, stated separately so a row that grew
+  // somewhere else cannot hide inside a matching total: 78 bytes is the JSON
+  // encoding of one `"txHash"` and one 66-character hash, and nothing more.
+  const unstamped = { ...live } as Partial<CensusDay>;
+  delete unstamped.txHash;
+  assert.equal(
+    encoded.length - JSON.stringify(unstamped).length, 78,
+    'a stamp costs 78 bytes on the deployed shape as well as on a local one',
+  );
+  // And the same for the field this batch added, differenced against *this* row.
+  // The 367 that an earlier draft of the comment above quoted as "the same row
+  // without v" is not the same row: it is day 32's, from the build before, which
+  // carried no v at all. Two rows subtracted from each other measure the world's
+  // growth as well as the field's cost, which is how six became seven.
+  const noV = { ...live } as Partial<CensusDay>;
+  delete noV.v;
+  assert.equal(
+    encoded.length - JSON.stringify(noV).length, 6,
+    '`v` costs six bytes on the row that carries it — the number the cap is sized against, and the field that moved it',
+  );
+
+  // The cap's promise, checked the way storage will check it: not as `rows × width`
+  // but as the bytes of the array a full book actually writes, brackets and the
+  // commas between neighbours included. Those 350 bytes of punctuation are the whole
+  // difference between a cap that fits its budget and the `budget / width` that
+  // quietly did not, so the assertion is made on the measured footprint.
+  const full = censusFootprint(Array.from({ length: CENSUS_CAP }, () => live));
+  assert.ok(
+    full.bytes <= CENSUS_BUDGET_BYTES,
+    `a full book is ${full.bytes} B against a share of ${CENSUS_BUDGET_BYTES}`,
+  );
+  assert.equal(full.maxRowBytes, CENSUS_ROW_BYTES, 'and the widest row inside it is the width the cap was derived from');
+  assert.ok(
+    censusFootprint(Array.from({ length: CENSUS_CAP + 1 }, () => live)).bytes > CENSUS_BUDGET_BYTES,
+    'the cap is the largest book that fits, not a round number with slack nobody measured',
+  );
+
+  // What used to be measured here, kept as the contrast rather than thrown away: a
+  // day-zero tank is a narrower row, and a cap derived from it is a cap that
+  // overspends the moment the world has been running for two months.
   const m = memStore();
   const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
   shortenDay(app);
   await tickTimes(app, 4);
   await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
-  const row = (await readCensus(app)).rows[0];
-  assert.equal(Object.keys(row.byArchetype).length, 4, 'all four archetypes alive, so nothing is missing from the measurement');
-  const bytes = JSON.stringify(row).length;
-  const stamped = JSON.stringify(stampAnchor([row], row.day, DIGEST_TX, row.hash).rows[0]).length;
-  assert.equal(
-    stamped, CENSUS_ROW_BYTES,
-    `a stamped row measures ${stamped} bytes and CENSUS_ROW_BYTES says ${CENSUS_ROW_BYTES}; the cap is derived from that number, so it is not a comment to leave behind`,
-  );
-  // The other half of the same measurement, stated separately so a row that grew
-  // somewhere else cannot hide inside a matching total: 78 bytes is the JSON
-  // encoding of one `"txHash"` and one 66-character hash, and nothing more.
-  assert.equal(stamped - bytes, 78, `a stamp added ${stamped - bytes} bytes to a ${bytes}-byte row`);
+  const fresh = (await readCensus(app)).rows[0];
+  const grown = stampAnchor([fresh], fresh.day, DIGEST_TX, fresh.hash).rows[0];
   assert.ok(
-    CENSUS_CAP * stamped < CENSUS_BUDGET_BYTES,
-    `the cap must stay inside its storage budget: ${CENSUS_CAP * stamped} B of ${CENSUS_BUDGET_BYTES}`,
+    JSON.stringify(grown).length < CENSUS_ROW_BYTES,
+    `a day-zero row is ${JSON.stringify(grown).length} bytes, under the ${CENSUS_ROW_BYTES} the deployed shape costs — which is the whole reason this test reads a live row`,
   );
+});
+
+/**
+ * `/health`'s footprint against the book `/history/census` serves.
+ *
+ * Read through the two public routes and recomputed here, because that is what an
+ * auditor does: a number the same code produced from the same array would agree no
+ * matter whether the array was the one being stored. Called after every event that
+ * can move the book — a day closing, a confirmation stamping a row, a cold start
+ * loading it back — so a fourth site that forgets to re-measure fails this instead
+ * of publishing a stale size.
+ */
+async function readFootprint(app: ReturnType<typeof createApp>) {
+  const [h, census] = await Promise.all([readHealth(app), readCensus(app)]);
+  assert.equal(h.census?.days, census.rows.length, 'the days published and the rows served are one array');
+  assert.deepEqual(
+    h.census && { bytes: h.census.bytes, maxRowBytes: h.census.maxRowBytes },
+    censusFootprint(census.rows),
+    `the footprint on /health is the footprint of the ${census.rows.length} rows on /history/census`,
+  );
+  assert.equal(h.census?.budget, CENSUS_BUDGET_BYTES, 'and the share it is measured against is the one in the constant');
+  return { health: h, rows: census.rows };
+}
+
+test("the day book's footprint is published at every place the book changes", async () => {
+  const rpc = await digestRpcStub();
+  const m = memStore();
+  const health = createHealth(1);
+  try {
+    await withDigestKey(async () => {
+      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(app);
+
+      // An empty book has a size, and it is the two brackets: `bytes: 0` would be a
+      // number for an array that writes `[]` into the stored value.
+      const empty = await readFootprint(app);
+      assert.equal(empty.health.census?.bytes, 2, 'an empty book is the empty array, in bytes');
+      assert.equal(empty.health.census?.maxRowBytes, 0, 'and holds no row to be the widest');
+      assert.equal(empty.health.signals?.counts.census_past_budget, undefined, 'which is not over any budget');
+
+      // Site one: a day closes and the row is appended.
+      await tickTimes(app, 4);
+      const sent = await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
+      const appended = await readFootprint(app);
+      assert.equal(appended.rows.length, 1);
+      assert.equal(appended.rows[0].txHash, undefined, 'still in flight, so still the unstamped shape');
+
+      // Site three first, because it is the one that can be skipped by accident: a
+      // cold isolate reads the book back and has to size what it loaded rather than
+      // start the count at zero.
+      const second = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(second);
+      const loaded = await readFootprint(second);
+      assert.equal(loaded.health.census?.bytes, appended.health.census?.bytes, 'the book that came back off disk is the book that went in');
+
+      // Site two — the stamp — driven the way `a day that makes it on chain is told
+      // so` drives it: backdate the poll clock, hand the stub a successful receipt,
+      // tick. A third isolate rather than the second, because the measurement wanted
+      // is the one `second` took before anything could confirm on it.
+      m.seedDigest({ ...sent, lastAttemptAt: 0 });
+      rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: sent.txHash });
+      const third = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
+      shortenDay(third);
+      await tickTimes(third, 4);
+      await untilDigest(m.digest, (r) => r.status === 'confirmed', 'confirmed');
+      const stamped = await readFootprint(third);
+      assert.equal(stamped.rows.length, loaded.rows.length, 'no second day closed while the first one was confirming');
+      assert.equal(stamped.rows[0].txHash, DIGEST_TX, 'the confirmation reached the row the footprint is measured on');
+      assert.equal(
+        stamped.health.census!.bytes - loaded.health.census!.bytes, 78,
+        'a stamp is 78 bytes of stored value with no new day, which is what the watermark and not the cap is for',
+      );
+      assert.equal(stamped.health.census?.maxRowBytes, loaded.health.census!.maxRowBytes + 78, 'and it shows up as a wider row too');
+      assert.equal(stamped.health.signals?.counts.census_past_budget, undefined, 'one stamped day is not a budget crossing');
+    });
+  } finally {
+    await rpc.close();
+  }
+});
+
+test('a day book that outgrows its share of the ledger says so once, and reddens the light', async () => {
+  const wide = (day: number): CensusDay => {
+    // A wider world rather than a fabricated shape: ten archetypes and six-digit
+    // headcounts make a row that `censusProblem` accepts because the headcount adds
+    // up. That is the point. The cap is sized from one build's widest row, so the
+    // only way to outgrow the budget is the one the cap cannot see — rows wider
+    // than the constant, at a row count that never exceeds it.
+    const byArchetype: Record<string, number> = {
+      APE: 100_000, WHALE: 100_000, ALGO: 100_000, INSIDER: 100_000, DOLPHIN: 100_000,
+      TURTLE: 100_000, SQUID: 100_000, CRAB: 100_000, JELLYFISH: 100_000, ANGLERFISH: 100_000,
+    };
+    return censusFixture(day, byArchetype);
+  };
+  const m = memStore();
+  const health = createHealth(1);
+  m.seedDayBook(Array.from({ length: CENSUS_CAP }, (_, i) => wide(i)));
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const { health: h, rows } = await readFootprint(app);
+  assert.equal(rows.length, CENSUS_CAP, 'the book is at its cap, which is the state the cap was designed for');
+  assert.ok(censusFootprint(rows).bytes > CENSUS_BUDGET_BYTES, `and over its budget anyway: ${censusFootprint(rows).bytes} B`);
+  assert.equal(h.signals?.counts.census_past_budget, 1, 'the crossing is counted, once, at the load that found it');
+  const detail = h.signals?.last?.census_past_budget?.detail ?? '';
+  assert.match(detail, new RegExp(`over a share of ${CENSUS_BUDGET_BYTES}`), 'the detail names the budget that was exceeded');
+  assert.match(detail, /widest \d+ against a claimed 374/, 'and the row width the cap was derived from, which is the number to go look at');
+  assert.equal(h.healthy, false, 'this one is an alarm and not an advisory: the claim that the book fits is already false');
+  assert.match(h.problem ?? '', /census_past_budget=1/, 'and it reaches the problem string, not only the counts');
+
+  // The edge, in the isolate that raised it: a second day closing on an already
+  // over-budget book is the same fact restated, so the counter stays at one. Without
+  // this, the alarm doubles every day and buries the number beside it — which is the
+  // failure `anchor_runway_low` and the snapshot watermark were both built to avoid.
+  shortenDay(app);
+  await tickTimes(app, 4);
+  await untilDigest(m.digest, (r) => r.status === 'unconfigured', 'unconfigured');
+  const again = await readHealth(app);
+  assert.equal(again.signals?.counts.census_past_budget, 1, 'staying over budget is one event, not one a day');
+  assert.equal(again.signals?.counts.census_days_dropped, 1, 'while the day that fell out of the front of it is counted separately');
+
+  // And the control: a book at the same cap whose rows are the width the cap was
+  // measured at fits, so the alarm above is about bytes and not about being full.
+  const narrow = memStore();
+  const narrowHealth = createHealth(2);
+  narrow.seedDayBook(Array.from({ length: CENSUS_CAP }, (_, i) => censusFixture(i)));
+  const fitted = createApp({ seed: 1, store: narrow.store, health: narrowHealth, ...offlineFeeds });
+  const hf = await readHealth(fitted);
+  assert.ok((await readFootprint(fitted)).health.census!.bytes <= CENSUS_BUDGET_BYTES, 'the fixture book is inside the share');
+  assert.equal(hf.signals?.counts.census_past_budget, undefined, 'and says nothing about it');
+  assert.equal(hf.healthy, true, 'a full book at the measured width is not an alarm');
 });
 
 /* ---------- which rule made this row, and who is allowed to say ---------- */
@@ -4948,10 +5145,12 @@ test('a stored book from before rows carried a version comes back named and unch
       assert.equal(h.signals?.counts.census_row_rejected, undefined, 'nothing was refused on the way in');
       assert.equal(h.signals?.counts.census_rule_backfilled, 1, 'the repair is a claim about real records, so it is counted');
       assert.match(h.signals?.last?.census_rule_backfilled?.detail ?? '', /1 row\(s\) of 1 arrived with no v; named 1/);
-      // The claim this leaves for the deployed tank: a book that has to be repaired
-      // on every read is counted and published, and is not an alarm — 32 legacy
-      // rows against a cap of 379 is about three weeks of cold starts, and a red
-      // light with no off switch for three weeks is why the next one gets skipped.
+      // The claim this leaves for the deployed tank: a book that had to be repaired
+      // is counted and published, and is not an alarm. It fires once per legacy
+      // snapshot — the test below saves and re-hydrates to prove the label goes out
+      // with the row — and the case it can come back is a snapshot from a build
+      // older than the one reading it, which is a fact about a deploy rather than a
+      // fault in this one.
       assert.equal(h.healthy, true, 'a cold start that repaired the book is not a failing one');
       assert.equal(h.problem, null);
       assert.equal(h.advisory, 'census_rule_backfilled=1', 'said out loud, just not as a fault');
@@ -4959,6 +5158,44 @@ test('a stored book from before rows carried a version comes back named and unch
   } finally {
     rpc.close();
   }
+});
+
+/**
+ * The repair is applied once, not on every read.
+ *
+ * Measured rather than argued, because the first draft of `ADVISORY_KINDS`
+ * justified itself with "fires on every cold start for as long as those records are
+ * in the book — three weeks of red" — a claim about a save path that had never been
+ * run. The loader labels the row in memory and `saveStore` writes that same array
+ * back out, so the second isolate finds a book that already names its own rule. The
+ * advisory exemption still stands (a repair is not a fault, and a re-import from an
+ * older build would legitimately re-fire it), but it stands for the reason below and
+ * not for the one that was written down.
+ */
+test('a row named at load is saved named, so the next isolate does not name it again', async () => {
+  const m = memStore();
+  const health = createHealth(1);
+  const { v: _dropped, ...legacy } = censusFixture(5);
+  m.seedDayBook([legacy as StoredRow]);
+  // An isolate that has been asleep for a minute: the state this app hydrates carries
+  // a clock that old, which is what makes `catchUp` below do the work a real request
+  // does in production.
+  m.seedClock(Date.now() - 60_000);
+  const app = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const first = await readCensus(app);
+  assert.equal(first.rows.length, 1, 'the legacy row loaded');
+  assert.equal(first.rows[0].v, LEGACY_RULE_VERSION, 'and was named on the way in');
+  assert.equal((await readHealth(app)).signals?.counts.census_rule_backfilled, 1, 'named once, out loud');
+  assert.equal(m.dayBook()![0].v, undefined, 'nothing has been written back yet — the label is only in this isolate');
+  assert.ok((await app.catchUp()) > 0, 'the catch-up ran, and a catch-up ends in saveStore');
+  assert.equal(m.dayBook()![0].v, LEGACY_RULE_VERSION, 'the label is in the stored bytes, not only in the closure');
+
+  const again = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+  const reread = await readCensus(again);
+  assert.equal(reread.rows.length, 1);
+  assert.equal(reread.rows[0].v, LEGACY_RULE_VERSION, 'the second isolate reads a row that already names its rule');
+  assert.equal((await readHealth(again)).signals?.counts.census_rule_backfilled, 1,
+    'naming the same row twice would be the repair failing, not working');
 });
 
 test('the route publishes every rule it can check, and each row names one of them', async () => {
@@ -6014,11 +6251,12 @@ test('a signal reddens the health light only while it is still happening', () =>
 
 /**
  * The other half of the same rule: a count that describes the records on disk
- * rather than a fault that started and stopped. The deployed book is made of rows
- * this loader labels on every cold start, and `ADVISORY_KINDS` carries the
- * measurement of how long that goes on — about three weeks of filed days. Under
- * the window rule alone that is a red light that cannot go out, which is the
- * condition under which a red light stops being read.
+ * rather than a fault that started and stopped. The loader labels a legacy row once
+ * and saves the label back with it — the test above measures that — but the first
+ * 24 hours after such a cold start would still hold the light red for a book that
+ * loaded correctly. `ADVISORY_KINDS` exists for that hour, and `M288` is the proof
+ * it is load-bearing: drop the exemption and the only red light in the tank is the
+ * repair.
  */
 test('an advisory signal is counted, published, and never holds the light red', () => {
   const T = 1_700_000_000_000;

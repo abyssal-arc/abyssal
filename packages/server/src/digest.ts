@@ -542,18 +542,34 @@ export function censusChanges(rows: readonly CensusDay[]): CensusChange[] {
 }
 
 /**
- * What one row costs in the storage value, measured rather than estimated.
+ * What one row costs in the storage value, measured on the rows that are stored.
  *
- * The `a day book row is as small as its comment claims` test re-measures this
- * on a real row from a real day — four archetypes alive, a 64-character digest,
- * thirteen digits of wall clock, the two digits of `v` that say which rule made
- * that digest, and the 78 bytes of `,"txHash":"0x…"` that a confirmed day
- * carries — and asserts equality, so a row that grows anywhere fails there
- * instead of quietly overspending the cap below. The measurement reads 267 bytes
- * unstamped and 345 stamped; the same test asserts the 78-byte difference
- * separately, so growth in the body cannot hide inside a matching total.
+ * The number below has been wrong once, in a way worth keeping in the sentence:
+ * it read 339, then 345, because it was measured on a day-zero tank built by the
+ * test — `day: 0`, `tick: 4`, a population in the forties. The deployed book holds
+ * `day: 59`, a 7-digit tick and six-digit counters, and its widest row measures
+ * 374 bytes. At the cap those 345-byte rows implied (379) the array would have put
+ * 142,126 bytes into a budget of 131,072 — over by 8%, and over on the very first
+ * day the cap filled, since every row in the book is wider than the constant. The
+ * guard test now measures the shape the world actually serves rather than the shape
+ * a fresh local tank happens to make, and the number is re-read from the deployed
+ * route (`GET /history/census`, 2026-09-26T07:15Z, the widest of its 35 rows — day
+ * 59, one of the 34 that carry a transaction hash) rather than derived from a
+ * fixture.
+ *
+ * 374 bytes is a stamped row. The same row with its `txHash` removed is 296 and
+ * with `v` removed is 368 — each differenced against itself, not against another
+ * day's row, because that is the mistake that made the last version of this comment
+ * say seven bytes for `v`: 367 was day 32's width in the build before, which wrote
+ * no `v` at all, and day 32 in this book is 373. Differenced row-by-row across all
+ * 35 rows the field costs 6 on every one of them, and the hash 78 on every stamped
+ * one. The 78 bytes of `,"txHash":"0x…"` are asserted separately from the total so
+ * growth somewhere else in the row cannot hide inside a matching sum. Every
+ * character a row can hold is ASCII — archetype names, digits and hex — which is why
+ * a string length is a byte count here at all; the test asserts that too, because it
+ * is the assumption the whole arithmetic stands on.
  */
-export const CENSUS_ROW_BYTES = 345;
+export const CENSUS_ROW_BYTES = 374;
 
 /**
  * The share of the ledger value the day book is allowed to take.
@@ -566,23 +582,60 @@ export const CENSUS_ROW_BYTES = 345;
 export const CENSUS_BUDGET_BYTES = 128 * 1024;
 
 /**
- * Days kept in the book, derived from the two numbers above rather than picked:
- * 379 rows inside 128 KiB. That is not the long run of history it sounds like —
- * the anchor's own clock says a day is longer than the four-ticks-a-second
- * arithmetic suggests, because the digest waits for the chain to confirm before
- * the next row opens. Measured on the deployed tank, over the 29 gaps between
- * consecutive days of a 31-day book: 79m 58s to 90m 03s, mean 82m 56s. At that
- * mean the whole book is 21.8 days — just over three weeks of a busy world. The
- * six bytes this batch added to a row cost seven days of that history: the cap
- * went 386 → 379, which is what `CENSUS_CAP` being derived rather than typed is
- * for.
+ * Days kept in the book, derived from the two numbers above rather than picked —
+ * including the part of the array that is not a row: `n` rows of 374 bytes encode as
+ * `375n + 1` bytes once the opening bracket, the comma after every neighbour and the
+ * closing bracket are counted, so the cap is the largest `n` with `375n + 1` inside
+ * the budget. That is 349, spending 130,876 of 131,072 with 196 left over. The
+ * formula that produced 350 (`budget / row`) was this comment's arithmetic, not the
+ * code's, and it was wrong by the 351 bytes of commas and brackets a 350-row book
+ * needs: 131,251, over the budget by 179 — the same kind of error the paragraph
+ * above is about, found here by writing down the measurement this function is
+ * supposed to make safe and comparing. 349 rows is not the long run of history it
+ * sounds like — the anchor's own clock says a day is longer than the
+ * four-ticks-a-second arithmetic suggests, because the digest waits for the chain to
+ * confirm before the next row opens. Measured on the deployed tank over the 34 gaps
+ * between consecutive days of the 35-day book at 2026-09-26T07:15Z: 1 h 19 m 59 s to
+ * 1 h 30 m 04 s, mean 1 h 23 m 15 s. At that mean the whole book is 20.1 days — just
+ * under three weeks of a busy world. The six bytes `v` adds to a row cost six days of
+ * that history on this formula — the same row without the field is 368 bytes and
+ * would buy 355 rows — which is what deriving the cap rather than typing it is for.
  *
- * There is no byte alarm on this array, on purpose: the ledger is stored as an
- * object, so its encoded size is not a number this code can produce honestly —
- * see the note in `worker.ts` about why the ledger reports no byte count. The cap
- * and the `census_days_dropped` counter are what stand in for one.
+ * What watches the derivation is `censusFootprint` below and the `census_past_budget`
+ * counter beside it: the constant above is a *measured maximum*, not a per-row
+ * average, so the day a row outgrows it the cap over-spends its budget the way it
+ * just did — and this time there is a number that says so, rather than only a
+ * comment explaining afterwards why the arithmetic was wrong.
  */
-export const CENSUS_CAP = Math.floor(CENSUS_BUDGET_BYTES / CENSUS_ROW_BYTES);
+export const CENSUS_CAP = Math.floor((CENSUS_BUDGET_BYTES - 1) / (CENSUS_ROW_BYTES + 1));
+
+/**
+ * The stored day book's own footprint, measured on the rows it holds.
+ *
+ * `bytes` is the size of the JSON array as it is written into the ledger value —
+ * brackets and commas included, which is what makes the cap above its bound rather
+ * than a suggestion. Measured in bytes with `TextEncoder` and not by `string.length`
+ * for the same reason the snapshot is (`persist()` in `worker.ts`): the budget is
+ * stated in bytes, and a length is in UTF-16 code units. Day-book rows are ASCII and
+ * the guard test on `CENSUS_ROW_BYTES` asserts that, so the two agree today; this is
+ * the half of the ledger whose encoding this code can produce honestly, and the
+ * whole ledger's is not (the object goes to `storage.put` and Cloudflare sizes it
+ * with a serializer nobody can invoke here).
+ *
+ * One pass over the array plus one stringified row at a time, called wherever the
+ * book changes: a day closing, a confirmation writing 78 bytes into the row that is
+ * already there, a cold start reading the whole thing back, and once at construction
+ * so an empty book publishes 2 bytes rather than nothing — four sites in `handler.ts`.
+ */
+export function censusFootprint(rows: readonly CensusDay[]): { bytes: number; maxRowBytes: number } {
+  const encode = new TextEncoder();
+  let maxRowBytes = 0;
+  for (const row of rows) {
+    const n = encode.encode(JSON.stringify(row)).byteLength;
+    if (n > maxRowBytes) maxRowBytes = n;
+  }
+  return { bytes: encode.encode(JSON.stringify(rows)).byteLength, maxRowBytes };
+}
 
 /** What `stampAnchor` did, and the reason it says it did nothing. */
 export interface AnchorStamp {

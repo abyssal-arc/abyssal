@@ -125,10 +125,16 @@ export const censusRow = (day, byArchetype, txHash) => ({
 });
 
 export const census = {
-  // Mirrors the server's derived cap (128 KiB over a measured row width of 345
-  // bytes for a stamped row). Written out rather than imported because the browser
-  // has no access to the module that computes it, and nothing on this side reads it.
-  cap: 379,
+  // Mirrors the server's derived cap: 128 KiB of share, 374 bytes for the widest
+  // stamped row the deployed book holds, and one byte of comma per neighbour plus
+  // two brackets (see `CENSUS_CAP`). Written out rather than imported because the
+  // browser has no access to the module that computes it, and nothing on this side
+  // reads it — which is why `pure.test.js` re-derives it from the same three numbers
+  // instead of trusting the literal. This number has been corrected four times since
+  // it was first typed: 400 by hand, then 386, 379 and 350 as the row width was
+  // re-measured three times over two batches, and 349 now that the separators are
+  // counted in the derivation.
+  cap: 349,
   book: 4,
   coverage: { first: 0, last: 4, days: 4 },
   hashed: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
