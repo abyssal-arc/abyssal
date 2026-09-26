@@ -42,6 +42,7 @@ import {
   censusFootprint,
   type CensusDay, type DigestRecord, type StoredRow,
 } from './digest.js';
+import { checkTransaction, isTxHash, type RpcObject } from './verify.js';
 import { advisorySignals, budgetCrossed, healthProblem, staleSignals, type Health } from './health.js';
 import {
   ABYS_PRICES,
@@ -519,6 +520,54 @@ function decimate<T>(rows: T[], slots: number): T[] {
 function positiveInt(raw: string | null, fallback: number): number {
   const n = Number(raw ?? '');
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * Ask one node one method for one object, and keep the three answers distinct.
+ *
+ * `null` means the node *answered* "there is no such thing", which is evidence;
+ * a throw means the question was never answered — a dead endpoint, a timeout, a
+ * JSON-RPC error — and is not evidence of anything. The route below spends those
+ * two on different verdicts, because a verifier that reports "no commitment was
+ * ever made" when its own RPC timed out is making a false statement about this
+ * project's history out of a network failure. Same discipline as `econ.ts`, which
+ * will not write a runway of zero for a balance it could not read.
+ *
+ * The timeout is a real deadline rather than a courtesy: this is a request path,
+ * and a node that hangs would otherwise hold a viewer's connection open for as
+ * long as the platform allows. `unref` is called only where it exists, because
+ * Workers have no timer list to release and a bare cast to a type the runtime
+ * does not carry is how this file invented an API it could not call.
+ */
+async function rpcObject(
+  rpc: string,
+  method: string,
+  params: unknown[],
+  timeoutMs = 4_000,
+): Promise<RpcObject | null> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs) as ReturnType<typeof setTimeout> & { unref?(): void };
+  timer.unref?.();
+  try {
+    const res = await globalThis.fetch(rpc, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: ac.signal,
+    });
+    if (!res.ok) throw new Error(`${method}: HTTP ${res.status}`);
+    const j = (await res.json()) as { result?: RpcObject | null; error?: { message?: string } };
+    if (j.error) throw new Error(`${method}: ${j.error.message ?? 'rpc error'}`);
+    return j.result ?? null;
+  } catch (err) {
+    // Named once here and rethrown: the route's answer says "the chain was not
+    // reached", and without this line the only trace of *why* is whatever the
+    // caller's log happens to keep — and console lines are never delivered.
+    console.error(`verify: ${method} did not answer`, err);
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -1172,6 +1221,16 @@ export function createApp(options: AppOptions = {}) {
   let censusBytes = 0;
   let censusMaxRowBytes = 0;
   let censusOver = false;
+
+  /**
+   * Whether the current RPC outage for `GET /verify` has already been announced.
+   * Edge-triggered like `censusOver`: the first request that cannot reach the
+   * node notes `verify_unreachable`, and every later one on the same outage says
+   * nothing until a request succeeds and resets the flag. Without it, a viewer
+   * refreshing a page whose node is down counts the same network failure once
+   * per click, and `/health` would be reporting traffic rather than outages.
+   */
+  let verifyOutageNoted = false;
 
   /**
    * Size the book on the rows it holds and say once, on the crossing, that the
@@ -2156,6 +2215,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /history': 'recent per-tick stats (incl. per-archetype population) for charts: ?window=<n> sets the depth, ?slots=<n> decimates server-side',
         'GET /history/pulse': 'time-travel for the OBSERVE pulse: ?range=1h|24h returns re-bucketed USDC volume columns',
         'GET /history/census': `the day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; ?days=<n> for the newest n; see .hashed for what the commitment covers`,
+        'GET /verify': `read one anchored day off the chain: ?tx=<0x…> fetches the transaction and its receipt, decodes the commitment out of the calldata, re-hashes it under the rule the record itself names, and compares against the day book — verdicts are verified, mismatch, uncheckable (a rule this build has no field list for), pending, not-found, unreadable and unknown, which are not interchangeable`,
         'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the Arc USDC flow ring this isolate has polled so far, filtered by ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; the answer carries retained/oldest/newest so the coverage bought is visible rather than implied; 503 until the SELLER_PRIVATE_KEY binding is set`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
@@ -2295,6 +2355,98 @@ export function createApp(options: AppOptions = {}) {
           committed: false,
         },
       }, 200, 3);
+    }
+
+    if (req.method === 'GET' && path === '/verify') {
+      // Read one of our commitments straight off the chain. The whole route is a
+      // wrapper around `verify.ts`, which does the arithmetic without touching the
+      // network — so what lives here is only the asking, and the answering about
+      // the asking.
+      const txParam = url.searchParams.get('tx');
+      if (!txParam || !isTxHash(txParam)) {
+        // Shaped like the burn route's refusal rather than a bare 400: a reader who
+        // pasted a block hash from an explorer is one character edit away from an
+        // answer, and the response should say which edit.
+        return json({
+          error: '`tx` must be a transaction hash: 0x followed by 64 hex digits',
+          got: txParam === null ? null : `${txParam.slice(0, 10)}… (${txParam.length} chars)`,
+          hint: 'a row\'s `txHash` from GET /history/census is the thing to ask about',
+        }, 400);
+      }
+      const txHash = txParam.toLowerCase();
+      // The row that points at this transaction, if the book has one. Looked up by
+      // hash rather than by day, because the question a reader asks is "is *this*
+      // transaction what my row claims" — and a book that has no such row is an
+      // answer (an unanchored day, or a hash from another chain), not a failure.
+      const row = dayBook.find((r) => typeof r.txHash === 'string' && r.txHash.toLowerCase() === txHash) ?? null;
+      const rpc = options.rpc ?? readEnv('ARC_RPC_URL');
+      let chainAnswered = false;
+      let tx: RpcObject | null = null;
+      let receipt: RpcObject | null = null;
+      if (rpc) {
+        try {
+          // Two calls rather than a batch: a batch failure would not say which of
+          // the two the node refused, and the answer distinguishes "no such
+          // transaction" from "no receipt yet". Concurrent, because the reader is
+          // waiting on both anyway.
+          [tx, receipt] = await Promise.all([
+            rpcObject(rpc, 'eth_getTransactionByHash', [txHash]),
+            rpcObject(rpc, 'eth_getTransactionReceipt', [txHash]),
+          ]);
+          chainAnswered = true;
+        } catch {
+          // `rpcObject` already logged and counted which question went quiet; here
+          // the only new fact is that the *answer* is now "we could not look".
+          tx = null;
+          receipt = null;
+        }
+      }
+      const check = await checkTransaction(txHash, tx, receipt, row, { chainAnswered });
+      if (!chainAnswered) {
+        // One event per failure rather than one per request: a viewer retrying a
+        // page that cannot reach its node would otherwise fill the ledger with the
+        // same outage, and `/health` would be reporting how many people looked.
+        if (!verifyOutageNoted) {
+          verifyOutageNoted = true;
+          options.health?.note(
+            'verify_unreachable',
+            rpc ? `the configured endpoint did not answer a verification request: ${rpc}` : 'no RPC endpoint configured, so this build cannot verify any transaction',
+          );
+        }
+      } else {
+        verifyOutageNoted = false;
+      }
+      // Status is the verdict, not a wrapper around it: a 200 whose body says
+      // "mismatch" is a green light that has to be opened to be read.
+      const status = check.verdict === 'verified' ? 200
+        : check.verdict === 'mismatch' ? 409
+        : check.verdict === 'not-found' ? 404
+        : check.verdict === 'pending' ? 202
+        : check.verdict === 'unknown' ? 502
+        : 200;
+      // A confirmed transaction's bytes do not change, so its verification can be
+      // cached; a pending one cannot, because the next second may be the one that
+      // answers. `cacheSec` is the only place that distinction is made, and the
+      // helper refuses to store anything above it.
+      const cacheSec = check.verdict === 'pending' || check.verdict === 'unknown' ? 0 : 60;
+      return json({
+        ...check,
+        // What the answer was computed *against*, so that a reader can disagree
+        // with this build rather than with our arithmetic: the rule table the
+        // verdict was looked up in, the endpoint that was asked, the chain this
+        // isolate believes it is on, and the address whose key signs the days.
+        context: {
+          chainId: CHAIN_ID,
+          rpc: rpc ?? null,
+          chainAnswered,
+          signer: digestSigner(),
+          rules: DIGEST_RULE_TABLE,
+          book: { cap: CENSUS_CAP, days: dayBook.length, coverage: dayBook.length ? { first: dayBook[0].day, last: dayBook[dayBook.length - 1].day } : null },
+          // The same check, redoable without this endpoint: the pre-image is
+          // published above precisely so `sha256sum` is the only dependency.
+          doItYourself: 'GET /history/census, take a row\'s fields in .rules[v] order joined by |, prefix "abyssal-day-digest|", hash with sha256, compare against .hash, and read .input of the transaction from a node you choose',
+        },
+      }, status, cacheSec);
     }
 
     if (req.method === 'GET' && path === '/data/flows') {

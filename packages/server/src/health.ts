@@ -181,6 +181,18 @@ export const SIGNAL_KINDS = [
    * counter that gets ignored the next time it matters.
    */
   'data_settle_failed',
+  /**
+   * A `GET /verify` request came in and this build could not ask the chain the
+   * question — either no RPC endpoint is configured, or the configured one did
+   * not answer inside the timeout. Counted because the response alone cannot tell
+   * an operator what happened: the viewer correctly gets `unknown` (which is not
+   * evidence that no commitment exists), but a run of those is a fact about our
+   * own infrastructure, not about the transaction. Edge triggered like the budget
+   * watermarks — `verifyOutageNoted` in handler.ts announces the first request of
+   * an outage and resets on the first that gets an answer — so the count is a
+   * number of outages, not a number of page refreshes during one.
+   */
+  'verify_unreachable',
 ] as const;
 
 export type SignalKind = (typeof SIGNAL_KINDS)[number];

@@ -41,6 +41,10 @@ import {
   txFeeUnits, unitScaleProblem, USDC_TOKEN_DECIMALS,
   type AnchorEcon,
 } from '../src/econ.js';
+import {
+  isTxHash, decodeCalldataPayload, chainFacts, receiptFacts, checkTransaction,
+  type RpcObject,
+} from '../src/verify.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -6960,6 +6964,354 @@ test('a stored economics object that no longer means what it claims is refused o
   assert.equal(body.anchor.runway.anchors, null);
   assert.match(body.anchor.runway.unknown ?? '', /balance not read/);
 });
+
+/* ------------------------------------------------------------------ J-3: /verify */
+
+/** A 20-byte address for the stub transaction's `from`/`to`; its value is not under test. */
+const VERIFY_SIGNER = '0x' + 'cd'.repeat(20);
+
+/**
+ * A (row, calldata, payload) triple that all agree, built from one `censusFixture`.
+ *
+ * The row's `hash` and the calldata's `hash` are the SAME recomputed digest, so a
+ * `verified` verdict here is proof of the whole chain — fixture → payload → chain
+ * bytes → decode → re-hash → row compare — and not a fixture hand-tuned to pass.
+ */
+async function anchoredPair(day: number, txHash = DIGEST_TX) {
+  const base = censusFixture(day);
+  const payload = await buildPayload(base, base.ts);
+  const row = { ...base, hash: payload.hash, txHash };
+  return { row, calldata: encodeDigest(payload), payload };
+}
+
+/** ABYS tag glued to an arbitrary JSON body, for the decode-refusal cases. */
+const calldataWith = (json: string) => `0x41425953${Buffer.from(json).toString('hex')}` as const;
+
+/**
+ * A stub whose reachability a test can toggle, so the outage edge can be watched
+ * cross a recovery. A JSON-RPC error object is what makes `rpcObject` throw — the
+ * same shape a dead endpoint produces — as distinct from answering `null`, which
+ * the route must read as `not-found` rather than `unknown`.
+ */
+async function verifyOutageStub(calldata: string) {
+  let fail = true;
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    const call = JSON.parse(body || '{}') as { method?: string };
+    res.setHeader('content-type', 'application/json');
+    if (fail) {
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'endpoint down' } }));
+      return;
+    }
+    const result = call.method === 'eth_getTransactionByHash'
+      ? { input: calldata, from: VERIFY_SIGNER, blockNumber: '0x100' }
+      : call.method === 'eth_getTransactionReceipt'
+        ? { status: '0x1', blockNumber: '0x100', blockHash: '0x' + '11'.repeat(32), gasUsed: '0x5208', effectiveGasPrice: '0x1' }
+        : null;
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result }));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    setFail: (v: boolean) => { fail = v; },
+    close: () => server.close(),
+  };
+}
+
+test('isTxHash wants exactly 0x + 64 hex', () => {
+  assert.ok(isTxHash('0x' + 'ab'.repeat(32)));
+  assert.ok(isTxHash('0x' + 'AB'.repeat(32)), 'case-insensitive on the way in');
+  assert.ok(!isTxHash('0x' + 'ab'.repeat(31)), 'one byte short');
+  assert.ok(!isTxHash('ab'.repeat(32)), 'no 0x prefix');
+  assert.ok(!isTxHash('0x' + 'zz'.repeat(32)), 'not hex');
+  assert.ok(!isTxHash(123 as unknown as string), 'not a string at all');
+});
+
+test('decodeCalldataPayload is the exact inverse of encodeDigest', async () => {
+  const { calldata, payload } = await anchoredPair(5);
+  const d = decodeCalldataPayload(calldata);
+  assert.ok(d.ok, d.ok ? '' : d.problem);
+  if (d.ok) {
+    assert.equal(d.magic, '0x41425953');
+    assert.equal(d.fields.hash, payload.hash);
+    assert.equal(d.fields.day, 5);
+    assert.equal(d.fields.v, 1, 'the record names its own rule');
+  }
+});
+
+test('decodeCalldataPayload refuses every way a byte string is not a record', () => {
+  assert.match(String((decodeCalldataPayload('hello') as { problem: string }).problem), /not a hex string/);
+  assert.match(String((decodeCalldataPayload('0xabc') as { problem: string }).problem), /odd number of hex/);
+  assert.match(String((decodeCalldataPayload('0x41') as { problem: string }).problem), /shorter than the 4-byte/);
+  assert.match(String((decodeCalldataPayload('0xdeadbeef00') as { problem: string }).problem), /not the 0x41425953/);
+  assert.match(String((decodeCalldataPayload('0x41425953ffff') as { problem: string }).problem), /not valid UTF-8/);
+  assert.match(String((decodeCalldataPayload(calldataWith('[1,2,3]')) as { problem: string }).problem), /not an object/);
+  assert.match(String((decodeCalldataPayload(calldataWith('{"v":1}')) as { problem: string }).problem), /no `day`/);
+  assert.match(String((decodeCalldataPayload(calldataWith('{"v":1,"day":1,"hash":"a"}'.replace('"a"', `"${'a'.repeat(64)}"`)) ) as { problem: string }).problem), /no `ts`/);
+  assert.match(String((decodeCalldataPayload(calldataWith(`{"v":1.5,"day":1,"hash":"${'a'.repeat(64)}","ts":1}`)) as { problem: string }).problem), /`v` is not a whole number/);
+  assert.match(String((decodeCalldataPayload(`0x41425953${'ab'.repeat(2100)}` as unknown as string) as { problem: string }).problem), /over the .*-byte bound/);
+});
+
+test('chainFacts reads the tag without decoding the body', async () => {
+  assert.equal(chainFacts(null), null, 'a node that gave no transaction gives no facts');
+  const { calldata } = await anchoredPair(2);
+  const f = chainFacts({ input: calldata, from: VERIFY_SIGNER.toUpperCase(), to: VERIFY_SIGNER.toUpperCase(), blockNumber: '0x100' });
+  assert.ok(f);
+  assert.equal(f!.ours, true);
+  assert.equal(f!.from, VERIFY_SIGNER, 'addresses come back lowercased, matching our own records');
+  assert.equal(f!.to, VERIFY_SIGNER);
+  assert.equal(f!.blockNumber, '256', 'a hex height is published in decimal');
+  assert.ok(f!.payloadHexLength > 8, 'the body is bigger than the tag');
+  // Some nodes answer with `data` rather than `input`; the fact must survive either name.
+  assert.equal(chainFacts({ data: calldata })!.ours, true);
+  assert.equal(chainFacts({ input: '0xdeadbeef00' })!.ours, false, 'a foreign transaction is not ours');
+});
+
+test('receiptFacts keeps confirmed, reverted and pending apart', () => {
+  assert.equal(receiptFacts(null).status, 'pending', 'no receipt is its own answer');
+  assert.equal(receiptFacts({}).status, 'pending', 'an object with no status is treated as no receipt');
+  assert.equal(receiptFacts({ status: '0x1', gasUsed: '0x5208', effectiveGasPrice: '0x2' }).status, 'confirmed');
+  assert.equal(receiptFacts({ status: '0x0' }).status, 'reverted');
+  assert.equal(receiptFacts({ status: '0x1', gasUsed: '0x5208', effectiveGasPrice: '0x2' }).feeUnits, String(21000n * 2n));
+  assert.equal(receiptFacts({ status: '0x1', gasUsed: '0x5208' }).feeUnits, null, 'a missing gas field is not guessed as zero');
+});
+
+test('a chain that was not reached is unknown, and is never called not-found', async () => {
+  const c = await checkTransaction(DIGEST_TX, null, null, null, { chainAnswered: false });
+  assert.equal(c.verdict, 'unknown');
+  assert.equal(c.found, 'unknown');
+  assert.match(c.problem ?? '', /not reached/);
+});
+
+test('a node that answered null is evidence, and reads as not-found', async () => {
+  const c = await checkTransaction(DIGEST_TX, null, null, null, { chainAnswered: true });
+  assert.equal(c.verdict, 'not-found');
+  assert.equal(c.found, 'not-found');
+  assert.match(c.problem ?? '', /answered/);
+});
+
+test('a transaction with no receipt yet is pending', async () => {
+  const { calldata } = await anchoredPair(1);
+  const c = await checkTransaction(DIGEST_TX, { input: calldata, from: VERIFY_SIGNER }, null, null, { chainAnswered: true });
+  assert.equal(c.found, 'pending');
+  assert.equal(c.verdict, 'pending');
+});
+
+test('someone else\'s transaction is unreadable and never hashed', async () => {
+  const c = await checkTransaction(DIGEST_TX, { input: '0xdeadbeef00' }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(c.verdict, 'unreadable');
+  assert.equal(c.chain?.ours, false);
+  assert.match(c.problem ?? '', /no ABYS tag/);
+});
+
+test('a matching chain record, row and recomputed hash verify', async () => {
+  const { row, calldata } = await anchoredPair(3);
+  const c = await checkTransaction(
+    DIGEST_TX,
+    { input: calldata, from: VERIFY_SIGNER, blockNumber: '0x100' },
+    { status: '0x1', blockNumber: '0x100', blockHash: '0x' + '11'.repeat(32), gasUsed: '0x5208', effectiveGasPrice: '0x1' },
+    row,
+    { chainAnswered: true },
+  );
+  assert.equal(c.verdict, 'verified');
+  assert.equal(c.hashOutcome, 'verified');
+  assert.equal(c.rowAgreement, 'same');
+  assert.equal(c.problem, null, 'verified carries no problem');
+  assert.ok(c.preImage && c.preImage.startsWith('abyssal-day-digest|'), 'the exact bytes for a stranger with sha256');
+});
+
+test('a record whose fields do not hash to its own hash is a mismatch', async () => {
+  const { payload } = await anchoredPair(4);
+  const liar = { ...payload, hash: 'cd'.repeat(32) };
+  const c = await checkTransaction(DIGEST_TX, { input: encodeDigest(liar as DigestPayload) }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(c.hashOutcome, 'mismatch');
+  assert.equal(c.verdict, 'mismatch');
+  assert.match(c.problem ?? '', /hash/);
+});
+
+test('a valid record that disagrees with our stored row is a mismatch naming the field', async () => {
+  const { row, calldata } = await anchoredPair(6);
+  const drifted = { ...row, predations: row.predations + 1 };
+  const c = await checkTransaction(DIGEST_TX, { input: calldata }, { status: '0x1' }, drifted, { chainAnswered: true });
+  assert.equal(c.hashOutcome, 'verified', 'the chain record is internally sound');
+  assert.equal(c.rowAgreement, 'differs');
+  assert.equal(c.verdict, 'mismatch');
+  assert.ok(c.disagreements.some((d) => d.field === 'predations'), 'and it says which field');
+});
+
+test('a record naming a rule this build lacks is uncheckable, not corrupt', async () => {
+  const { payload } = await anchoredPair(7);
+  const future = { ...payload, v: 999 };
+  const c = await checkTransaction(DIGEST_TX, { input: encodeDigest(future as DigestPayload) }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(c.ruleKnown, false);
+  assert.equal(c.hashOutcome, 'uncheckable');
+  assert.equal(c.verdict, 'uncheckable');
+  assert.equal(c.preImage, null, 'no pre-image is published for a rule we cannot name');
+  assert.match(c.problem ?? '', /v=999/);
+});
+
+test('a reverted receipt still verifies the record it carries', async () => {
+  const { row, calldata } = await anchoredPair(8);
+  const c = await checkTransaction(DIGEST_TX, { input: calldata }, { status: '0x0', blockNumber: '0x100' }, row, { chainAnswered: true });
+  assert.equal(c.receipt?.status, 'reverted');
+  assert.equal(c.verdict, 'verified', 'integrity of the bytes is not the same claim as whether the write landed');
+});
+
+test('ABYS bytes that do not decode are unreadable with a reason', async () => {
+  const c = await checkTransaction(DIGEST_TX, { input: calldataWith('{"v":1}') }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(c.verdict, 'unreadable');
+  assert.ok(c.decodeProblem);
+});
+
+test('GET /verify refuses a parameter that is not a transaction hash', async () => {
+  const app = createApp({ seed: 1, store: memStore().store });
+  const short = await app.fetch(new Request('http://localhost/verify?tx=0x123'));
+  assert.equal(short.status, 400);
+  const body = await short.json() as { hint: string; got: string };
+  assert.match(body.hint, /\/history\/census/);
+  assert.match(body.got, /chars\)/, 'a truncated paste is reported by length');
+  const none = await app.fetch(new Request('http://localhost/verify'));
+  assert.equal(none.status, 400);
+});
+
+test('GET /verify is advertised in the endpoint index', async () => {
+  const app = createApp({ seed: 1, store: memStore().store });
+  const index = await (await app.fetch(new Request('http://localhost/api'))).json() as { endpoints: Record<string, string> };
+  assert.ok('GET /verify' in index.endpoints, 'the route is discoverable, not a secret');
+});
+
+test('GET /verify returns 404 when the node answers there is no such transaction', async () => {
+  const stub = rpcStub(() => null);
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  try {
+    const app = createApp({ seed: 1, rpc: url, store: memStore().store });
+    const res = await app.fetch(new Request(`http://localhost/verify?tx=${DIGEST_TX}`));
+    assert.equal(res.status, 404);
+    const body = await res.json() as { verdict: string; context: { chainAnswered: boolean } };
+    assert.equal(body.verdict, 'not-found');
+    assert.equal(body.context.chainAnswered, true);
+  } finally {
+    stub.close();
+  }
+});
+
+test('GET /verify verifies a matching record, caches it, and hands back the rule table', async () => {
+  const { row, calldata } = await anchoredPair(3);
+  const stub = rpcStub((m) => m === 'eth_getTransactionByHash'
+    ? { input: calldata, from: VERIFY_SIGNER, to: VERIFY_SIGNER, blockNumber: '0x100' }
+    : m === 'eth_getTransactionReceipt'
+      ? { status: '0x1', blockNumber: '0x100', blockHash: '0x' + '11'.repeat(32), gasUsed: '0x5208', effectiveGasPrice: '0x1' }
+      : null);
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  const m = memStore();
+  m.seedDayBook([row]);
+  try {
+    const app = createApp({ seed: 1, rpc: url, store: m.store });
+    const res = await app.fetch(new Request(`http://localhost/verify?tx=${row.txHash}`));
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('cache-control') ?? '', /s-maxage=60/, 'an immutable record may be cached');
+    const body = await res.json() as { verdict: string; rowAgreement: string; book: { day: number }; context: { rules: Record<string, string[]>; doItYourself: string } };
+    assert.equal(body.verdict, 'verified');
+    assert.equal(body.rowAgreement, 'same', 'the seeded row was found and agrees');
+    assert.equal(body.book.day, 3);
+    assert.ok(body.context.rules['1'].includes('predations'), 'the answer says what it hashed');
+    assert.match(body.context.doItYourself, /sha256/);
+  } finally {
+    stub.close();
+  }
+});
+
+test('GET /verify returns 202 for a pending transaction and refuses to cache it', async () => {
+  const { calldata } = await anchoredPair(1);
+  const stub = rpcStub((m) => m === 'eth_getTransactionByHash' ? { input: calldata, from: VERIFY_SIGNER } : null);
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  try {
+    const app = createApp({ seed: 1, rpc: url, store: memStore().store });
+    const res = await app.fetch(new Request(`http://localhost/verify?tx=${DIGEST_TX}`));
+    assert.equal(res.status, 202);
+    assert.equal(res.headers.get('cache-control'), 'no-store', 'the next second may be the one that answers');
+    assert.equal((await res.json() as { verdict: string }).verdict, 'pending');
+  } finally {
+    stub.close();
+  }
+});
+
+test('GET /verify returns 409 for a mismatch', async () => {
+  const { row, calldata } = await anchoredPair(6);
+  const drifted = { ...row, predations: row.predations + 1 };
+  const stub = rpcStub((m) => m === 'eth_getTransactionByHash' ? { input: calldata } : m === 'eth_getTransactionReceipt' ? { status: '0x1' } : null);
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  const m = memStore();
+  m.seedDayBook([drifted]);
+  try {
+    const app = createApp({ seed: 1, rpc: url, store: m.store });
+    const res = await app.fetch(new Request(`http://localhost/verify?tx=${drifted.txHash}`));
+    assert.equal(res.status, 409);
+    assert.equal((await res.json() as { verdict: string }).verdict, 'mismatch');
+  } finally {
+    stub.close();
+  }
+});
+
+test('GET /verify with no reachable node answers unknown and notes the outage once, not per request', async () => {
+  const health = createHealth();
+  const app = createApp({ seed: 1, rpc: '', store: memStore().store, health });
+  const ask = (tx: string) => app.fetch(new Request(`http://localhost/verify?tx=${tx}`));
+  const r1 = await ask(DIGEST_TX);
+  assert.equal(r1.status, 502);
+  assert.equal((await r1.json() as { verdict: string }).verdict, 'unknown');
+  const r2 = await ask(`0x${'12'.repeat(32)}`);
+  assert.equal(r2.status, 502);
+  assert.equal(health.view().counts.verify_unreachable, 1, 'two requests, one outage');
+  assert.match(health.view().last.verify_unreachable.detail, /no RPC endpoint configured/);
+});
+
+test('an answered verify request is never counted as an outage', async () => {
+  const { row, calldata } = await anchoredPair(3);
+  const stub = rpcStub((m) => m === 'eth_getTransactionByHash' ? { input: calldata } : m === 'eth_getTransactionReceipt' ? { status: '0x1' } : null);
+  await new Promise<void>((r) => stub.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
+  const health = createHealth();
+  const m = memStore();
+  m.seedDayBook([row]);
+  try {
+    const app = createApp({ seed: 1, rpc: url, store: m.store, health });
+    const res = await app.fetch(new Request(`http://localhost/verify?tx=${row.txHash}`));
+    assert.equal(res.status, 200);
+    assert.equal(health.view().counts.verify_unreachable ?? 0, 0, 'a chain that answered is not an outage');
+  } finally {
+    stub.close();
+  }
+});
+
+test('a recovered verify outage counts as a new outage, not the same one forever', async () => {
+  const { row, calldata } = await anchoredPair(3);
+  const s = await verifyOutageStub(calldata);
+  const health = createHealth();
+  const m = memStore();
+  m.seedDayBook([row]);
+  try {
+    const app = createApp({ seed: 1, rpc: s.url, store: m.store, health });
+    const ask = () => app.fetch(new Request(`http://localhost/verify?tx=${row.txHash}`));
+    await ask();
+    await ask();
+    assert.equal(health.view().counts.verify_unreachable, 1, 'the two requests of one outage are one event');
+    s.setFail(false);
+    assert.equal((await ask()).status, 200, 'the chain answered');
+    s.setFail(true);
+    await ask();
+    assert.equal(health.view().counts.verify_unreachable, 2, 'the recovery reset the edge, so a second outage is counted');
+  } finally {
+    s.close();
+  }
+});
+
+
 
 
 
