@@ -827,14 +827,15 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 ## Tests and CI
 
 327 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-25T19:39:32Z: 59 + 176 + 92,
+workspaces report them in a working copy at 2026-09-26T02:09:18Z: 59 + 176 + 92,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
 so a job log reads one pass short of the totals here rather than a different
-count: run #68, the commit this batch stands on, logs 310 tests and 309 passes
-with exactly that skip and no failure, which is the shape to expect from the 327
-above once this tree is the one the runner has.
+count: run #69, the commit this batch stands on, logs 327 tests and 326 passes
+with exactly that skip and no failure. That is the shape to expect from any run
+whose log is opened next: the totals above are the working copy's, and the one
+row CI never runs is named in the log rather than missing in silence.
 
 | Workspace | Tests | Covers |
 | --- | --- | --- |
@@ -979,6 +980,20 @@ shows are not the only way out: `/health` publishes `digest.payloadV` beside
 `digest.verifies` and `digest.verifyProblem`, so a `null` can be read for *which*
 version has no rule without anybody opening the site.
 
+That recomputation has been run over the whole book rather than a sample of it:
+the pre-image of each of its thirty stamped rows — rebuilt from the fields the row
+publishes, plus the `v` it does not, supplied there by assumption — hashes back to
+the hash printed beside it, thirty for thirty, in a run dated 2026-09-26T02:02:59Z
+that also asked two nodes for every transaction in the sample and found them in
+agreement on all thirty-one receipts. That run is a script which, like the mutation
+battery, lives outside the committed tree, and every figure quoted below it is its
+output; the book grows by one row a day, which is why re-deriving them is a step
+rather than a copy-paste. Recomputing failed once, usefully: the day-15 hash in the
+first draft of that script had been typed from notes instead of read off disk, and
+what surfaced it was both nodes answering *no receipt* for the bytes I had written.
+A check that fails loudly is worth more than a check that is merely run, and a
+reader who wants to redo any of this needs `/history/census`, a node and sha256.
+
 The bookkeeping the anchor needed outlived its first draft: `lastCommittedDay` and the
 outstanding transaction moved into the ledger, because an eviction between two day
 boundaries used to be able to commit the same day twice.
@@ -986,39 +1001,59 @@ boundaries used to be able to commit the same day twice.
 Whether the account that pays for it can keep paying is measured rather than
 assumed. Each confirmed day is priced from its own receipt, read off the chain
 rather than quoted, and every receipt the book points at has been fetched back
-and multiplied out: twenty of its twenty-one rows carry a transaction hash — the
+and multiplied out — twice, from two nodes, which had to agree on `status`,
+`gasUsed`, `effectiveGasPrice` and `blockNumber` before either answer counted.
+Thirty of the book's thirty-one rows carry a transaction hash — the
 first row, day 27, is timestamped 2026-09-24T07:35:11Z, under ten minutes before
 the commit that taught the poll to record one, and its absence is kept rather
-than filled in after the fact. Those twenty, with the day-15 anchor that
+than filled in after the fact. Those thirty, with the day-15 anchor that
 predates the book (`0xcc60e690…`) added, span 30,440 to 30,600 gas: the gas a
-day burns is not a constant. Neither is the price — 20, 20.001, 20.1, 20.115,
-20.131747031, 20.19900952 and 21 gwei have each appeared on one of them — which
+day burns is not a constant. Neither is the price — eleven prices have appeared
+across those thirty-one receipts (20, 20.0001, 20.001, 20.1, 20.115,
+20.131747031, 20.141795011, 20.1520875, 20.19900952, 20.25 and 21 gwei) — which
 puts a day at 611,200,000,000,000 to 640,920,000,000,000 fee units, `0.0006` of
-the money, the cheapest and the dearest of those twenty-one separated by 4.9%. The
+the money, the cheapest and the dearest of those thirty-one separated by 4.9%. The
 newest of those measured costs is what the balance gets divided by, and the pair
-moves with every confirmation: the reading `/health` published
-for day 46 (taken 2026-09-25T09:59:25Z) held 19,980,353,015,540,751,440 fee
-units against a day that had just cost 615,060,000,000,000, and the first divided
-by the second, truncated, is the `32,485` printed beside them — a division
-anybody can redo from the two figures published next to it, which is the only way
-this figure stays checkable through the ~83 minutes it takes to be superseded.
-The next confirmation replaced it with 19,979,737,955,540,751,440 over the same
-quoted cost, i.e. `32,484`, and the subtraction that produced the runway did not
-change between the two readings — but the pair has a second check in it, because
-what the two balances differ by is *exactly* the 615,060,000,000,000 the
-newer receipt says that day cost. A gas price read off a receipt and a balance
-read off the node agree to the fee unit, and nothing else has spent from that
-account in between: the same subtraction, three times over now (days 35→36 and
-42→43 are quoted below). Nineteen gaps between twenty consecutive confirmations' block
-timestamps put the distance from one anchored day to the next between 79 minutes
-58 seconds and 90 minutes 3 seconds, mean 83 minutes 24 seconds; at that mean the
-runway above is 5.15 years, and across the spread of those gaps 4.94 to 5.56. That
-spread is not stable either: the version of this sentence before last had
+moves with every confirmation. The reading on record when this paragraph was last
+re-derived — taken 2026-09-26T01:07:54Z, for day 57 — holds
+19,973,592,279,347,715,280 fee units against a day that cost 616,653,877,500,000,
+and the first divided by the second, truncated, is the `32,390` published beside
+them: a division anybody can redo from the two figures published next to it,
+which is the only way this figure stays checkable through the ~83 minutes it
+takes to be superseded. Redoing it is also the only way the *balance* stays
+checkable, so the audit asks for that address's balance itself: at
+2026-09-26T02:02:59Z, fifty-five minutes after the reading it judges, both nodes
+still answered 19,973,592,279,347,715,280 — the recorded figure to the unit,
+because no day confirmed in between and nothing else spends this account. An
+older pair is quoted because it is where that subtraction was first demonstrated,
+and it is kept rather than overwritten: the reading for day 46 (taken
+2026-09-25T09:59:25Z) held 19,980,353,015,540,751,440 against a day that had just
+cost 615,060,000,000,000, and the first divided by the second is the `32,485` of
+that afternoon. The next confirmation replaced it with 19,979,737,955,540,751,440
+over the same quoted cost, i.e. `32,484`, and the subtraction that produced the
+runway did not change between the two readings — but the pair has a second check
+in it, because what the two balances differ by is *exactly* the
+615,060,000,000,000 the newer receipt says that day cost. A gas price read off a
+receipt and a balance read off the node agree to the fee unit, and nothing else
+has spent from that account in between: the same subtraction, three times over now
+(days 35→36 and 42→43 are quoted below). Twenty-nine gaps between the thirty
+consecutive confirmations of the book's own rows put the distance from one anchored
+day to the next between 79 minutes 58 seconds and 90 minutes 3 seconds, mean 82
+minutes 56 seconds; at that mean the
+runway above is 5.11 years, and across the spread of those gaps 4.92 to 5.55. The
+day-15 anchor is in the cost sample and *not* in that distribution, and the
+reason it needs a sentence is that the first draft of the audit had it in both:
+it sits 18 hours 15 minutes 35 seconds before the first row of the book, so
+appending it to a list of intervals produced a maximum gap of 1095 minutes 35
+seconds and a mean 33 minutes 45 seconds above the sample's real one. That spread
+is not stable either: the version of this sentence before last had
 seventeen gaps, a maximum of 86 minutes 54 seconds and a mean of 82 minutes 45;
 the confirmation that followed it was 90 minutes 3 seconds from its predecessor
 and widened the maximum by three minutes nine seconds, and the one after that
-moved the mean a further 14 seconds. Which is the reason the spread is printed
-beside the mean instead of folded into it. Both balances are read at the moment a
+moved the mean a further 14 seconds. Ten confirmations later the maximum has not
+moved and the mean has come *down* by twenty-eight seconds. Which is the reason
+the spread is printed beside the mean instead of folded into it. Both balances are
+read at the moment a
 day confirms — two RPC calls per anchored day, not one per page view — and the age
 of the reading is published beside the figures, so a reader
 can see how stale the arithmetic is rather than assume it is current. The same
