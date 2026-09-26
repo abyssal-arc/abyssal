@@ -974,12 +974,12 @@ commas plus 2 brackets is `13,355`, the figure the route claimed — and at the 
 reading its two newest rows (day 63, 373 bytes, `0xdd6e40d2…`; day 64, 374 bytes,
 `0x31e30588…`) were each re-hashed from their own published `v` against the `rules` table
 the route serves, landing on the hash printed beside them. A cap that is only correct in a
-test run is a cap that will be wrong in production while looking right here. Both docs
-commits that record these readings changed no served byte — the twelve-file comparison
-against the working tree was re-run after each and came back twelve `same` — and both
-were deployed anyway (CI #73 and #74, both `success`), so that "what is live" and "what
-`main` says is live" are the same artifact rather than two claims that have to be
-reconciled later.
+test run is a cap that will be wrong in production while looking right here. Every docs
+commit that records these readings changed no served byte — the twelve-file comparison
+against the working tree was re-run after each and came back twelve `same` (CI #73, #74
+and #75, all `success`) — and each was deployed anyway, the last of them at 11:41:04Z as
+`20327c00`, so that "what is live" and "what `main` says is live" are the same artifact
+rather than two claims that have to be reconciled later.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
 Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
