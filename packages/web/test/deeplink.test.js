@@ -61,10 +61,10 @@ test('only the views and drawers that exist can be opened', () => {
 });
 
 test('the written link is in one order, whoever wrote it', () => {
-  const full = { day: 7, drawer: 'you', addr: ADDR, view: 'observe', creature: 42 };
+  const full = { day: 7, drawer: 'you', addr: ADDR, view: 'observe', creature: 42, verify: 1 };
   assert.equal(
     serializeFocus(full),
-    '?view=observe&creature=42&addr=0x1234abcd567890123456789012345678901234ab&day=7&drawer=you',
+    '?view=observe&creature=42&addr=0x1234abcd567890123456789012345678901234ab&day=7&verify=1&drawer=you',
   );
   // Two tabs holding the same state must produce the same bytes, or "copy the bar"
   // and "click copy link" disagree in front of the user.
@@ -80,8 +80,24 @@ test('what is written is what is read, for every key', () => {
     { view: 'observe', addr: ADDR.toLowerCase() },
     { view: 'observe', day: 0, drawer: 'mem' },
     { view: 'world', day: 399, drawer: 'analytics', creature: 7, addr: ADDR.toLowerCase() },
+    { view: 'world', day: 4, verify: 1 },
   ];
   for (const f of cases) assert.deepEqual(parseFocus(serializeFocus(f)), f, `round trip of ${JSON.stringify(f)}`);
+});
+
+test('verify is a flag, and only `1` raises it', () => {
+  // The whole point of the key is to make a page fetch on someone else's behalf,
+  // so the accepted spelling is narrow: `1` and nothing else. Each rejected form
+  // is a real thing a person or a generator writes; reading any of them as "yes"
+  // would let a link say `verify=0` and still run the check.
+  assert.deepEqual(parseFocus('?day=4&verify=1'), { day: 4, verify: 1 });
+  assert.equal(parseFocus('?verify=1').verify, 1, 'it stands beside no day too — the page decides what to pin');
+  for (const bad of ['0', 'true', 'yes', '', '01', '2', ' on']) {
+    assert.deepEqual(parseFocus(`?day=4&verify=${bad}`), { day: 4 }, `verify=${JSON.stringify(bad)} is not the flag`);
+  }
+  assert.deepEqual(parseFocus('?day=4&verify'), { day: 4 }, 'a bare `verify` with no value is not the flag');
+  // Round trip keeps it: the string the bar holds is the string that reads back.
+  assert.deepEqual(parseFocus(serializeFocus({ day: 4, verify: 1 })), { day: 4, verify: 1 });
 });
 
 test('the tank is named in the link, not left to the site to guess', () => {

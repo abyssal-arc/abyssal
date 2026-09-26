@@ -3790,6 +3790,16 @@ function renderCensusText() {
 let verifyState = null;
 
 /**
+ * Whether the link that opened this page asked to see the verdict without a click
+ * (`?…&day=4&verify=1`). A one-shot: it is spent the moment the book has answered
+ * enough to know the pinned row's hash, so a reader who then moves the pin is back
+ * to the button they always had — the link asked us to check *that* day, not to
+ * check every day they browse. Kept beside `verifyState` because the two are the
+ * before and after of the same request.
+ */
+let verifyOnBoot = focus.verify === 1;
+
+/**
  * The pinned day in words, so that a shared `?day=` states what it points at
  * rather than leaving it as a pixel a viewer has to hover to discover. When the
  * day is real but outside the window we fetched, it says that too: an absent row
@@ -3871,6 +3881,19 @@ function renderVerify() {
   if (!el) return;
   const pinnedRow = censusRows.find((r) => r.day === censusPinnedDay) ?? null;
   const pinnedHash = pinnedRow?.txHash ?? null;
+  // A forwarded stamped day (`?…&day=4&verify=1`) shows its verdict on arrival:
+  // once the book has loaded we know whether the pinned row carries a hash, and if
+  // it does we spend the one-shot to make the request the reader would otherwise
+  // have made by hand. Spent whether or not it fires — a day that never went on
+  // chain gets no request for a hash we do not have, and stays as quiet as the
+  // button would have left it.
+  if (verifyOnBoot && censusData) {
+    verifyOnBoot = false;
+    if (pinnedHash && !verifyState) {
+      runVerify(pinnedHash);
+      return;
+    }
+  }
   // Three ways the panel should not speak: no day is pinned, the pinned day was
   // never on chain, or the verdict we hold is about a different transaction than
   // the row now on screen. All three clear it rather than leave the last answer
@@ -3879,6 +3902,10 @@ function renderVerify() {
     el.hidden = true;
     el.className = '';
     el.innerHTML = '';
+    // The bar stops advertising a verdict it is no longer showing, so a link copied
+    // now — after the reader moved off the checked row — will not make the next
+    // person wait on a fetch that has nothing to answer.
+    if (focus.verify !== undefined) setFocus({ verify: null });
     return;
   }
   const view = verifyView(verifyState.res, {
@@ -3901,6 +3928,11 @@ function renderVerify() {
     ? `<div class="verify-tech"><a href="${esc(view.link.href)}" title="${esc(view.link.title)}" target="_blank" rel="noopener">${esc(view.link.title)}</a></div>`
     : '';
   el.innerHTML = head + notes + tech + link;
+  // And now that a verdict is genuinely on screen, the bar says so — the same
+  // string the reader is about to copy, so the link they send boots straight into
+  // this recomputation for whoever opens it. Written once, guarded so a repaint of
+  // a verdict already named in the bar does not touch the history.
+  if (focus.verify !== 1) setFocus({ verify: 1 });
 }
 
 /**

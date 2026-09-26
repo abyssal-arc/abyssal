@@ -1,13 +1,22 @@
 /**
  * What the address bar is for: naming the thing a visitor is looking at.
  *
- * Five keys, each one a state the interface can already be in:
+ * Six keys, each one a state the interface can already be in:
  *
  *   view     'world' | 'observe'
  *   creature a tank animal's id — its card is open and the camera is on it
  *   addr     an address, 0x + 40 hex — its flow card is open
  *   day      a day in the book, pinned so the chart names it
+ *   verify   `1` — the pinned day's independent recomputation is on screen
  *   drawer   'mem' | 'obits' | 'analytics' | 'you'
+ *
+ * `verify` is the only one of the six that names something the page *did* rather
+ * than something it is looking at, and it only means anything beside a `day`: a
+ * forwarded link that says "this stamped day was checked against the chain, and
+ * here is the answer" is the point, so opening it re-runs that check in the
+ * recipient's browser instead of leaving them a pin to click. It carries no hash —
+ * the day names the row, the row carries its own transaction — so a link never
+ * freezes a verdict to a number that has since moved.
  *
  * The rules live here rather than inline in `app.js` because every one of them is
  * a claim a test can check and a browser cannot: whether `?creature=-3` means
@@ -26,7 +35,7 @@ export const VIEWS = ['world', 'observe'];
 export const DRAWERS = ['mem', 'obits', 'analytics', 'you'];
 
 /** Written in this order, always: two tabs must produce byte-identical links. */
-const KEY_ORDER = ['view', 'creature', 'addr', 'day', 'drawer'];
+const KEY_ORDER = ['view', 'creature', 'addr', 'day', 'verify', 'drawer'];
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
@@ -55,6 +64,14 @@ export function parseFocus(params) {
 
   const day = whole(src.get('day'));
   if (day !== null) out.day = day;
+
+  // The one accepted spelling is `1`. `verify=true`, `verify=yes`, `verify=0` and a
+  // bare `verify` are each a person who meant the flag but wrote a different
+  // dialect, and the safe reading of a flag whose only job is to make the page
+  // fetch on someone's behalf is to refuse the ones we did not agree on rather
+  // than to guess — a `verify=0` that fired a request would be a link doing the
+  // opposite of what its own text says.
+  if (src.get('verify') === '1') out.verify = 1;
 
   const drawer = src.get('drawer');
   if (drawer !== null && DRAWERS.includes(drawer)) out.drawer = drawer;
