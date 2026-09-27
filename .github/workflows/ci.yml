@@ -36,4 +36,5 @@ jobs:
           node --input-type=module --check < packages/web/src/observe.js
           node --input-type=module --check < packages/web/src/anchor.js
           node --input-type=module --check < packages/web/src/verify.js
+          node --input-type=module --check < packages/web/src/sweep.js
       - run: npm test

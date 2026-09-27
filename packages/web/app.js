@@ -34,6 +34,7 @@ import { diffWorld, worldSeed } from './src/worldsince.js';
 import { anchorLabel } from './src/anchor.js';
 import { venueCoverageNotes } from './src/observe.js';
 import { verifyView } from './src/verify.js';
+import { sweepTally, SWEEP_TIERS } from './src/sweep.js';
 
 initI18n();
 
@@ -3510,6 +3511,13 @@ async function refreshCensus() {
     censusRows = d.rows;
     censusStack = censusSeries(censusRows, ARCHETYPES);
     censusHoverDay = null;
+    // A fresh book invalidates any whole-book pass made against the old rows: a
+    // verdict about a day that has left the window, or a hash that has since
+    // changed, must not survive as a stale green. The reader asks again.
+    sweepStates.clear();
+    sweepPhase = 'idle';
+    sweepTotal = 0;
+    sweepDone = 0;
     // The book in hand is also the new baseline, but only if somebody is looking
     // at it — see `noteWorldSince`. This sits inside the try because a failed
     // fetch must not spend the memory of the last book that did arrive.
@@ -3727,6 +3735,20 @@ censusCanvas.addEventListener('click', () => {
   });
 }
 
+// The whole-book sweep, delegated the same way as the per-row check above: the
+// button is rewritten by `renderSweep` on every tick of the pass, so a listener
+// bound to it would have to be rebound mid-flight — and a sweep that loses its own
+// button halfway is one the reader cannot restart. Binding to the container and
+// matching `data-sweep` is the one line that survives every repaint.
+{
+  const el = document.getElementById('census-sweep');
+  el?.addEventListener('click', (ev) => {
+    const btn = typeof ev.target?.closest === 'function' ? ev.target.closest('button[data-sweep]') : null;
+    if (!btn) return;
+    runSweep();
+  });
+}
+
 /**
  * The same book in words, because a stacked area cannot answer "is anything
  * dying?" — it shows total height, and a species going extinct inside a growing
@@ -3798,6 +3820,32 @@ let verifyState = null;
  * before and after of the same request.
  */
 let verifyOnBoot = focus.verify === 1;
+
+/**
+ * The whole-book pass. `verifyState` above answers one pinned day; this answers
+ * "are ALL of the days in this book intact?" without the reader clicking forty
+ * times. The state is deliberately separate from the per-row widget: a sweep that
+ * overwrote `verifyState` would put a forty-row aggregate where the reader expected
+ * one day's verdict, which is the collapse `sweep.js` refuses to compute in the
+ * first place.
+ *
+ * `sweepStates` is keyed by `txHash`, not by day, for the same reason `verifyState`
+ * is: two days can share one transaction (a retry reuses its payload by design), and
+ * asking the route twice about the same hash and storing the answer once is what
+ * makes `sweepTally`'s per-row tiers agree with the per-row widget.
+ */
+let sweepPhase = 'idle'; // idle | running | done
+const sweepStates = new Map(); // txHash -> the state string the widget would show
+let sweepTotal = 0; // distinct stamped hashes in the pass under way
+let sweepDone = 0; // how many of them have an answer
+
+/** The four tiers keyed the way `sweepTally` names them, for their labels. */
+const SWEEP_TIER_KEYS = {
+  intact: 'sweepIntact',
+  problems: 'sweepProblems',
+  cannotSay: 'sweepCannotSay',
+  unchecked: 'sweepUnchecked',
+};
 
 /**
  * The pinned day in words, so that a shared `?day=` states what it points at
@@ -3936,6 +3984,120 @@ function renderVerify() {
 }
 
 /**
+ * The distinct `txHash`es a whole-book pass has to ask about. Deduplicated here,
+ * at the point the requests are made rather than in `sweepTally`: two days sharing
+ * one transaction is a fact about the book (a retry reuses its payload by design),
+ * so the sweep asks the route once and `sweepTally` counts the row per day it lands
+ * on. Asking twice and storing one answer is what keeps the aggregate honest.
+ */
+function stampedHashes(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    const h = r && r.txHash;
+    if (typeof h === 'string' && h && !seen.has(h)) { seen.add(h); out.push(h); }
+  }
+  return out;
+}
+
+/**
+ * Ask the site's own `/verify` route about every stamped day, a few at a time, and
+ * keep a running tally the reader can watch fill in.
+ *
+ * Client-side by necessity: the route is one transaction per request and is cached
+ * at the edge (`s-maxage=60`), so a book of a hundred days is a hundred cheap reads
+ * the browser can make — while the Worker doing the same loop server-side would be
+ * a hundred RPC reads against a wall clock it cannot win. The per-row verdict is
+ * projected through `verifyView`, the *same* table the pinned-day widget uses, so
+ * the sweep and the widget cannot disagree about what a body meant; a fetch this
+ * browser could not make becomes `client-error`, which `sweepTally` files under
+ * `cannotSay` and never folds into `intact`.
+ *
+ * Bounded concurrency (six) because "verify the whole book" on a large window must
+ * not open one socket per day. The worker pool walks a shared cursor and each worker
+ * re-invokes itself only after its request settles, so the pass always drains: a
+ * sweep that could hang without settling `done` is the failure this shape prevents.
+ */
+function runSweep() {
+  if (sweepPhase === 'running') return; // one pass at a time; the button is not a queue
+  const hashes = stampedHashes(censusRows);
+  if (hashes.length === 0) return;
+  sweepStates.clear();
+  sweepTotal = hashes.length;
+  sweepDone = 0;
+  sweepPhase = 'running';
+  renderSweep();
+  const CONCURRENCY = 6;
+  let cursor = 0;
+  const ask = (hash) => fetch(`/verify?tx=${encodeURIComponent(hash)}`)
+    .then(async (r) => {
+      let res = null;
+      try { res = await r.json(); } catch { res = null; }
+      return verifyView(res, { txHash: hash, explorerTxUrl }).state;
+    })
+    .catch(() => 'client-error');
+  const worker = () => {
+    if (cursor >= hashes.length) return Promise.resolve();
+    const hash = hashes[cursor++];
+    return ask(hash).then((state) => {
+      sweepStates.set(hash, state);
+      sweepDone += 1;
+      renderSweep();
+      return worker();
+    });
+  };
+  const n = Math.min(CONCURRENCY, hashes.length);
+  Promise.all(Array.from({ length: n }, () => worker())).then(() => {
+    sweepPhase = 'done';
+    renderSweep();
+  });
+}
+
+/**
+ * The sweep's own panel — a fifth view of the same rows, and the only place the
+ * four tiers are ever shown together. The order of the tiers comes from
+ * `SWEEP_TIERS` rather than a local list, so the panel cannot print a tier the
+ * tally does not compute or drop one it does.
+ *
+ * No button while a pass is running (it would be a second queue into the same
+ * pool), and the tally is only drawn once the reader has asked: an idle book with
+ * zero rows checked is not a book of `unchecked` days to parade, it is a book
+ * nobody has verified yet, and the button is the honest face of that.
+ */
+function renderSweep() {
+  const el = document.getElementById('census-sweep');
+  if (!el) return;
+  if (stampedHashes(censusRows).length === 0) {
+    el.hidden = true;
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  el.hidden = false;
+  const parts = [];
+  let hasProblems = false;
+  if (sweepPhase === 'running') {
+    parts.push(`<div class="sweep-head">${esc(t('sweepChecking', { n: sweepDone, total: sweepTotal }))}</div>`);
+  } else if (sweepPhase === 'done') {
+    parts.push(`<div class="sweep-head">${esc(t('sweepDone'))}</div>`);
+  }
+  if (sweepPhase !== 'idle') {
+    const tally = sweepTally(censusRows, sweepStates);
+    hasProblems = tally.problems > 0;
+    parts.push(`<div class="sweep-sub">${esc(t('sweepStamped', { n: tally.stamped, total: tally.rows }))}</div>`);
+    parts.push(`<div class="sweep-tally">${SWEEP_TIERS.map((tier) => (
+      `<span class="sw sw-${tier}">${esc(t(SWEEP_TIER_KEYS[tier], { n: tally[tier] }))}</span>`
+    )).join('')}</div>`);
+  }
+  if (sweepPhase === 'idle' || sweepPhase === 'done') {
+    const label = sweepPhase === 'done' ? t('sweepAgain') : t('sweepCheck');
+    parts.push(`<button type="button" class="sweep-run" data-sweep="1">${esc(label)}</button>`);
+  }
+  el.className = `sweep sweep-${sweepPhase}${hasProblems ? ' sweep-has-problems' : ''}`;
+  el.innerHTML = parts.join('');
+}
+
+/**
  * The world's own "what happened while you were away".
  *
  * `abyssal-standing:` answers that for one address. This answers it for the tank,
@@ -4060,6 +4222,11 @@ function paintCensus() {
   // matches clears the panel), when the book changes (a row newly gains its
   // `txHash`), and never from a path that would refetch behind the reader's back.
   renderVerify();
+  // Fifth: the whole-book tally is a view of the same rows as the four above, so a
+  // repaint after a fresh book redraws a pass already made without asking the route
+  // again — and a book that gained or lost a stamped row drops the sweep back to
+  // the button, because `stampedHashes` is recomputed here, not remembered.
+  renderSweep();
 }
 
 // The boot fetch sits here rather than beside `pollAux()` where the other pollers

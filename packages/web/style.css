@@ -993,6 +993,41 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
   overflow-wrap: anywhere;
 }
 #census-verify .verify-tech a { color: var(--fg-3); text-decoration: underline; }
+/* The whole-book tally. Hidden until there is a stamped day to ask about, so the
+   `[hidden]` restatement is load-bearing for the same reason `#census-verify`'s is:
+   the flex below would otherwise outrank the UA `[hidden]` and leave an empty box.
+   The four tiers are the honest face of the pass, and they are deliberately not one
+   number — a lone "88% verified" is the fraction `sweep.js` exists to refuse. */
+#census-sweep {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: calc(var(--sp));
+}
+#census-sweep[hidden] { display: none; }
+#census-sweep .sweep-head { font-family: var(--font-display); font-weight: 600; }
+#census-sweep.sweep-done .sweep-head { color: var(--fg); }
+#census-sweep.sweep-running .sweep-head { color: var(--fg-3); font-style: italic; }
+#census-sweep.sweep-has-problems .sweep-head { color: var(--danger); }
+#census-sweep .sweep-sub { color: var(--fg-3); }
+#census-sweep .sweep-tally { display: flex; flex-wrap: wrap; gap: calc(var(--sp)); }
+#census-sweep .sw { font-variant-numeric: tabular-nums; }
+#census-sweep .sw-intact { color: var(--accent); }
+#census-sweep .sw-problems { color: var(--danger); }
+#census-sweep .sw-cannotSay { color: var(--amber); }
+#census-sweep .sw-unchecked { color: var(--fg-3); font-style: italic; }
+#census-sweep .sweep-run {
+  align-self: flex-start;
+  display: inline;
+  padding: 0;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+#census-sweep .sweep-run:hover { border-bottom-color: var(--accent); }
 /* What closed since this browser last looked, kept apart from the day list above
    it because it speaks about a stretch of time rather than about a day. The
    `[hidden]` restatement is load-bearing, not decoration: an author-level

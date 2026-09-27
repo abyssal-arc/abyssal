@@ -219,7 +219,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (374 total)
+npm test           # sim + server + web tests (390 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -673,7 +673,7 @@ reading says nothing about whether the digest commit is configured — check
 | GET | `/history` | Per-tick stats for charts: `?window=<n>` sets the depth (default and max 2000), `?slots=<n>` decimates server-side to the chart's point budget |
 | GET | `/history/pulse` | Time-travel for the OBSERVE pulse: `?range=1h\|24h` returns re-bucketed USDC volume columns |
 | GET | `/history/census` | The day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; `?days=<n>` for the newest n. The in-progress day carries `committed: false`. The answer carries the storage `cap` and, beside it, `rules`: the hash rule table keyed by version, so a row's `v` says which entry recomputes its `hash` and a reader needs no build of ours to check one. `coverage.first` is where a truncated book admits where it starts |
-| GET | `/verify?tx=0x…` | Recompute an anchored day straight off the chain: read the transaction's calldata and its receipt from the node, rebuild the pre-image under the rule the row's `v` names, and return one of seven verdicts — `verified` (the bytes are intact; a reverted receipt still verifies the record it carries, and the revert is reported beside it), `mismatch`, `uncheckable` (a rule this build never published — a fact about the build, not the day), `pending`, `not-found` (a node that answered "no such transaction" — evidence), `unreadable`, or `unknown` (a node that did not answer at all — not evidence, and never folded into `not-found`). The status is the verdict: 200 for a confirmed check (`s-maxage=60`, a confirmed transaction's calldata can never change), 409 a mismatch, 404 a not-found, 202 a pending (`no-store`, the next second may be the answer), 502 an unknown. Every answer publishes what it was computed against — chain id, the endpoint asked, whether the chain answered, the signer, the whole rule table, the book's cap and coverage, and a do-it-yourself sentence that reduces the trust to `sha256sum`. The day-book widget on a stamped row reads from it: the `Verify independently` button, the ten-state projection in `packages/web/src/verify.js`, and the seven verdicts the browser paints |
+| GET | `/verify?tx=0x…` | Recompute an anchored day straight off the chain: read the transaction's calldata and its receipt from the node, rebuild the pre-image under the rule the row's `v` names, and return one of seven verdicts — `verified` (the bytes are intact; a reverted receipt still verifies the record it carries, and the revert is reported beside it), `mismatch`, `uncheckable` (a rule this build never published — a fact about the build, not the day), `pending`, `not-found` (a node that answered "no such transaction" — evidence), `unreadable`, or `unknown` (a node that did not answer at all — not evidence, and never folded into `not-found`). The status is the verdict: 200 for a confirmed check (`s-maxage=60`, a confirmed transaction's calldata can never change), 409 a mismatch, 404 a not-found, 202 a pending (`no-store`, the next second may be the answer), 502 an unknown. Every answer publishes what it was computed against — chain id, the endpoint asked, whether the chain answered, the signer, the whole rule table, the book's cap and coverage, and a do-it-yourself sentence that reduces the trust to `sha256sum`. The day-book widget on a stamped row reads from it: the `Verify independently` button, the ten-state projection in `packages/web/src/verify.js`, and the seven verdicts the browser paints. A `Verify the whole book` pass on the same widget asks this route once per distinct stamped hash — bounded to six in flight, deduplicated so two days sharing a transaction are asked once — and files every day into one of four tiers in `packages/web/src/sweep.js`: `intact` (`verified`), `problems` (`mismatch`/`not-found`/`unreadable`), `cannotSay` (`uncheckable`/`unknown`/`pending`/a `client-error` this browser could not make/`shape-unknown`), and `unchecked` (a stamped day with no answer yet); the four always add up to the stamped count, and nothing unverifiable is ever folded into `intact` |
 | GET | `/judgments` | Cull records, each tagged `type: "harvest" \| "judgment"`; filter with `?type=` |
 | GET | `/events` | Positioned event stream (predation/cull/intervention) for visualization; poll with `?since=<seq>` |
 | GET | `/reports` | Battle reports for paid interventions, scored 400 ticks after the burn |
@@ -827,8 +827,8 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-374 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-26T18:15:55Z: 59 + 210 + 105,
+390 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-27T06:04:14Z: 59 + 210 + 121,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
@@ -848,26 +848,43 @@ offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
 against a local server, which is why `@napi-rs/canvas` is there: a canvas that
 cannot measure text cannot lay out a card. GitHub Actions
 (`.github/workflows/ci.yml`) runs four gates on Node 22: `npm run build`,
-`npm run typecheck`, an ESM syntax check over the eleven client files the browser
+`npm run typecheck`, an ESM syntax check over the twelve client files the browser
 loads, and `npm test`. The syntax gate exists because the client is
 dependency-free ES modules — a stray top-level await should fail in CI rather
 than in a browser — and it lists those files by name, so a web test asserts the
-list still matches the files on disk in both directions: a twelfth file that no gate
+list still matches the files on disk in both directions: a thirteenth file that no gate
 parses, and a gate that parses a file the browser never loads, are both a gate that
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 331 hand-written single-line mutations of
+runs negative verification: a battery of 350 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-331 of 331 in one pass, over 41 minutes 55 seconds read off the battery's own
-per-row stamps (17:23:37Z to 18:05:32Z, 331 rows), 0 missed and 0 without a verdict,
+350 of 350 in one pass, over 47 minutes read off the battery's own
+per-row stamps (04:42:18Z to 05:29:39Z, 350 rows), 0 missed and 0 without a verdict,
 and that run is the final tree — no verdict here is inherited from a state a later
-edit had already changed. The battery grew to 331 with eighteen mutants this batch
-(M313–M330), all aimed at the `/verify` widget rather than the endpoint under it:
+edit had already changed. This batch grew the battery from 331 to 350 with nineteen
+mutants across the two shipped features. Seven are on the shared verify link
+(M331–M337): the `verify=1` flag raising on any value instead of only `1` (M331), the
+key dropped from the serialization order (M332), a pinned stamped link never
+auto-verifying (M333), the boot fetch firing with no transaction to check (M334), the
+bar still advertising a verdict it just cleared (M335), a shown verdict never entering
+the bar (M336), and the boot request never armed (M337); M101 was re-pinned because the
+sixth deep-link key moved the `KEY_ORDER` line it quotes. Twelve are on the whole-book
+sweep (M338–M349): a `cannotSay` day folded into `intact` (M338), an unhashed day
+counted as a stamped row (M339), an unchecked row promoted into `cannotSay` (M340), a
+sweep with rows left unasked still claiming `done` (M341), the pass never settling out
+of running (M342), a fetch this browser could not make called `verified` (M343), an
+idle stamped book offering no button (M344), the sweep never painted with the rest of
+the book (M345), a Korean tier label dropped (M346), the sweep box no longer hiding
+itself (M347), `sweep.js` out of the ESM gate (M348) and the sweep suite out of the run
+list (M349); M328 was re-pinned because the fifth step in `paintCensus` (`renderSweep`)
+moved the closing brace its old anchor quoted. The batch before this one — the
+`/verify` widget batch — grew the battery to 331 with eighteen mutants (M313–M330),
+all aimed at the `/verify` widget rather than the endpoint under it:
 `not-found` folding into `unknown` on the client (M313), `uncheckable` sharing the
 mismatch headline (M314), the reverted note either never firing (M315) or folded
 into the headline state (M316), the pre-image dropped from the technical block
@@ -885,7 +902,7 @@ shared key set (M330). One pre-existing anchor, M243, was re-pinned — not beca
 it broke but because the fourth step in `paintCensus` moved the closing brace its
 3-line anchor quoted, and a mutant that anchors nowhere is skipped rather than
 judged; the preflight caught it in under a second, which is exactly what
-`--check` exists for. `--check` reads 331/331 anchors pointing at exactly one line
+`--check` exists for. `--check` reads 350/350 anchors pointing at exactly one line
 each. The pass before it — the `/verify` endpoint's own batch, seven verdicts and
 all server-side — grew the battery to 313 with ten mutants (M303–M312): an
 unreached chain reported as the evidence-bearing `not-found` (M303), any
