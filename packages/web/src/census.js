@@ -73,6 +73,43 @@ export function censusEvents(changes) {
 }
 
 /**
+ * The same markers, joined to the on-chain reading that bounds each claim.
+ *
+ * `censusEvents` flattens the server's `lost`/`gained`; it cannot say *where* a
+ * claim's proof lives, because a change carries only the day it was observed.
+ * This reaches back into the rows that change was derived from — the same rows
+ * the route published beside it — and files each event against the reading whose
+ * transaction seals it:
+ *
+ *   - a species counted in one row and gone in the next was **last seen alive**
+ *     in the earlier row, so a loss anchors one reading back;
+ *   - a species that first appears in a row is **first counted** there, so a gain
+ *     anchors to its own day.
+ *
+ * The anchor carries that row's `txHash` when the day went on chain, and `null`
+ * when it did not. That `null` is the reason to return an anchor at all rather
+ * than only the stamped ones: an extinction is still an extinction, but "the last
+ * day it was counted is not on the chain" is a different sentence from "here is
+ * the transaction that shows it," and the caller has to tell them apart instead
+ * of rendering a missing proof as a link to nothing.
+ */
+export function anchoredEvents(rows, changes) {
+  const list = rows ?? [];
+  const index = new Map();
+  list.forEach((r, i) => index.set(r.day, i));
+  return censusEvents(changes).map((e) => {
+    const at = index.get(e.day);
+    if (at === undefined) return { ...e, anchor: { day: null, tx: null } };
+    // A loss is bounded by the reading before the one that lost it — the last the
+    // species was counted; a gain by the reading that first counted it.
+    const anchorRow = e.kind === 'lost' ? (at > 0 ? list[at - 1] : null) : list[at];
+    if (!anchorRow) return { ...e, anchor: { day: null, tx: null } };
+    const tx = typeof anchorRow.txHash === 'string' && anchorRow.txHash ? anchorRow.txHash : null;
+    return { ...e, anchor: { day: anchorRow.day, tx } };
+  });
+}
+
+/**
  * One word for where a species is going, over the last `span` readings.
  *
  * `unknown` is a real answer and not a failure: one row cannot have a slope, and

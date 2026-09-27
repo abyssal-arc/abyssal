@@ -27,7 +27,7 @@
 import { t, initI18n } from './i18n.js';
 import { mulberry32, hashSeed, mixSeed, unitNoise } from './src/geom.js';
 import { hsla, shortAddr, fmtUsd } from './src/format.js';
-import { censusEvents, censusSeries, censusTrend } from './src/census.js';
+import { anchoredEvents, censusEvents, censusSeries, censusTrend } from './src/census.js';
 import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
 import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
 import { diffWorld, worldSeed } from './src/worldsince.js';
@@ -3787,11 +3787,27 @@ function renderCensusText() {
       + `<span class="cr-num">${newest.byArchetype?.[a] ?? 0}${rate}</span></div>`;
   }).join('');
   const gaps = censusStack.gaps.slice(0, 3).map((gp) => `<div class="census-row cr-gap"><span>${esc(t('censusGap', { after: gp.after, before: gp.before }))}</span></div>`);
-  const marks = censusEvents(censusData.changes)
+  const marks = anchoredEvents(censusRows, censusData.changes)
     .slice(-6)
     .reverse()
-    .map((e) => `<div class="census-row"><i class="cr-dot" style="background:${e.kind === 'lost' ? '#ff6b6b' : (ARCHETYPE_COLORS[e.archetype] ?? '#8899aa')}"></i>`
-      + `<span>${esc(t(e.kind === 'lost' ? 'censusLost' : 'censusGained', { a: e.archetype, day: e.day }))}</span></div>`);
+    .map((e) => {
+      const dot = e.kind === 'lost' ? '#ff6b6b' : (ARCHETYPE_COLORS[e.archetype] ?? '#8899aa');
+      // The claim is anchored to the reading whose transaction seals it: for a
+      // loss the day the species was last counted, for a gain the day it was
+      // first. A stamped anchor is the same `verify` deep link a pinned day earns,
+      // so it re-checks itself on arrival; an unstamped one says so in words — the
+      // extinction is still real, only its proof is not on the chain yet.
+      let anchorHtml;
+      if (e.anchor.tx) {
+        const href = serializeFocus({ day: e.anchor.day, verify: 1 });
+        const label = e.kind === 'lost' ? t('censusAnchorSeen', { day: e.anchor.day }) : t('censusAnchorCheck');
+        anchorHtml = ` · <a class="ce-anchor" href="${esc(href)}">${esc(label)}</a>`;
+      } else {
+        anchorHtml = ` · <span class="ce-anchor ce-anchor-none">${esc(t('censusAnchorNone'))}</span>`;
+      }
+      return `<div class="census-row"><i class="cr-dot" style="background:${dot}"></i>`
+        + `<span>${esc(t(e.kind === 'lost' ? 'censusLost' : 'censusGained', { a: e.archetype, day: e.day }))}</span>${anchorHtml}</div>`;
+    });
   events.innerHTML = [...gaps, ...marks].join('');
   pinCensus(censusPinnedDay, censusRows.find((r) => r.day === censusPinnedDay) ?? null);
 }

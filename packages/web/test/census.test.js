@@ -1,9 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { censusEvents, censusGaps, censusSeries, censusTrend, TREND_EPSILON_PER_DAY } from '../src/census.js';
+import { anchoredEvents, censusEvents, censusGaps, censusSeries, censusTrend, TREND_EPSILON_PER_DAY } from '../src/census.js';
 
 /** A day-book row, shaped like the server's. Only the fields the maths reads. */
 const row = (day, population, byArchetype = {}) => ({ day, population, byArchetype });
+
+/** A row for the anchor maths: an arbitrary headcount and an optional transaction. */
+const trow = (day, byArchetype, txHash) => ({
+  day, population: Object.values(byArchetype).reduce((s, n) => s + n, 0), byArchetype,
+  ...(txHash ? { txHash } : {}),
+});
 
 test('a gap in the book is reported as a gap, not as a straight line', () => {
   assert.deepEqual(censusGaps([row(0, 1), row(1, 1), row(2, 1)]), [], 'three consecutive readings');
@@ -89,4 +95,70 @@ test('one word for where a species is going, and `unknown` when nothing can be s
   // compared against a real one.
   assert.equal(censusTrend([row(4, 9, { APE: 9 }), row(4, 3, { APE: 3 })], 'APE').state, 'unknown');
   assert.ok(TREND_EPSILON_PER_DAY > 0 && TREND_EPSILON_PER_DAY < 1, 'the dead band is under one creature per day');
+});
+
+test('an extinction anchors to the last reading the species was counted, an emergence to its own', () => {
+  const rows = [
+    trow(0, { APE: 2 }, '0xA'),
+    trow(1, { APE: 2, INSIDER: 1 }, '0xB'),
+    trow(2, { APE: 2 }, '0xC'),
+    trow(3, { APE: 2, CRAB: 1 }, '0xD'),
+  ];
+  const events = anchoredEvents(rows, [
+    { day: 2, lost: ['INSIDER'], gained: [] },
+    { day: 3, lost: [], gained: ['CRAB'] },
+  ]);
+  assert.deepEqual(events, [
+    { day: 2, archetype: 'INSIDER', kind: 'lost', anchor: { day: 1, tx: '0xB' } },
+    { day: 3, archetype: 'CRAB', kind: 'gained', anchor: { day: 3, tx: '0xD' } },
+  ], 'a loss points one reading back to the transaction that shows it alive; a gain to its own day');
+});
+
+test('the anchor is the reading before, not the day before', () => {
+  // Day 9 is the second reading, and day 1 to 8 are simply not in the book. A
+  // species gone at day 9 was last counted at day 0 — the previous *row* — and
+  // anchoring to `day - 1` (day 8, absent) would be inventing a reading.
+  const rows = [trow(0, { APE: 2, INSIDER: 1 }, '0xA'), trow(9, { APE: 2 }, '0xJ')];
+  const events = anchoredEvents(rows, [{ day: 9, lost: ['INSIDER'], gained: [] }]);
+  assert.deepEqual(events[0].anchor, { day: 0, tx: '0xA' }, 'the loss anchors to the last row, not to a day that does not exist');
+});
+
+test('an anchor row that never went on chain carries the day and a null transaction', () => {
+  const lost = anchoredEvents(
+    [trow(0, { APE: 2, INSIDER: 1 }), trow(1, { APE: 2 })],
+    [{ day: 1, lost: ['INSIDER'], gained: [] }],
+  );
+  assert.deepEqual(lost[0].anchor, { day: 0, tx: null }, 'the extinction is real; only its proof is missing');
+  const gained = anchoredEvents(
+    [trow(0, { APE: 2 }), trow(1, { APE: 2, CRAB: 1 })],
+    [{ day: 1, lost: [], gained: ['CRAB'] }],
+  );
+  assert.deepEqual(gained[0].anchor, { day: 1, tx: null }, 'an unstamped first-counting says the same thing');
+});
+
+test('an event whose day is not in the book, or a loss with no reading before it, has no anchor', () => {
+  const drifted = anchoredEvents([trow(0, { APE: 2 }, '0xA')], [{ day: 5, lost: ['INSIDER'], gained: [] }]);
+  assert.deepEqual(drifted[0].anchor, { day: null, tx: null }, 'a change naming a day the rows do not hold anchors nowhere');
+  // A loss is derived from two readings; if the book's very first row is somehow
+  // called a loss, there is no earlier reading to point at, and it says so rather
+  // than reaching off the front of the array.
+  const firstRow = anchoredEvents([trow(0, { APE: 2 }, '0xA')], [{ day: 0, lost: ['APE'], gained: [] }]);
+  assert.deepEqual(firstRow[0].anchor, { day: null, tx: null }, 'the first reading has no predecessor to anchor to');
+});
+
+test('the anchor keeps the marker ordering and per-species shape censusEvents sets', () => {
+  const rows = [trow(0, { APE: 1, WHALE: 1, INSIDER: 1 }, '0xA'), trow(1, { APE: 1, CRAB: 1 }, '0xB')];
+  const events = anchoredEvents(rows, [{ day: 1, lost: ['INSIDER', 'WHALE'], gained: ['CRAB'] }]);
+  assert.deepEqual(events, [
+    { day: 1, archetype: 'INSIDER', kind: 'lost', anchor: { day: 0, tx: '0xA' } },
+    { day: 1, archetype: 'WHALE', kind: 'lost', anchor: { day: 0, tx: '0xA' } },
+    { day: 1, archetype: 'CRAB', kind: 'gained', anchor: { day: 1, tx: '0xB' } },
+  ], 'lost before gained on one day, each species its own event, both losses sharing the one prior anchor');
+});
+
+test('anchored events of an empty book, and of a book with no changes', () => {
+  assert.deepEqual(anchoredEvents([], []), [], 'nothing happened');
+  assert.deepEqual(anchoredEvents(undefined, undefined), [], 'a server that sent neither rows nor changes is not a crash');
+  const noRows = anchoredEvents([], [{ day: 1, lost: ['APE'], gained: [] }]);
+  assert.deepEqual(noRows, [{ day: 1, archetype: 'APE', kind: 'lost', anchor: { day: null, tx: null } }], 'an event with no book to reach back into is still the event');
 });
