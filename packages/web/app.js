@@ -35,6 +35,7 @@ import { anchorLabel } from './src/anchor.js';
 import { venueCoverageNotes } from './src/observe.js';
 import { verifyView } from './src/verify.js';
 import { sweepTally, SWEEP_TIERS } from './src/sweep.js';
+import { runwayView } from './src/runway.js';
 
 initI18n();
 
@@ -3263,6 +3264,7 @@ const CENSUS_TREND_KEYS = {
   unknown: 'censusTrendUnknown',
 };
 let censusData = null;   // last /history/census payload
+let anchorEcon = null;   // last /health `anchor` economics — what committing costs and for how long it is funded
 let censusInFlight = false;
 let censusRows = [];     // the rows it sent, oldest first
 let censusStack = null;  // censusSeries() of those rows
@@ -4227,6 +4229,76 @@ function renderWorldSince() {
  * canvas empty until the next 30-second aux cycle, which at boot meant "the text
  * says four days and the chart says nothing at all".
  */
+/**
+ * Integer grouping for a funding count, locale-independent on purpose: `1,234`
+ * here is the exact string a test asserts, and a locale that groups differently
+ * would turn a passing wiring test red for a reason that has nothing to do with
+ * the feature. `runwayView` already refused to invent a number; this only decides
+ * how a real one is written.
+ */
+function group(n) {
+  if (!Number.isFinite(n)) return String(n);
+  return Math.trunc(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+/**
+ * The public anchor runway: what committing a day costs, and how many more days
+ * the signing account can still pay for. Sits beside the day-digest chip because
+ * it is the same promise seen from the money side — "the day you just saw is on
+ * chain, and here is how long we can keep making them." `/health` already divides
+ * balance by the last measured cost; `runwayView` turns that into one honest state
+ * and this paints it, never colouring a failed reading as fine and never printing
+ * a number the chain did not hand over.
+ */
+function renderRunway() {
+  const el = document.getElementById('day-runway');
+  if (!el) return;
+  // No /health answer means nothing to say about money, so the panel stays hidden
+  // rather than showing a state we have not read — the same reason the sweep box
+  // waits for a stamped day instead of offering "0 unchecked" for a book nobody checked.
+  if (!anchorEcon) {
+    el.hidden = true;
+    el.innerHTML = '';
+    return;
+  }
+  const v = runwayView(anchorEcon);
+  let value;
+  if (v.state === 'neverRead') {
+    value = `<span class="dr-none">${esc(t('runwayNeverRead'))}</span>`;
+  } else if (v.state === 'unknown') {
+    // The reason is the server's own sentence about why there is no number; shown
+    // verbatim (escaped) rather than swallowed, because "balance not read" and "no
+    // cost measured yet" call for different actions.
+    value = `<span class="dr-unknown">${esc(t('runwayUnknown'))}</span>`
+      + (v.reason ? ` <span class="dr-reason">${esc(v.reason)}</span>` : '');
+  } else if (v.state === 'capped') {
+    value = `<span class="dr-val">${esc(t('runwayPlenty'))}</span>`;
+  } else {
+    // `ok` and `low` both carry the real quotient and the threshold beside it; only
+    // the tone differs, and the tone is what makes it guardable rather than pretty.
+    value = `<span class="dr-val">${esc(t('runwayFunded', { n: group(v.anchors) }))}</span>`
+      + (v.alarmBelow !== null ? ` <span class="dr-sub">${esc(t('runwayBelow', { m: group(v.alarmBelow) }))}</span>` : '');
+  }
+  const age = v.ageSeconds !== null ? ` <span class="dr-age">· ${v.ageSeconds}s</span>` : '';
+  el.hidden = false;
+  el.className = `day-runway dr-${v.state}`;
+  el.innerHTML = `<span class="dr-label">${esc(t('runwayTitle'))}</span>${value}${age}`;
+}
+
+/**
+ * Read the anchor's economics. Its own poller rather than another arm of
+ * `pollAux`'s `Promise.all`: the three endpoints there are guarded as a set (a
+ * positional swap once fed battle reports into the extinction lists), and `/health`
+ * has no business riding that wire every 30s when its numbers move once a day.
+ */
+async function pollHealth() {
+  try {
+    const d = await getJSON('/health');
+    anchorEcon = d && d.anchor ? d.anchor : null;
+    renderRunway();
+  } catch { /* keep the last runway reading on screen */ }
+}
+
 function paintCensus() {
   drawCensusChart();
   renderCensusText();
@@ -4255,6 +4327,13 @@ function paintCensus() {
 // one failing endpoint there used to take the charts, the culls and the reports
 // down with it, and the census has even less reason to ride along every 30s.
 refreshCensus().then(paintCensus);
+
+// The runway is drawn from /health, read on its own slow cadence and pulled once
+// here at boot. It sits below the `let anchorEcon` its renderer reads for the same
+// reason the line above does: the synchronous prefix of an async call must not
+// reach into the temporal dead zone.
+pollHealth();
+setInterval(() => { if (!document.hidden) pollHealth(); }, 60000);
 
 /* ---------- obituaries (cull records grouped by event) ---------- */
 

@@ -237,6 +237,11 @@
       <span class="da-note" data-i18n="dayAnchorNote">preview · commits on-chain at day end</span>
       <button class="dock-btn mini" data-export="digest" data-i18n="exportDigest">Export digest</button>
     </div>
+    <!-- The public anchor runway: what committing costs and how many more days the
+         signing account can pay for. Filled only once /health answers with an
+         anchor block; a page that has not read the chain's money says nothing here
+         rather than showing a zero it invented. -->
+    <div id="day-runway" class="day-runway" hidden></div>
     <div class="analytics-grid">
       <div class="analytics-side">
         <div class="sig-guide">

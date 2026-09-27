@@ -319,12 +319,16 @@ export const verifiedResponse = (txHash) => ({
  *   before a byte comes back), or absent for the canonical `verified` body. The
  *   route is served in every boot, so a test that never clicks the button still
  *   sees `reqs.verify === 0` rather than an unmatched path returning `{}`.
+ * @param {object|null} [opts.health] what `/health` should answer: an anchor-
+ *   carrying payload for the runway wiring to read, or `null`/absent for `{}` (no
+ *   anchor block), which is what every other boot sees and what keeps `#day-runway`
+ *   hidden. Counted in `reqs.health` like the other watched routes.
  * @returns the page, its canvases, what it asked the server for, what the visitor
  *   copied, and a `close()` that has to be called or the process never exits
  */
 let stageTaken = false;
 
-export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain, verify } = {}) {
+export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain, verify, health } = {}) {
   // One page per process, and the reason is measured rather than suspected:
   // `app.js` is evaluated once and the ESM cache never evaluates it again, so a
   // second `boot()` hands back a DOM nothing is driving. Checked on this harness —
@@ -343,7 +347,7 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   const servedSnapshot = digestChain === undefined
     ? snapshot
     : { ...snapshot, state: { ...snapshot.state, digestChain } };
-  const reqs = { census: 0, observe: 0, verify: 0 };
+  const reqs = { census: 0, observe: 0, verify: 0, health: 0 };
   const server = createServer((req, res) => {
     const path = req.url?.split('?')[0] ?? '/';
     res.setHeader('content-type', 'application/json');
@@ -371,6 +375,9 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
       const addr = new URLSearchParams(req.url?.split('?')[1] ?? '').get('addr');
       if (!observeLive) res.end(JSON.stringify({ available: false }));
       else res.end(JSON.stringify(addr ? addressPayload(addr) : observe));
+    } else if (path === '/health') {
+      reqs.health++;
+      res.end(JSON.stringify(health ?? {}));
     } else res.end(JSON.stringify({}));
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
