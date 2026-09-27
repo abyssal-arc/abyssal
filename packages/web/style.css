@@ -820,6 +820,22 @@ button.iv .price { color: var(--fg-3); font-size: 10px; font-family: var(--font-
 #day-runway.dr-ok .dr-val, #day-runway.dr-capped .dr-val { color: var(--accent); }
 #day-runway.dr-low .dr-val { color: var(--amber); }
 
+/* The offline replay player, docked under the pulse chart. `#replay-player` is the
+   only selector here that sets a `display`, so it is the one that has to restate the
+   hiding for the `[hidden]` guard. A file that could not be played paints its message
+   in `rp-bad` (danger) or `rp-empty` (muted italic) — never as a scrubber sitting at
+   0 of 0, which is the "quiet window" misreading the loader exists to prevent. */
+#replay-player { display: flex; flex-direction: column; gap: var(--sp); margin-top: calc(var(--sp) * 2); }
+#replay-player[hidden] { display: none; }
+.replay-player .rp-head { display: flex; align-items: center; gap: calc(var(--sp) * 2); }
+.replay-player .rp-title { color: var(--fg-3); text-transform: uppercase; letter-spacing: 1.2px; font-size: 9px; }
+.replay-player .rp-scrub { width: 100%; accent-color: var(--accent); }
+.replay-player .rp-summary { font-size: 10px; color: var(--fg-2); }
+.replay-player .rp-summary .rp-skip { color: var(--amber); font-size: 9px; }
+.replay-player.rp-bad .rp-summary { color: var(--danger); font-style: italic; }
+.replay-player.rp-empty .rp-summary { color: var(--fg-3); font-style: italic; }
+.replay-player .rp-cursor { font-size: 9px; color: var(--fg-3); }
+
 /* Compact button for header rows, where a full dock button shouts. */
 .dock-btn.mini {
   font-size: 9px;

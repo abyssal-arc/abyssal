@@ -38,4 +38,5 @@ jobs:
           node --input-type=module --check < packages/web/src/verify.js
           node --input-type=module --check < packages/web/src/sweep.js
           node --input-type=module --check < packages/web/src/runway.js
+          node --input-type=module --check < packages/web/src/replay.js
       - run: npm test

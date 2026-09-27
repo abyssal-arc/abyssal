@@ -446,6 +446,11 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   globalThis.cancelAnimationFrame = window.cancelAnimationFrame;
   globalThis.CustomEvent = window.CustomEvent;
   globalThis.Event = window.Event;
+  // The offline replay player reads a local file, so the boot that drives it needs
+  // the same file APIs a browser hands `app.js`: `new FileReader()` resolves to
+  // `window.FileReader` there, and a test constructs the dropped file with `window.File`.
+  globalThis.FileReader = window.FileReader;
+  globalThis.File = window.File;
   Object.defineProperty(window, 'innerWidth', { value: 1200, configurable: true });
   Object.defineProperty(window, 'innerHeight', { value: 700, configurable: true });
 

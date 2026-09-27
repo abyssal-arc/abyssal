@@ -94,12 +94,28 @@
           <span class="obs-actions">
             <button class="dock-btn mini" data-export="csv" data-i18n="exportCsv">Export CSV</button>
             <button class="dock-btn mini" data-export="replay" data-i18n="exportReplay">Export replay</button>
+            <input id="replay-file" type="file" accept="application/json,.json" hidden />
+            <label class="dock-btn mini" for="replay-file" data-i18n="replayChoose">Load replay file</label>
           </span>
         </div>
         <canvas id="pulse"></canvas>
         <div class="flowmap-legend">
           <span><i class="lg-plain"></i><span data-i18n="pulseLegendV">USDC volume per bucket</span></span>
           <span><i class="lg-x402"></i><span data-i18n="pulseLegendX">gold cap = x402 share of bucket</span></span>
+        </div>
+        <!-- The offline player. Filled only once a downloaded replay file is chosen;
+             hidden otherwise rather than showing an empty scrubber, because a slider
+             at 0 of 0 reads as "a quiet window" — the exact confusion the loader is
+             built to avoid. It draws from the file alone, with no request to the
+             server: the downloaded payload is the whole show. -->
+        <div id="replay-player" class="replay-player" hidden>
+          <div class="rp-head">
+            <span class="rp-title" data-i18n="replayTitle">Offline replay</span>
+            <button id="replay-btn" class="dock-btn mini rp-btn" type="button" data-i18n="replayPlay">Play</button>
+          </div>
+          <input id="replay-scrub" class="rp-scrub" type="range" min="0" max="0" step="1" value="0" aria-label="Replay position" />
+          <div id="replay-summary" class="rp-summary"></div>
+          <div id="replay-cursor" class="rp-cursor"></div>
         </div>
       </section>
     </div>

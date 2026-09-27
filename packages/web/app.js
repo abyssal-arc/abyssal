@@ -36,6 +36,7 @@ import { venueCoverageNotes } from './src/observe.js';
 import { verifyView } from './src/verify.js';
 import { sweepTally, SWEEP_TIERS } from './src/sweep.js';
 import { runwayView } from './src/runway.js';
+import { buildReplay, revealThrough } from './src/replay.js';
 
 initI18n();
 
@@ -4298,6 +4299,146 @@ async function pollHealth() {
     renderRunway();
   } catch { /* keep the last runway reading on screen */ }
 }
+
+/* ---------------- offline replay: play a downloaded file, no server ---------------- */
+
+/**
+ * The replay player's whole state: the timeline `buildReplay` produced (null until
+ * a file is chosen), the name shown beside it, whether the last file failed to
+ * parse, and the playhead timer. Nothing here is fetched — the payload arrives as a
+ * local file the visitor downloaded from `GET /export?kind=replay`, and the point of
+ * this panel is that it draws from those bytes alone.
+ */
+let replayR = null;
+let replayName = '';
+let replayBad = false;
+let replayPlaying = false;
+let replayTimer = 0;
+
+/** A span of milliseconds, said the way a person would: ms, seconds, or minutes. */
+function fmtSpan(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  if (ms < 60_000) return `${Math.round(ms / 100) / 10}s`;
+  return `${Math.round(ms / 6000) / 10}min`;
+}
+
+/** A frame's timestamp as a wall-clock time; the date is the file's, only the time moves. */
+function fmtClock(ts) {
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  const two = (x) => String(x).padStart(2, '0');
+  return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+}
+
+function stopReplay() {
+  replayPlaying = false;
+  if (replayTimer) { clearInterval(replayTimer); replayTimer = 0; }
+  const btn = document.getElementById('replay-btn');
+  if (btn) btn.textContent = t('replayPlay');
+}
+
+/** One sweep of the playhead: advance a frame, and stop at the last real one. */
+function replayStep() {
+  const scrub = document.getElementById('replay-scrub');
+  if (!scrub || !replayR || !replayR.count) { stopReplay(); return; }
+  let i = Math.trunc(Number(scrub.value)) + 1;
+  if (i >= replayR.count) { i = replayR.count - 1; scrub.value = String(i); updateReplayCursor(); stopReplay(); return; }
+  scrub.value = String(i);
+  updateReplayCursor();
+}
+
+function toggleReplay() {
+  if (!replayR || !replayR.count) return;
+  if (replayPlaying) { stopReplay(); return; }
+  const scrub = document.getElementById('replay-scrub');
+  // Rewind if the last play ran to the end, so Play never looks dead on a full bar.
+  if (scrub && Math.trunc(Number(scrub.value)) >= replayR.count - 1) { scrub.value = '0'; updateReplayCursor(); }
+  replayPlaying = true;
+  const btn = document.getElementById('replay-btn');
+  if (btn) btn.textContent = t('replayPause');
+  replayTimer = setInterval(replayStep, 120);
+}
+
+/**
+ * Write the summary line and set up the scrubber. Three outcomes, each its own look:
+ * a file that is not JSON is `rp-bad` (danger), a file with no usable events is
+ * `rp-empty` (muted, never a scrubber parked at 0 of 0), and a playable one gets a
+ * scrubber whose max is the real frame count. Rows without a timestamp are reported,
+ * not hidden: `dropped` is the difference between "the file was short" and "the file
+ * had rows we could not read".
+ */
+function renderReplay() {
+  const box = document.getElementById('replay-player');
+  if (!box) return;
+  const summary = document.getElementById('replay-summary');
+  const scrub = document.getElementById('replay-scrub');
+  box.hidden = false;
+  box.classList.remove('rp-bad', 'rp-empty');
+  stopReplay();
+
+  if (replayBad) {
+    box.classList.add('rp-bad');
+    if (summary) summary.textContent = esc(t('replayBad'));
+    if (scrub) { scrub.max = '0'; scrub.value = '0'; scrub.disabled = true; }
+    const cur = document.getElementById('replay-cursor');
+    if (cur) cur.textContent = '';
+    return;
+  }
+  if (!replayR || replayR.empty) {
+    box.classList.add('rp-empty');
+    const skip = replayR && replayR.dropped ? ` ${esc(t('replaySkipped', { n: group(replayR.dropped) }))}` : '';
+    if (summary) summary.innerHTML = esc(t('replayEmpty')) + skip;
+    if (scrub) { scrub.max = '0'; scrub.value = '0'; scrub.disabled = true; }
+    const cur = document.getElementById('replay-cursor');
+    if (cur) cur.textContent = '';
+    return;
+  }
+  if (scrub) { scrub.max = String(replayR.count - 1); scrub.value = '0'; scrub.disabled = false; }
+  // The whole line is escaped once, so a file whose name carries markup cannot open
+  // a tag — and only once, so a name with an ampersand still reads as an ampersand.
+  const parts = [esc(t('replayLoaded', { name: replayName, n: group(replayR.count), span: fmtSpan(replayR.spanMs) }))];
+  if (replayR.dropped) parts.push(`<span class="rp-skip">${esc(t('replaySkipped', { n: group(replayR.dropped) }))}</span>`);
+  if (summary) summary.innerHTML = parts.join(' ');
+  updateReplayCursor();
+}
+
+/** The line under the scrubber: which frame the playhead sits on, and what ran by then. */
+function updateReplayCursor() {
+  const cur = document.getElementById('replay-cursor');
+  if (!cur) return;
+  const scrub = document.getElementById('replay-scrub');
+  const r = revealThrough(replayR, scrub ? Number(scrub.value) : 0);
+  if (!r) { cur.textContent = ''; return; }
+  cur.textContent = esc(t('replayCursor', { shown: group(r.shown), n: group(replayR.count), time: fmtClock(r.t) }));
+}
+
+function applyReplay(text, name) {
+  replayName = name || 'replay.json';
+  let payload;
+  try {
+    payload = JSON.parse(text);
+    replayBad = false;
+  } catch {
+    replayBad = true;
+    replayR = null;
+  }
+  if (!replayBad) replayR = buildReplay(payload);
+  renderReplay();
+}
+
+function loadReplayFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => applyReplay(String(reader.result), file.name);
+  reader.onerror = () => applyReplay(null, file.name);
+  reader.readAsText(file);
+}
+
+document.getElementById('replay-file')?.addEventListener('change', (ev) => {
+  const file = ev.target.files && ev.target.files[0];
+  if (file) loadReplayFile(file);
+});
+document.getElementById('replay-scrub')?.addEventListener('input', () => { stopReplay(); updateReplayCursor(); });
+document.getElementById('replay-btn')?.addEventListener('click', toggleReplay);
 
 function paintCensus() {
   drawCensusChart();
