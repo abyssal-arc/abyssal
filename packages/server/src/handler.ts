@@ -43,6 +43,10 @@ import {
   type CensusDay, type DigestEcon, type DigestRecord, type StoredRow,
 } from './digest.js';
 import { checkTransaction, isTxHash, type RpcObject } from './verify.js';
+import {
+  buildCreaturePoster, buildDayPoster, buildNotFoundPoster, buildStoryFacts, buildStoryPoster,
+  renderPoster, type PosterSpec,
+} from './share.js';
 import { advisorySignals, budgetCrossed, healthProblem, staleSignals, type Health } from './health.js';
 import {
   ABYS_PRICES,
@@ -801,6 +805,20 @@ export function createApp(options: AppOptions = {}) {
       headers['cache-control'] = 'no-store';
     }
     return new Response(JSON.stringify(data), { status, headers });
+  }
+
+  // The share pages are the one place this handler answers in HTML. Same cache
+  // discipline as `json` — a subject that will not change for a minute is cacheable,
+  // a "nothing here" never is — but `text/html`, because a crawler is coming.
+  function html(body: string, status = 200, cacheSec = 0): Response {
+    const headers: Record<string, string> = {
+      'content-type': 'text/html; charset=utf-8',
+      'access-control-allow-origin': '*',
+    };
+    headers['cache-control'] = cacheSec > 0
+      ? 'public, s-maxage=' + cacheSec + ', stale-while-revalidate=' + cacheSec * 3
+      : 'no-store';
+    return new Response(body, { status, headers });
   }
 
   function countdown(intervalTicks: number, cullRatio: number) {
@@ -2219,6 +2237,7 @@ export function createApp(options: AppOptions = {}) {
       chain: { network: NETWORK, chainId: CHAIN_ID, asset: 'ABYSSAL' },
       endpoints: {
         'GET /': 'web frontend',
+        'GET /s/day/<n> · /s/creature/<id> · /s/story': 'the shareable poster for one thing — a committed day, a creature (living or remembered), or a week of the day book — as standalone HTML whose og:title/og:description carry the real figures so a shared link unfurls truthfully',
         'GET /api': 'this endpoint index',
         'GET /state': 'tick, day, population, chain + market temperature, harvest/judgment countdowns, price list, legendary thresholds, editable traits',
         'GET /world': 'render snapshot: creatures (with archetype, plus paid identity where any exists), foods, world size',
@@ -2249,6 +2268,62 @@ export function createApp(options: AppOptions = {}) {
     };
   }
 
+  /**
+   * Serve `GET /s/<kind>/<id>` — the shareable poster for one subject. It reads the
+   * same live data the JSON routes do (the day book, the tank, the lineage lookup
+   * that also answers for dead creatures) and renders it through the pure builders
+   * in `share.ts`; the only decision made here is *which* subject and whether it
+   * exists. A subject that is gone or never was is an honest 404 page, not an empty
+   * 200 — the whole point of a shared link is that it says something true.
+   */
+  function serveShare(url: URL): Response {
+    const origin = url.origin;
+    const ogImage = `${origin}/assets/og.png`;
+    const render = (spec: PosterSpec, cacheSec: number) => html(renderPoster(spec, { ogImage }), spec.status ?? 200, cacheSec);
+    const parts = url.pathname.split('/').filter((s) => s.length > 0);
+    const kind = parts[1] ?? '';
+    const ident = parts[2];
+
+    if (kind === 'day') {
+      const day = ident !== undefined && /^(0|[1-9]\d*)$/.test(ident) ? Number(ident) : null;
+      const row = day === null ? undefined : dayBook.find((r) => r.day === day);
+      if (!row) return render(buildNotFoundPoster('day', ident ?? '?', { origin }), 0);
+      return render(buildDayPoster(row, { origin }), 60);
+    }
+
+    if (kind === 'creature') {
+      const id = creatureIdOf(ident);
+      const found = id === null ? null : lineageLookup(id);
+      if (!found) return render(buildNotFoundPoster('creature', ident ?? '?', { origin }), 0);
+      // `lineageLookup` already resolves a dead life from the obituary ring, so a
+      // memorial card reads the same as a living one with a different badge. The
+      // live creature is consulted only for the two facts the obituary does not
+      // keep: legendary status and whether the displayed name was a bought one.
+      const live = id !== null ? findCreature(world, id) : null;
+      const node = found.node;
+      return render(buildCreaturePoster({
+        id: node.id,
+        name: node.name,
+        archetype: node.archetype,
+        generation: node.generation,
+        kills: node.kills,
+        offspring: node.offspring,
+        alive: node.alive,
+        legendary: live ? isLegendary(live) : false,
+        customName: live ? Boolean(live.customName) : false,
+        codename: live?.customName ? live.name : undefined,
+      }, { origin }), 30);
+    }
+
+    if (kind === 'story') {
+      const facts = buildStoryFacts(dayBook);
+      if (!facts) return render(buildNotFoundPoster('story', 'the week', { origin }), 0);
+      return render(buildStoryPoster(facts, { origin }), 60);
+    }
+
+    return render(buildNotFoundPoster(kind || 'share', ident ?? '', { origin }), 0);
+  }
+
   async function fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -2262,6 +2337,10 @@ export function createApp(options: AppOptions = {}) {
           'access-control-allow-headers': 'content-type,x-payment,x-payment-tx',
         },
       });
+    }
+
+    if (req.method === 'GET' && (path === '/s' || path.startsWith('/s/'))) {
+      return serveShare(url);
     }
 
     if (req.method === 'GET' && path === '/api') {

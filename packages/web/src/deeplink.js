@@ -130,3 +130,21 @@ export function focusUrl(base, focus) {
   url.hash = '';
   return url.toString();
 }
+
+/**
+ * The shareable poster link for a focus, against the given origin.
+ *
+ * The address bar (`focusUrl`) keeps exact state; this is a different artifact —
+ * the URL of the standalone `/s/...` page a crawler can unfurl into a card. The
+ * priority is creature, then day, then the week: a chosen animal outranks a pinned
+ * day, and when someone is only watching the tank neither is present, so "a week in
+ * the tank" is the thing worth sending. It is an absolute, same-origin URL with a
+ * path only — never a query — so a poster link cannot carry the exact-state noise the
+ * bar happens to hold, and the `/s` route it names is the same subject the bar is on.
+ */
+export function posterShareUrl(origin, focus) {
+  const base = String(origin ?? '').replace(/\/+$/, '');
+  if (focus && focus.creature != null) return `${base}/s/creature/${focus.creature}`;
+  if (focus && focus.day != null) return `${base}/s/day/${focus.day}`;
+  return `${base}/s/story`;
+}

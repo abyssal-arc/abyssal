@@ -7,7 +7,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { DRAWERS, VIEWS, focusUrl, parseFocus, serializeFocus } from '../src/deeplink.js';
+import { DRAWERS, VIEWS, focusUrl, parseFocus, posterShareUrl, serializeFocus } from '../src/deeplink.js';
 
 const ADDR = '0x1234aBcd567890123456789012345678901234Ab';
 
@@ -115,4 +115,15 @@ test('the copied link and the address bar are the same string', () => {
   assert.ok(!focusUrl(base, f).includes('frag'), 'the fragment goes');
   assert.ok(!focusUrl(base, f).includes('utm_source'), 'and so does whatever else was in the bar');
   assert.deepEqual(parseFocus(new URL(focusUrl(base, f)).search), f, 'opening the link gives back the state');
+});
+
+test('the share link names the most specific thing on screen, as an absolute same-origin path', () => {
+  // The poster is a different artifact from the bar: an absolute URL to `/s/...`,
+  // path only, so it unfurls for a crawler wherever it is pasted.
+  assert.equal(posterShareUrl('https://x.test/', { view: 'world', creature: 12 }), 'https://x.test/s/creature/12', 'a trailing slash on the origin is not doubled');
+  assert.equal(posterShareUrl('https://x.test', { view: 'observe', day: 4, verify: 1 }), 'https://x.test/s/day/4', 'a pinned day, verification flag and all, shares the day');
+  assert.equal(posterShareUrl('https://x.test', { view: 'world' }), 'https://x.test/s/story', 'just watching the tank shares the week');
+  assert.equal(posterShareUrl('https://x.test', { creature: 3, day: 4 }), 'https://x.test/s/creature/3', 'a chosen animal outranks a pinned day');
+  assert.equal(posterShareUrl('https://x.test', { day: 0 }), 'https://x.test/s/day/0', 'day zero is a real day, not an absent one');
+  assert.ok(!posterShareUrl('https://x.test', { day: 4 }).includes('?'), 'a poster link carries no exact-state query');
 });

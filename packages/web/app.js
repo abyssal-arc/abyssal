@@ -28,7 +28,7 @@ import { t, initI18n } from './i18n.js';
 import { mulberry32, hashSeed, mixSeed, unitNoise } from './src/geom.js';
 import { hsla, shortAddr, fmtUsd } from './src/format.js';
 import { anchoredEvents, censusEvents, censusSeries, censusTrend } from './src/census.js';
-import { focusUrl, parseFocus, serializeFocus } from './src/deeplink.js';
+import { focusUrl, parseFocus, posterShareUrl, serializeFocus } from './src/deeplink.js';
 import { diffStanding, sinceDay, standingSeed, trimSince } from './src/since.js';
 import { diffWorld, worldSeed } from './src/worldsince.js';
 import { anchorLabel } from './src/anchor.js';
@@ -149,6 +149,7 @@ function setFocus(patch) {
     if (v === null || v === undefined) delete focus[k];
     else focus[k] = k === 'addr' ? String(v).toLowerCase() : v;
   }
+  syncShareButton();
   const next = serializeFocus(focus);
   if (next === window.location.search) return;
   window.history.replaceState(null, '', next || window.location.pathname);
@@ -186,6 +187,29 @@ async function copyText(text) {
 /** Copy the current link and say whether it landed. */
 async function copyFocusLink() {
   const ok = await copyText(focusLink());
+  toast(ok ? t('linkCopied') : t('linkNotCopied'), !ok);
+}
+
+/**
+ * Keep the share button pointing at the poster for whatever is on screen.
+ *
+ * The button carries its target in `data-share-url` rather than computing it on
+ * click, for two reasons: the exact-state query the bar holds can say more than a
+ * poster can show (a `verify=1` beside a day), so the two are derived from the same
+ * `focus` by one rule instead of a click guessing; and it makes the button's target
+ * a fact a test can read without a clipboard, which a browser lets you set but a
+ * harness cannot always honor.
+ */
+function syncShareButton() {
+  const el = document.getElementById('share-btn');
+  if (el) el.dataset.shareUrl = posterShareUrl(window.location.origin, focus);
+}
+
+/** Copy the poster link for the current subject — the thing meant to be forwarded. */
+async function copyPosterLink() {
+  const el = document.getElementById('share-btn');
+  const url = el?.dataset.shareUrl || posterShareUrl(window.location.origin, focus);
+  const ok = await copyText(url);
   toast(ok ? t('linkCopied') : t('linkNotCopied'), !ok);
 }
 
@@ -1729,6 +1753,11 @@ document.querySelector('#addr-card .tx-close').addEventListener('click', () => {
   setFocus({ addr: null });
 });
 document.getElementById('addr-link').addEventListener('click', copyFocusLink);
+// The top-bar share button tracks the subject on screen. The initial sync is what
+// makes it right for a cold open: a visitor who arrived on `?day=4` should see a day
+// poster as the share target before they ever move focus, not the week default.
+document.getElementById('share-btn')?.addEventListener('click', copyPosterLink);
+syncShareButton();
 
 /** Seamless news-style ticker of the newest real flows, dual-track looping. */
 const TICKER_MAX = 20;

@@ -45,6 +45,9 @@ import {
   isTxHash, decodeCalldataPayload, chainFacts, receiptFacts, checkTransaction,
   type RpcObject,
 } from '../src/verify.js';
+import {
+  buildCreaturePoster, buildDayPoster, buildStoryFacts, renderPoster,
+} from '../src/share.js';
 
 // The handler feeds from the live Arc RPC by default; the suite must never
 // depend on the network, so pin the offline rain before any app is created.
@@ -7396,6 +7399,142 @@ test('a recovered verify outage counts as a new outage, not the same one forever
   } finally {
     s.close();
   }
+});
+
+/* ---------- the share posters: GET /s/<kind>/<id> ---------- */
+
+/**
+ * Fetch a share page and hand back both the response (status, headers) and its
+ * HTML as text. These are the only routes in the suite that answer in HTML, so
+ * the assertions read the document the way a crawler's parser would — through the
+ * rendered string, not a parsed JSON body.
+ */
+async function readShare(
+  app: { fetch(req: Request): Promise<Response> },
+  path: string,
+): Promise<{ res: Response; html: string }> {
+  const res = await app.fetch(new Request(`http://localhost${path}`));
+  return { res, html: await res.text() };
+}
+
+test('GET /s/day/<n> renders a committed day as a poster whose figures are the row\'s own', async () => {
+  const m = memStore();
+  m.seedDayBook([{ ...censusFixture(61, { APE: 3, WHALE: 1 }), txHash: '0x' + 'cd'.repeat(32) }]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const { res, html } = await readShare(app, '/s/day/61');
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+  assert.match(res.headers.get('cache-control') ?? '', /s-maxage=60/, 'a committed day will not change this minute, so it is cacheable');
+  assert.ok(html.includes('<title>ABYSSAL · Day 61</title>'));
+  // The population in the unfurl text is the row's population (3 + 1 = 4), not a
+  // number the render invented.
+  assert.ok(html.includes('Day 61 on Arc: 4 creatures'), 'og:description carries the real headcount');
+  assert.ok(html.includes('APE · 4 kills'), 'the committed top predator is decoded from its `archetype:kills` shape');
+  assert.ok(html.includes('APE 3'), 'the per-species headcount is shown');
+  assert.ok(html.includes('/s/day/61'), 'the canonical url is the poster itself');
+  assert.ok(html.includes('view=observe&amp;day=61&amp;verify=1'), 'a stamped day links the reader into the SPA\'s own verification');
+  assert.ok(html.includes('On chain · verifiable'), 'and the card says which kind of day this is');
+});
+
+test('a day that never anchored is not dressed up as one that did', async () => {
+  const m = memStore();
+  m.seedDayBook([censusFixture(5)]); // no txHash
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const { res, html } = await readShare(app, '/s/day/5');
+  assert.equal(res.status, 200);
+  assert.ok(!html.includes('verify=1'), 'no verification link is offered for a day with no transaction to verify');
+  assert.ok(html.includes('not yet anchored'), 'and the card admits it');
+});
+
+test('GET /s/day/<n> for a day not in the book is an honest 404 page, not an empty 200', async () => {
+  const m = memStore();
+  m.seedDayBook([censusFixture(61)]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const { res, html } = await readShare(app, '/s/day/9999');
+  assert.equal(res.status, 404);
+  assert.equal(res.headers.get('cache-control'), 'no-store', 'a 404 must not be cached as if it were permanent');
+  assert.match(res.headers.get('content-type') ?? '', /text\/html/);
+  assert.ok(html.includes('There is no day 9999 to show'));
+});
+
+test('GET /s/creature/<id> names a living resident, and 404s a life that is not remembered', async () => {
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  const c = app.world.creatures[0];
+  const { res, html } = await readShare(app, `/s/creature/${c.id}`);
+  assert.equal(res.status, 200);
+  assert.ok(html.includes(`<h1>${c.name}</h1>`), 'the headline is the creature\'s display name');
+  assert.ok(html.includes('Alive in the tank'));
+  assert.ok(html.includes(c.archetype), 'the species is stated');
+  assert.ok(html.includes(`view=world&amp;creature=${c.id}`), 'the card sends a reader to the live tank');
+  const gone = await readShare(app, '/s/creature/999999');
+  assert.equal(gone.res.status, 404, 'an id nobody has ever had is not a resident');
+});
+
+test('GET /s/story recaps the week from the day book and reports an extinction inside it', async () => {
+  const m = memStore();
+  m.seedDayBook([
+    censusFixture(10, { APE: 2, INSIDER: 1 }),
+    censusFixture(11, { APE: 2, INSIDER: 1 }),
+    censusFixture(12, { APE: 2 }), // INSIDER is gone by the end of the window
+  ]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const { res, html } = await readShare(app, '/s/story');
+  assert.equal(res.status, 200);
+  assert.ok(html.includes('A WEEK IN THE TANK'));
+  assert.ok(html.includes('Day 10–12'), 'the span names the days it covers');
+  assert.ok(html.includes('Went extinct') && html.includes('INSIDER'), 'an extinction between two committed rows is told');
+  assert.ok(html.includes('3 → 2'), 'the population change reads as a movement, start to end');
+});
+
+test('a reseed inside the week makes the flow figures unknown rather than a confident sum', async () => {
+  const m = memStore();
+  m.seedDayBook([
+    censusFixture(20),
+    // Counters that ran backwards are a different tank wearing the same day
+    // numbers; the recap must refuse to add across that gap.
+    { ...censusFixture(21), born: 1, died: 1, predations: 1 },
+  ]);
+  const app = createApp({ seed: 1, store: m.store, ...offlineFeeds });
+  const { html } = await readShare(app, '/s/story');
+  assert.match(html, /Births<\/div><div class="fv" style="color:[^"]*">unknown</, 'a sum across a reseed is a fabricated number, so none is shown');
+});
+
+test('bare /s and an unknown kind are 404s with the same honest shape', async () => {
+  const app = createApp({ seed: 1, ...offlineFeeds });
+  assert.equal((await readShare(app, '/s')).res.status, 404);
+  assert.equal((await readShare(app, '/s/galaxy/7')).res.status, 404);
+});
+
+test('the endpoint index advertises the share posters, because an undiscovered route is unshared', async () => {
+  const app = createApp({ seed: 7, ...offlineFeeds });
+  const api = (await (await app.fetch(new Request('http://localhost/api'))).json()) as { endpoints: Record<string, string> };
+  assert.ok(
+    Object.keys(api.endpoints).some((k) => k.startsWith('GET /s/day/<n>')),
+    'GET /api lists the share surface',
+  );
+});
+
+test('a large population is grouped, a one-row book is not a week, and a bought name cannot break its own document', () => {
+  const row = { ...censusFixture(9), population: 12345, byArchetype: { APE: 12345 }, totalEnergy: 98765 };
+  const dayHtml = renderPoster(buildDayPoster(row as CensusDay, { origin: 'https://x.test' }), { ogImage: 'https://x.test/assets/og.png' });
+  assert.ok(dayHtml.includes('12,345') && dayHtml.includes('98,765'), 'thousands separators, deterministically');
+
+  assert.equal(buildStoryFacts([censusFixture(1)]), null, 'one row is a fact; a week needs two');
+
+  // The security-relevant one: a name is bought and typed by a person, so the
+  // hostile string below is exactly what a paid name can be. It must appear only
+  // as escaped text, in a <h1> and inside content="..." attributes both.
+  const hostile = '<script>alert("x")</script>';
+  const html = renderPoster(
+    buildCreaturePoster(
+      { id: 7, name: hostile, archetype: 'APE', generation: 1, kills: 0, offspring: 0, alive: true, customName: true, codename: 'MOBY' },
+      { origin: 'https://x.test' },
+    ),
+    { ogImage: '' },
+  );
+  assert.ok(!html.includes('<script>alert'), 'the raw name never survives into the document');
+  assert.ok(html.includes('&lt;script&gt;'), 'it survives only as escaped text');
+  assert.ok(!/<meta[^>]*content="[^"]*"><script/.test(html), 'a name cannot close its own og attribute and start a tag');
 });
 
 

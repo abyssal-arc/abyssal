@@ -78,3 +78,13 @@ test('every key the link named is the screen it names', () => {
   assert.equal(addrCard.hidden, false, 'the endpoint the link named has its card open');
   assert.equal(addrCard.querySelector('.addr-h').title, FLOW_ADDR, 'the card is about a different address');
 });
+
+test('the share button points at the poster for the most specific subject the link named', () => {
+  // The button's target is written when focus is set, so a cold-opened link gets a
+  // correct share before the visitor touches anything. The link names an animal and
+  // pins a day at once; the poster must be about the animal, which is more specific.
+  const btn = document.getElementById('share-btn');
+  assert.ok(btn, 'the top bar offers a share button');
+  assert.match(btn.dataset.shareUrl ?? '', /\/s\/creature\/101$/, `shared the wrong subject: ${btn.dataset.shareUrl}`);
+  assert.ok(!(btn.dataset.shareUrl ?? '').includes('?'), 'a poster link is a bare path, not the exact-state query the bar holds');
+});
