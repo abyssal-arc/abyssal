@@ -40,7 +40,7 @@ import {
   nameRowRule, newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
   CENSUS_BUDGET_BYTES, CENSUS_CAP, CENSUS_ROW_BYTES, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS, DIGEST_RULE_TABLE, DIGEST_V, LEGACY_RULE_VERSION,
   censusFootprint,
-  type CensusDay, type DigestRecord, type StoredRow,
+  type CensusDay, type DigestEcon, type DigestRecord, type StoredRow,
 } from './digest.js';
 import { checkTransaction, isTxHash, type RpcObject } from './verify.js';
 import { advisorySignals, budgetCrossed, healthProblem, staleSignals, type Health } from './health.js';
@@ -862,7 +862,7 @@ export function createApp(options: AppOptions = {}) {
         // because this is the one place a hash is taken over a day that has not
         // been committed yet: the rule it will use is a fact about this build, and
         // saying so is what keeps the preview honest when the build changes.
-        digest: await digestHash({ v: DIGEST_V, ...digestStats(day, world) }),
+        digest: await digestHash({ v: DIGEST_V, ...digestStats(day, world), ...dayEcon() }),
       },
       population: world.creatures.length,
       totalEnergy: round1(world.creatures.reduce((s, c) => s + c.energy, 0)),
@@ -1182,6 +1182,18 @@ export function createApp(options: AppOptions = {}) {
    */
   let anchorEcon: AnchorEcon = newAnchorEcon(0);
   /**
+   * The economics a day's commitment covers: the ledger's running machine-sale count
+   * and the USDC those sales brought in. Handed to BOTH the `/state` preview and the
+   * day-end commit from this one place, so the numbers a viewer watches through the
+   * day are built the same way as the ones that go on chain — one source, `anchorEcon`,
+   * not two expressions that can drift. They are also the rule-2 fields the preview
+   * hash needs to match what commits; under rule 1 they were not hashed and so were
+   * not here.
+   */
+  function dayEcon(): DigestEcon {
+    return { sales: anchorEcon.sales, revenueUnits: anchorEcon.revenueUnits };
+  }
+  /**
    * Guards against two pumps running at once inside this isolate.
    *
    * Deliberately a boolean rather than the record's status, which is the other
@@ -1439,7 +1451,7 @@ export function createApp(options: AppOptions = {}) {
         // tick the world while the payload is being hashed, and a world re-read
         // after that gives up a row whose headcount is a later moment than its
         // population — which `censusProblem` then refuses on every cold start.
-        const payload = await buildPayload(reading.stats, ts);
+        const payload = await buildPayload(reading.stats, dayEcon(), ts);
         rec = newDigestRecord(prevDay, payload);
         digest = rec;
         // Filed whether or not the broadcast succeeds: the day happened, and a

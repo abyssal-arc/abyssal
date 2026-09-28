@@ -12,13 +12,13 @@
  * about 2^16 — tens of thousands of candidate worlds, an afternoon on a laptop.
  * A number that cheap to collide is not a commitment, and the entire purpose of
  * broadcasting this to a blockchain is to make the value expensive to deny.
- * Nothing had been anchored when the FNV-1a digest was replaced, so version 1 is
- * the only rule this project has ever published — and that sentence now describes
- * real records rather than a hypothetical: thirty-one days are on Arc under rule 1
- * (thirty of them pointed at by a row of the day book), each re-hashed from the
- * outside and matching. That is precisely why the table above exists: the rule can
- * only ever be added to, because a number already on a public chain cannot be
- * re-hashed and must not be re-interpreted.
+ * Rule 1 was alone for the tank's first weeks on Arc, and every one of those
+ * records re-hashes from the outside and matches. This build adds rule 2 beside it
+ * — the ecology of a day, plus that day's settled economics (how many data windows
+ * machines paid for, and the USDC they brought in) — which is precisely what the
+ * table exists for: a rule can only ever be added to, never re-interpreted, because
+ * a number already on a public chain cannot be re-hashed. Days written under rule 1
+ * stay rule 1 and verify under rule 1; days closed from here on commit under rule 2.
  *
  * Every field in the hash pre-image also ships in the payload, and the field
  * list is published as `DIGEST_HASH_FIELDS`. The old code hashed `world.tick`
@@ -48,11 +48,15 @@ export const DIGEST_MAGIC = '0x41425953';
  */
 export const DIGEST_RULES = {
   1: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
+  // Rule 2 is rule 1's list with the day's settled economics appended. The ecology
+  // fields keep their exact order so a v1 pre-image and a v2 pre-image share their
+  // prefix character for character; only two terms are added, at the end.
+  2: ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator', 'sales', 'revenueUnits'],
 } as const satisfies Record<number, readonly string[]>;
 
 /** Which rule new payloads are built with. Typed as a key of the table, so a bump
  * that names no rule is a type error rather than a runtime surprise. */
-export const DIGEST_V: keyof typeof DIGEST_RULES = 1;
+export const DIGEST_V: keyof typeof DIGEST_RULES = 2;
 
 /** The fields the current rule hashes, in order — `DIGEST_RULES[DIGEST_V]`, named. */
 export const DIGEST_HASH_FIELDS = DIGEST_RULES[DIGEST_V];
@@ -78,7 +82,27 @@ export interface DigestStats {
   topPredator: string | null;
 }
 
-export interface DigestPayload extends DigestStats {
+/**
+ * The day's settled economics, cumulative and read from the durable ledger —
+ * deliberately *not* a function of the world, which is why it is its own type and
+ * its own argument rather than more fields quietly bolted onto `DigestStats`.
+ *
+ * Both terms are integers-as-canonical-strings or integers, so the pre-image never
+ * carries a float (a percentage would, and this project does not put a float into a
+ * commitment); and the ledger seeds them at `0` and `"0"` before anything has sold,
+ * so a day can always be committed without a number having to be guessed. `sales`
+ * is machine-settled data windows and `revenueUnits` is what those windows paid, so
+ * together they are "how much of the deep sea's story was bought, and by how much,"
+ * committed to the chain beside the ecology that was already there.
+ */
+export interface DigestEcon {
+  /** Machine-settled data sales since this ledger existed. */
+  sales: number;
+  /** Sum of those sales' quoted amounts, in USDC token units, as a decimal integer string. */
+  revenueUnits: string;
+}
+
+export interface DigestPayload extends DigestStats, DigestEcon {
   v: number;
   /** Hex SHA-256 of the pre-image described by `DIGEST_HASH_FIELDS`. */
   hash: string;
@@ -237,9 +261,26 @@ export async function digestHash(stats: DigestStats & { v: number }): Promise<st
   return sha256Hex(pre.preImage);
 }
 
-/** Build the payload that goes on chain: the stats, the rule version, and their hash. */
-export async function buildPayload(stats: DigestStats, ts: number): Promise<DigestPayload> {
-  const base = { v: DIGEST_V as number, ...stats };
+/**
+ * Build the payload that goes on chain: the day's world numbers, its settled
+ * economics, the rule version, and their hash.
+ *
+ * `econ` is a separate parameter rather than part of `stats` because the two arrive
+ * from different readers — the world is counted by `censusReading`, the economics are
+ * the ledger's running tally — and a rule that hashes both must be *handed* both
+ * rather than trust one object to have silently grown a second meaning. The version
+ * is taken from `DIGEST_V` but written before the spreads so a caller that hands over
+ * a stats object carrying its own stale `v` (a payload, a fixture) cannot overwrite
+ * the rule this build commits under.
+ */
+export async function buildPayload(stats: DigestStats, econ: DigestEcon, ts: number): Promise<DigestPayload> {
+  // `v` is written first so the payload's key order matches its rule's field order
+  // (a published `hashed` list a reader walks left to right), and re-asserted after
+  // the spread so a stats object that carries a stale `v` — a payload, a fixture —
+  // cannot win the value by key order while losing the position. This build commits
+  // under `DIGEST_V`, full stop.
+  const base = { v: DIGEST_V as number, ...stats, ...econ };
+  base.v = DIGEST_V as number;
   return { ...base, ts, hash: await digestHash(base) };
 }
 

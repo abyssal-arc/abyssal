@@ -224,7 +224,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (390 total)
+npm test           # sim + server + web tests (435 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -832,8 +832,8 @@ boots and the observatory stays free to watch, but `POST /intervene` answers
 
 ## Tests and CI
 
-430 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-27T14:39:54Z: 59 + 210 + 161,
+435 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-28T05:21:46Z: 59 + 213 + 163,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
@@ -845,8 +845,8 @@ and the one row CI never runs is named in the log rather than missing in silence
 | Workspace | Tests | Covers |
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
-| `@abyssal/server` | 210 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say"), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, the bytes each of those fields costs against its own row and the footprint of a book filled to the cap it derives, the size published at every point the stored array changes and the watermark that fires once when the book outgrows its share, a legacy row that is named once because the name is saved with it, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept; and the seven-verdict `/verify` recomputation — that a chain which did not answer is `unknown` and never the evidence-bearing `not-found`, that any transaction is not assumed to be ours, that a reverted receipt still verifies the record it carries, that the row comparison checks the fields and not only the hash, that an unpublished rule is called `uncheckable` rather than corrupt and a real mismatch never softened into it, that a mismatch is a 409 and a pending is never cached, and that the outage `unknown` reports is counted once per failure and cleared on the first answer |
-| `@abyssal/web` | 161 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the ten-state `/verify` widget on a stamped row and a page whose pin moves off the row mid-flight (the panel is cleared by the pair, not the calendar: a fresh paint keeps the last verdict on a newly pinned row only when the hash still matches), the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, the extinction and emergence events anchored to the on-chain reading that bounds each — a loss to the day the species was last counted, a gain to the day that first counted it, and an unstamped claim stated as not yet on chain rather than linked to nothing, the public anchor runway read from `/health` and normalised into one honest state before it is painted — a comfortable day count grouped for reading with its threshold and its age beside it, an alarm that follows the server's own flag rather than a re-derived comparison, a ceiling-clamped reading that refuses to print the number it clamped, an uncomputable one that surfaces the reason verbatim and escaped so a stray `<img>` stays text, and a page with no anchor economics that says nothing at all rather than inventing a zero — and the offline replay player, which reads a downloaded `/export kind=replay` file with the browser's own `FileReader` and never asks the server for a frame: two independently-ordered arrays merged into one deterministic timeline, a row with no usable timestamp dropped and *counted* rather than pinned to the start of the window, an empty file given its own state instead of a scrubber parked at zero, a corrupt file answered in words with its name kept out of the markup, and the skipped-row count surfaced beside a partly-readable one so a file with holes cannot replay as a file that was simply short — and a canvas render smoke test |
+| `@abyssal/server` | 213 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say", that the day's settled economics ride inside the rule-2 commitment but never into the served day-book row so neither the cap nor the widest row moves when `v` ticks to 2, that a day written under rule 1 still verifies while this build commits under rule 2, and that money edited under a chain record is a mismatch because it is inside the hash), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, the bytes each of those fields costs against its own row and the footprint of a book filled to the cap it derives, the size published at every point the stored array changes and the watermark that fires once when the book outgrows its share, a legacy row that is named once because the name is saved with it, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept; and the seven-verdict `/verify` recomputation — that a chain which did not answer is `unknown` and never the evidence-bearing `not-found`, that any transaction is not assumed to be ours, that a reverted receipt still verifies the record it carries, that the row comparison checks the fields and not only the hash, that an unpublished rule is called `uncheckable` rather than corrupt and a real mismatch never softened into it, that a mismatch is a 409 and a pending is never cached, and that the outage `unknown` reports is counted once per failure and cleared on the first answer |
+| `@abyssal/web` | 163 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the ten-state `/verify` widget on a stamped row and a page whose pin moves off the row mid-flight (the panel is cleared by the pair, not the calendar: a fresh paint keeps the last verdict on a newly pinned row only when the hash still matches), the one localised note a rule-2 `/verify` answer paints beneath the verdict — the committed economics read back off `payload.fields` with the server's own figures, on both a clicked row and a page booted straight into the panel from a forwarded link, and nothing at all on a rule-1 record that committed none —, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, the extinction and emergence events anchored to the on-chain reading that bounds each — a loss to the day the species was last counted, a gain to the day that first counted it, and an unstamped claim stated as not yet on chain rather than linked to nothing, the public anchor runway read from `/health` and normalised into one honest state before it is painted — a comfortable day count grouped for reading with its threshold and its age beside it, an alarm that follows the server's own flag rather than a re-derived comparison, a ceiling-clamped reading that refuses to print the number it clamped, an uncomputable one that surfaces the reason verbatim and escaped so a stray `<img>` stays text, and a page with no anchor economics that says nothing at all rather than inventing a zero — and the offline replay player, which reads a downloaded `/export kind=replay` file with the browser's own `FileReader` and never asks the server for a frame: two independently-ordered arrays merged into one deterministic timeline, a row with no usable timestamp dropped and *counted* rather than pinned to the start of the window, an empty file given its own state instead of a scrubber parked at zero, a corrupt file answered in words with its name kept out of the markup, and the skipped-row count surfaced beside a partly-readable one so a file with holes cannot replay as a file that was simply short — and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
@@ -862,17 +862,34 @@ parses, and a gate that parses a file the browser never loads, are both a gate t
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 403 hand-written single-line mutations of
+runs negative verification: a battery of 410 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-403 of 403 in one pass, over 51 minutes 49 seconds read off the battery's own
-per-row stamps (13:41:26Z to 14:33:15Z, 403 rows), 0 missed and 0 without a verdict,
-and that run is the final tree — no verdict here is inherited from a state a later
-edit had already changed; no pre-existing anchor needed moving this time. This batch grew the battery from 382 to 403 with twenty-one mutants
-on the in-browser replay (M382–M402). Eight are on the pure `buildReplay` and the frame it reveals:
+409 of 410 in one pass (03:11:34Z to 05:11:37Z, 410 rows on the battery's own
+stamps), 0 missed and one row without a verdict: M26 timed out its own spawn
+(`spawn ETIMEDOUT`, a machine event rather than a regression) and was confirmed
+caught when re-run alone at 05:23:56Z, and every other anchor was judged inside
+the pass — no verdict here is inherited from a state a later edit had already
+changed. This batch grew the battery from 403 to 410 with seven mutants on the
+committed economics (M403–M409): a rule that publishes the revenue it forgets to
+hash (M403), a served day-book row that restates the money it was only meant to
+commit (M404), a pre-image that picks the rule in force instead of the rule the
+payload names (M405), money committed under rule 2 but left out of the hash
+(M406), a widget that names the committed economics but drops their figures
+(M407), a note that renders without its params so the panel shows the raw
+template (M408), and the `verifyCommitted` label dropped from the dictionary
+entirely (M409). Three pre-existing anchors were re-pinned, not because they broke
+but because `buildPayload` gained its `econ` argument and moved the text each one
+quotes: M4 (a published field not committed) now strikes rule 2's field list, M5
+(the preview hashing a different day than the anchor) now quotes the line carrying
+`...dayEcon()`, and M6 (a retry re-sampling the live world) now re-samples through
+`buildPayload(digestStats(r.day, world), dayEcon(), Date.now())`; the preflight
+`--check` read 410/410 anchors pointing at exactly one line each before the pass. The batch before
+it — the in-browser-replay batch — grew the battery from 382 to 403 with twenty-one
+mutants on the in-browser replay (M382–M402). Eight are on the pure `buildReplay` and the frame it reveals:
 a row with no timestamp pinned to the start of the window instead of refused (M382), a tie between a
 pulse and a flow flipping their merge order (M383), a lone event stretched into a fake one-millisecond
 span (M384), the empty flag inverted so a full timeline claims to be empty (M385), a playhead no longer
@@ -1079,8 +1096,8 @@ already been superseded by the commit describing it, and a sentence that goes st
 being correct is a sentence that should not carry a number.
 
 The trust anchor is live rather than reserved: a day that closes is committed to
-Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a fixed published field list
-anybody can recompute, and `GET /history/census` serves the book of those days —
+Arc by the key in `ARC_DIGEST_KEY`, the pre-image is a published, versioned field
+list anybody can recompute, and `GET /history/census` serves the book of those days —
 the numbers that went on chain next to the headcount they describe, and on the days
 whose transaction mined, the hash of the transaction itself so a reader can open it
 and check the calldata alone. A reverted transaction is kept on the day's record as
@@ -1111,6 +1128,26 @@ corrupt one does rather than wedging every day after it forever. The words the p
 shows are not the only way out: `/health` publishes `digest.payloadV` beside
 `digest.verifies` and `digest.verifyProblem`, so a `null` can be read for *which*
 version has no rule without anybody opening the site.
+
+That is the mechanism; rule 2 is the first thing added through it. `DIGEST_RULES` now
+names a `2` beside the `1`, `DIGEST_V` has moved to 2, and every day still judges
+itself by the rule its own payload names — so the field list above is unchanged for
+every day already written, and rule-1 days go on verifying forever. What rule 2 adds
+is the money. Two fields join the pre-image: `sales`, the machine-settled data windows
+sold since this ledger existed, and `revenueUnits`, the USDC token units those windows
+paid, as a decimal string — both read as running totals at the moment a day closed,
+not that day's takings. They are committed to the chain and published back through
+`/verify` as `payload.fields`, but they are deliberately *not* restated in the served
+day-book row: `/history/census` carries the population facts and no money, because a
+row is a window into a capped array and the money belongs in the commitment, not the
+array. The reader gets both halves of that choice — a rule-2 day can be checked to
+have committed a specific `sales` and `revenueUnits`, and money edited under it is a
+mismatch because it is inside the hash, yet the cap stays 349 and the widest row stays
+374, because `v` moving from 1 to 2 is the same 6 bytes and no money ever enters the
+census array. `/verify` returns the committed economics in its `payload.fields`, and
+the widget paints them as one localised line beneath the verdict — in all six
+languages, quoting exactly the figures the server wrote — while a rule-1 record, which
+committed no money, shows nothing rather than inventing a zero.
 
 That recomputation has been run over the whole book rather than a sample of it:
 the pre-image of each of its thirty-four stamped rows — rebuilt from the fields the

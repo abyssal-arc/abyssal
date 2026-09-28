@@ -3986,7 +3986,7 @@ function renderVerify() {
   el.className = view.cls;
   el.setAttribute('data-state', view.state);
   const head = `<div class="verify-head">${esc(t(view.headlineKey))}</div>`;
-  const notes = view.notes.map((n) => `<div class="verify-note">${esc(t(n.key))}</div>`).join('');
+  const notes = view.notes.map((n) => `<div class="verify-note">${esc(t(n.key, n.params))}</div>`).join('');
   const tech = view.tech.map((line) => `<div class="verify-tech">${esc(line)}</div>`).join('');
   // The link lives inside the technical block, not beside the headline: the
   // headline is what the site concluded, and the explorer is the reader's way to

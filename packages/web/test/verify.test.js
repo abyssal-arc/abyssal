@@ -52,6 +52,17 @@ const VERIFIED = {
 
 const withVerdict = (patch) => ({ ...VERIFIED, ...patch });
 
+// A rule-2 commitment carries the day's settled economics in its on-chain payload,
+// and `/verify` decodes them into `payload.fields` — the served day-book row does not
+// restate them, so this panel is the one place a reader sees what the chain promised.
+// Written as a rule-1 record patched up to rule 2, so the default fixture (an empty
+// `fields`) stays the honest picture of a day committed before money went on chain.
+const withCommitted = (sales, revenueUnits) => ({
+  ...VERIFIED,
+  payload: { ...VERIFIED.payload, v: 2, fields: { ...VERIFIED.payload.fields, sales, revenueUnits } },
+  preImage: `abyssal-day-digest|2|66|1286411|111|9863|264121|264010|248136|WHALE:54132|${sales}|${revenueUnits}`,
+});
+
 test('loading is its own state, not a bare panel', () => {
   const v = verifyView(null, { loading: true, txHash: TX, explorerTxUrl: 'https://e.test/tx/' });
   assert.equal(v.state, 'loading');
@@ -145,6 +156,19 @@ test('a revert under a verified hash is one note, not a different state', () => 
   assert.deepEqual(reverted.notes, [{ key: 'verifyReverted' }], 'and the revert is said, not swallowed');
 });
 
+test('a rule-2 record names the economics it committed, quoting the server\'s own figures', () => {
+  // The money is a rule-2 fact and the panel is the only place it surfaces, so the
+  // display has two edges to hold: a record that carries the terms must show them,
+  // and a rule-1 record — same verdict, empty fields — must show nothing. The
+  // `params` are the server's values as strings, never re-derived here: the widget
+  // localises the label and leaves the numbers exactly as `/verify` handed them.
+  const committed = verifyView(withCommitted(3, '21000'), { txHash: TX });
+  assert.equal(committed.state, 'verified', 'the economics ride under the verdict, they do not replace it');
+  assert.deepEqual(committed.notes, [{ key: 'verifyCommitted', params: { sales: '3', revenueUnits: '21000' } }]);
+  const before = verifyView(VERIFIED, { txHash: TX });
+  assert.deepEqual(before.notes, [], 'a day committed under rule 1 promised no money, so none is shown');
+});
+
 test('the technical block quotes the server, in the server\'s own bytes', () => {
   const v = verifyView(VERIFIED, { txHash: TX, explorerTxUrl: 'https://e.test/tx/' });
   const joined = v.tech.join('\n');
@@ -234,6 +258,12 @@ test('every headlineKey and note key this file emits is in the dictionary every 
   // through `VERIFY_STATES` reaches it, so the loop above cannot list it.
   const reverted = verifyView(withVerdict({ receipt: { ...VERIFIED.receipt, status: 'reverted' } }), { txHash: TX });
   for (const n of reverted.notes) keys.add(n.key);
+  // The committed-economics note is a second projection of the same `verified`
+  // verdict, reached only when the on-chain payload carries the rule-2 terms. No
+  // path through `VERIFY_STATES` feeds those fields, so the loop above cannot list
+  // `verifyCommitted` — projected here for the same reason `verifyReverted` is.
+  const committed = verifyView(withCommitted(3, '21000'), { txHash: TX });
+  for (const n of committed.notes) keys.add(n.key);
   const locales = Object.keys(DICT);
   const missing = [];
   for (const k of keys) for (const l of locales) if (!(k in DICT[l])) missing.push(`${l}/${k}`);
@@ -241,4 +271,5 @@ test('every headlineKey and note key this file emits is in the dictionary every 
   // `verifyReverted` only ever fires on a reverted receipt, so a boot test will
   // not exercise it in five of six locales unless this guard lists it here.
   assert.ok(keys.has('verifyReverted'), 'the reverted-under-verified note is not being tested as a key');
+  assert.ok(keys.has('verifyCommitted'), 'the committed-economics note is not being tested as a key');
 });

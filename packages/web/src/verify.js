@@ -100,6 +100,16 @@ export function verifyView(res, opts = {}) {
   // headline stays green for the first sentence; this row is the second one.
   if (res.verdict === 'verified' && res.receipt && res.receipt.status === 'reverted') notes.push({ key: 'verifyReverted' });
 
+  // Rule 2 commits a day's settled economics to the chain, and the served day-book row
+  // deliberately does not restate them — `/verify` is the one place a reader can see what
+  // the chain was actually promised. When the record carries those two terms, name them,
+  // quoting the figures exactly as the server handed them: the label is localised, the
+  // numbers are not, for the same reason the pre-image above is not.
+  const committed = res.payload && typeof res.payload.fields === 'object' ? res.payload.fields : null;
+  if (committed && typeof committed.sales !== 'undefined' && typeof committed.revenueUnits !== 'undefined') {
+    notes.push({ key: 'verifyCommitted', params: { sales: String(committed.sales), revenueUnits: String(committed.revenueUnits) } });
+  }
+
   const tech = [];
   const chainParts = [];
   if (res.chain && typeof res.chain.blockNumber === 'string') chainParts.push(`block ${res.chain.blockNumber}`);

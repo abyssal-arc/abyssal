@@ -37,6 +37,18 @@ import {
 } from './digest.js';
 import { hexToDecimalUnits } from './econ.js';
 
+/**
+ * Rule fields that are committed to the chain but deliberately *not* restated in a
+ * served day-book row — today the day's settled economics (`sales`, `revenueUnits`),
+ * which ride in the on-chain payload and are bound by its hash while the row stays a
+ * fixed-width census record. The row-vs-payload comparison skips these: a field the row
+ * never claims to carry is not a disagreement, it is out of scope for the row. This is
+ * not a lost alarm — `verifyPayload` re-hashes every field the payload names (money
+ * included) under the rule that payload selects, so tampered economics are caught as a
+ * hash `mismatch` before this comparison is ever reached.
+ */
+const ONCHAIN_ONLY_FIELDS = new Set(['sales', 'revenueUnits']);
+
 /** A `0x` followed by 64 hex digits: the shape every tx hash in the book has. */
 const TX_HASH = /^0x[0-9a-fA-F]{64}$/;
 
@@ -369,6 +381,10 @@ export async function checkTransaction(
     const fieldsToCompare = ruleKnown ? DIGEST_RULE_TABLE[version] : DIGEST_RULE_TABLE['1'];
     const disagreements: { field: string; payload: string; row: string }[] = [];
     for (const key of [...fieldsToCompare, 'hash']) {
+      // A field the served row deliberately does not carry is not compared — see
+      // `ONCHAIN_ONLY_FIELDS`. Its integrity is still guaranteed, one layer up, by the
+      // payload re-hash: the hash this row stores was made over these very fields.
+      if (ONCHAIN_ONLY_FIELDS.has(key)) continue;
       const a = render((fields as Record<string, unknown>)[key === 'v' ? 'v' : key]);
       const b = render((row as unknown as Record<string, unknown>)[key]);
       if (a !== b) disagreements.push({ field: key, payload: a, row: b });

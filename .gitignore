@@ -9,5 +9,7 @@ dist/
 # Token economics are designed here but not published yet; keep the doc local
 # so an over-eager `git add -A` cannot ship unpublished commitments.
 TOKEN_PLAN.md
+# A working paper drafted alongside the day-book; kept local, never shipped.
+PAPER.md
 # Local secrets (RPC provider URLs). Real deployments use `wrangler secret put`.
 .env

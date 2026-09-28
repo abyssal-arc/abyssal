@@ -3164,6 +3164,13 @@ const STATS = {
   born: 500, died: 480, predations: 311, topPredator: 'ghast:12',
 };
 
+// The two terms rule 2 appends to rule 1's list: the ledger's running count of
+// machine-settled data windows, and the USDC they brought in. Written as the fresh
+// ledger's zeros because that is what a day with no sales yet commits — `0` and `"0"`,
+// never a float, never null — and the `/state` preview a viewer watches all day is
+// hashed from exactly these same values, so the two can be compared on equal terms.
+const ECON = { sales: 0, revenueUnits: '0' };
+
 test('the pre-image is a fixed published string, so a stranger can reproduce the hash', async () => {
   // Both literals below came from a different SHA-256 implementation
   // (`printf '%s' '…' | shasum -a 256`), written out by hand from
@@ -3187,7 +3194,15 @@ test('the pre-image is a fixed published string, so a stranger can reproduce the
     tick: STATS.tick, day: STATS.day,
   };
   assert.equal(await digestHash(shuffled), await digestHash(STATS));
-  assert.equal(DIGEST_V, 1, 'v:1 is the only rule that ever anchored anything');
+  // Rule 2 is what new payloads commit under; rule 1 stays published because the days
+  // already on chain were hashed by it and can never be re-hashed. The two golden
+  // hashes above are the proof that rule 1 has not moved by one byte.
+  assert.equal(DIGEST_V, 2, 'this build commits new days under rule 2');
+  assert.deepEqual(
+    DIGEST_RULES[1],
+    ['v', 'day', 'tick', 'population', 'totalEnergy', 'born', 'died', 'predations', 'topPredator'],
+    'rule 1 is still in the table, exactly as it was when it anchored those days',
+  );
 });
 
 test('the day\'s numbers come off the world, and a tie is settled by name', async () => {
@@ -3213,7 +3228,7 @@ test('the day\'s numbers come off the world, and a tie is settled by name', asyn
 });
 
 test('every field the payload publishes is inside the commitment', async () => {
-  const p = await buildPayload(STATS, 1_700_000_000_000);
+  const p = await buildPayload(STATS, ECON, 1_700_000_000_000);
   // D3, structurally: the payload's own key list minus the two fields that are
   // not world facts must equal the published field list. A field added for the
   // viewer without joining the pre-image — the exact gap that let the old code
@@ -3253,15 +3268,50 @@ test('every field the payload publishes is inside the commitment', async () => {
   assert.equal((await verifyPayload({ ...p, ts: p.ts + 60_000 })).outcome, 'verified');
 });
 
+test('the settled economics are committed to the chain but not restated in the day-book row', async () => {
+  const econ = { sales: 12, revenueUnits: '4500000' };
+  const p = await buildPayload({ ...STATS, day: 9 }, econ, 1_700_000_000_000);
+  // The money joins the payload and its hash, so a reader of the chain can pull the
+  // number of data windows sold and the USDC they paid straight off the calldata.
+  assert.equal(p.sales, 12);
+  assert.equal(p.revenueUnits, '4500000');
+  assert.equal((await verifyPayload(p)).outcome, 'verified');
+  // Change either term and the commitment breaks — the whole reason money is here.
+  assert.equal((await verifyPayload({ ...p, sales: 13 })).outcome, 'mismatch', 'a day cannot quietly sell one more window than it committed');
+  assert.equal((await verifyPayload({ ...p, revenueUnits: '4500001' })).outcome, 'mismatch', 'nor quietly take one more unit of USDC');
+  // Yet the served day-book row is exactly as wide as it was: the money is hashed, not
+  // restated, so the row carries the ecology and the version and nothing else — which is
+  // why adding rule 2 costs no history at the cap.
+  const row = censusRow({ ...STATS, day: 9 }, { APE: STATS.population }, p);
+  assert.ok(!('sales' in row) && !('revenueUnits' in row), 'the row carries no economics, so no row grew and the cap did not move');
+  // A stranger re-hashing this v2 row therefore needs the chain's money beside it: the
+  // row alone is not a self-contained pre-image any more, and `digestHash` says so rather
+  // than hashing a hole.
+  await assert.rejects(() => digestHash(row), /rule v=2 hashes `sales`, which this payload does not carry/);
+  assert.equal(await digestHash({ ...row, ...econ }), row.hash, 'the row plus the committed economics reproduce its hash');
+});
+
+test('a day written under rule 1 still verifies while this build commits under rule 2', async () => {
+  // The backward-compatibility guarantee that makes adding a rule safe at all: a record
+  // already on chain under rule 1 is re-hashed by rule 1, not re-interpreted by the newest
+  // rule, so publishing rule 2 turns no honest anchor into a reported corruption.
+  const v1Record = { ...STATS, hash: await digestHash(STATS), ts: 1_700_000_000_000 };
+  assert.equal(DIGEST_V, 2, 'this build now commits under rule 2');
+  assert.equal((await verifyPayload(v1Record as unknown as DigestPayload)).outcome, 'verified',
+    'a v:1 record still verifies under rule 1 — the rule it names, not the one in force');
+});
+
 test('a record is judged by the rule it names, not by the rule in force', async () => {
   // The property the next version of the rule depends on. If the verifier took
   // the field list from `DIGEST_V`, then publishing a second rule would turn every
   // day already anchored under the first into a reported corruption — a red
   // `/health` and an "Anchor corrupt" label about a record that is honestly on
-  // chain and correct. So the lookup key is the payload's own `v`, and the only
-  // way to show that from a build with one rule is to name a version it lacks.
-  const p = await buildPayload({ ...STATS, day: 12 }, 1_700_000_000_000);
-  assert.equal(DIGEST_V, 1, 'this build has one rule');
+  // chain and correct. So the lookup key is the payload's own `v`: a version the
+  // published table does not name must still read `uncheckable`, and now that rule 2
+  // sits beside rule 1 that is no longer a hypothetical — a legacy v:1 day verifying
+  // under rule 1 while this build commits v:2 is the same fact, proven from history.
+  const p = await buildPayload({ ...STATS, day: 12 }, ECON, 1_700_000_000_000);
+  assert.equal(DIGEST_V, 2, 'this build has published a second rule and commits under it');
   assert.ok(DIGEST_RULE_TABLE[String(DIGEST_V)], 'and it is published under its own name');
 
   const future = { ...p, v: 999 };
@@ -3293,7 +3343,7 @@ test('an unpublished rule refuses the broadcast and is counted like any other re
   const m = memStore();
   try {
     await withDigestKey(async () => {
-      const payload = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      const payload = await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1);
       // One attempt short of the budget, so the backoff between retries is not
       // what this test is waiting on — see the matching comment on the mismatch
       // gate below.
@@ -3321,7 +3371,7 @@ test('an unpublished rule refuses the broadcast and is counted like any other re
 
 test('the next move is decided by the wall clock, not by how often the pump runs', () => {
   const now = 1_800_000_000_000;
-  const base = newDigestRecord(0, { ...STATS, day: 0, v: DIGEST_V, hash: 'x', ts: now });
+  const base = newDigestRecord(0, { ...STATS, ...ECON, day: 0, v: DIGEST_V, hash: 'x', ts: now });
   assert.equal(base.status, 'queued');
   assert.equal(base.lastAttemptAt, 0, 'a fresh record is due immediately, so a day boundary can anchor in the same tick');
   assert.equal(nextDigestAction(base, now), 'submit');
@@ -3351,7 +3401,7 @@ test('the next move is decided by the wall clock, not by how often the pump runs
 
 test('a record may not claim a transaction that was never broadcast', () => {
   const now = 1_800_000_000_000;
-  const base = newDigestRecord(0, { ...STATS, day: 0, v: DIGEST_V, hash: 'x', ts: now });
+  const base = newDigestRecord(0, { ...STATS, ...ECON, day: 0, v: DIGEST_V, hash: 'x', ts: now });
   // Every transition the pump can perform lands clean, which is the point of
   // having them: the states below are reachable only by writing a status and a
   // txHash independently, and that separation is the bug this module exists to
@@ -3392,7 +3442,7 @@ test('a record may not claim a transaction that was never broadcast', () => {
 });
 
 test('the calldata is a tagged payload a reader of the chain can decode alone', () => {
-  const p = { ...STATS, v: DIGEST_V, hash: 'ab'.repeat(32), ts: 1 };
+  const p = { ...STATS, ...ECON, v: DIGEST_V, hash: 'ab'.repeat(32), ts: 1 };
   const data = encodeDigest(p);
   assert.ok(data.startsWith(DIGEST_MAGIC), '"ABYS", so our records are findable on a block explorer');
   assert.deepEqual(
@@ -3424,7 +3474,7 @@ test('crossing into a new day anchors the day that closed', async () => {
       assert.equal(rec.payload.tick, 4, 'the world as of the boundary, not as of whenever the send landed');
       assert.deepEqual(
         rec.payload,
-        await buildPayload(digestStats(0, app.world), rec.payload.ts),
+        await buildPayload(digestStats(0, app.world), ECON, rec.payload.ts),
         'the record is exactly what the shared stats+hash calls produce from this world',
       );
 
@@ -3504,7 +3554,7 @@ test('a retry re-sends the numbers it committed, not a fresh reading of the tank
       // did the latter, so a retried anchor carried a hash from one moment and
       // numbers from a later one — still verifiable against itself, and lying
       // about the day it claimed to describe.
-      const committed = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      const committed = await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1);
       m.seedDigest(markFailed(markSubmitted(newDigestRecord(0, committed), 1), 0));
       const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
       shortenDay(app);
@@ -3566,7 +3616,7 @@ test('a stored record that claims more than happened is dropped, not trusted', a
     // Written under some other set of rules, or by a bug since fixed: the
     // storage outlives the code, and this is the one place anybody finds out.
     m.seedDigest({
-      ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)),
+      ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, ECON, 1)),
       status: 'pending',
       txHash: null,
       attempts: 1,
@@ -3589,7 +3639,7 @@ test('a payload that does not verify is never broadcast, and never wedges the pi
     await withDigestKey(async () => {
       // One attempt short of the budget, with a hash that cannot survive
       // verification — the state a corrupted payload or a changed rule produces.
-      const broken = await buildPayload({ ...STATS, day: 0, tick: 4 }, 1);
+      const broken = await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1);
       m.seedDigest({
         ...newDigestRecord(0, broken),
         status: 'failed',
@@ -3630,7 +3680,7 @@ test('the receipt settles an anchor, and a settled day lets the next one through
   const m = memStore();
   try {
     await withDigestKey(async () => {
-      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, 1));
+      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1));
       m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
       rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
       const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
@@ -3669,7 +3719,7 @@ test('a transaction that mined and reverted keeps its hash and loses its status'
   const m = memStore();
   try {
     await withDigestKey(async () => {
-      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, 1));
+      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1));
       m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
       rpc.setReceipt({ status: '0x0', blockNumber: '0x101', transactionHash: DIGEST_TX });
       const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, ...offlineFeeds });
@@ -3741,7 +3791,7 @@ test('the preview a viewer watches all day is the computation the anchor uses', 
   // hashed under one rule and broadcast under another would agree with itself and
   // disagree with the chain.
   const stats = digestStats(state.dayAnchor.day, app.world);
-  assert.equal(state.dayAnchor.digest, (await buildPayload(stats, 1)).hash);
+  assert.equal(state.dayAnchor.digest, (await buildPayload(stats, ECON, 1)).hash);
   assert.match(state.dayAnchor.digest, /^[0-9a-f]{64}$/, 'a SHA-256, not eight hex digits');
 });
 
@@ -4268,7 +4318,7 @@ test('a stored record that cannot be read back is counted every time it is refus
   const m = memStore();
   const health = createHealth(1);
   m.seedDigest({
-    ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)),
+    ...newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, ECON, 1)),
     status: 'pending',
     txHash: null,
     attempts: 1,
@@ -4296,7 +4346,7 @@ test('a payload whose hash no longer describes it is named without an attempt be
   // was different passes every state transition check, is still the outstanding
   // anchor, and will never be caught by the gate in front of a broadcast because
   // nothing ever reaches the gate — the day is already settled.
-  const good = await buildPayload({ ...STATS, day: 12 }, 7);
+  const good = await buildPayload({ ...STATS, day: 12 }, ECON, 7);
   const tampered: DigestPayload = { ...good, population: good.population + 1 };
   assert.equal((await verifyPayload(tampered)).outcome, 'mismatch', 'the hash no longer describes the numbers');
   assert.equal(coherenceProblem(newDigestRecord(12, tampered)), null, 'and no state rule can see it');
@@ -4400,7 +4450,7 @@ test('a closed day is written into the book and still there when it is read back
       const row = nameRowRule(book[0]).row;
       assert.equal(row.day, 0, 'the day that closed');
       assert.match(row.hash, /^[0-9a-f]{64}$/, 'bare digest hex, the shape `digestHash` emits — not a `0x` tx hash');
-      assert.equal(await digestHash(row), row.hash, 'the stored row is still the pre-image its hash was taken from');
+      assert.equal(await digestHash({ ...row, ...ECON }), row.hash, 'the row\'s ecology plus the money committed on chain reproduces its hash — rule 2 is what closed this day');
       assert.equal(sumHeads(row), row.population, 'the species add up to the population they were counted with');
       // The claim the whole design rests on, checked rather than described: the
       // census and the anchor are the same reading, so no viewer can be shown a
@@ -4458,7 +4508,7 @@ test('the tank keeps living while its day is filed, and the day still tells one 
       const row = nameRowRule(book[0]).row;
       assert.equal(sumHeads(row), row.population,
         'and its headcount is the population it was counted with, not the one standing when the hash landed');
-      assert.equal(await digestHash(row), row.hash, 'the row still hashes to what went on chain');
+      assert.equal(await digestHash({ ...row, ...ECON }), row.hash, 'the row still hashes to what went on chain, once its committed economics are restored');
       const h = await readHealth(app);
       assert.equal(h.signals?.counts.census_row_unsound, undefined, 'nothing had to be refused at the source');
       assert.equal(h.signals?.counts.census_row_rejected, undefined, 'and nothing will be dropped on the way back in');
@@ -4557,7 +4607,7 @@ test('a day that makes it on chain is told so, in its own row', async () => {
       const row = nameRowRule(m.dayBook()![0]).row;
       assert.equal(row.txHash, DIGEST_TX, 'the row names the transaction that carries it');
       assert.equal(row.hash, sent.payload.hash, 'stamping a row cannot change what it commits');
-      assert.equal(await digestHash(row), row.hash, 'the new field sits outside the hash, like `ts` does');
+      assert.equal(await digestHash({ ...row, ...ECON }), row.hash, 'the new field sits outside the hash, like `ts` does');
       assert.equal(censusProblem(row), null, 'a stamped row is still a sound row');
 
       const served = await readCensus(second);
@@ -4613,7 +4663,7 @@ test('an anchored day the book cannot match is counted rather than guessed at', 
       // can fall out of the front of the book at the cap, or be refused on load
       // by `censusProblem`, while the record beside it hydrates fine — the two
       // are checked by separate rules and only meet again here.
-      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, 1));
+      const queued = newDigestRecord(0, await buildPayload({ ...STATS, day: 0, tick: 4 }, ECON, 1));
       m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
       rpc.setReceipt({ status: '0x1', blockNumber: '0x101', transactionHash: DIGEST_TX });
       const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
@@ -4711,7 +4761,7 @@ test('a day that is anchored twice replaces its row rather than stacking a secon
   // alongside the rejected record. Appending would hand `censusChanges` two
   // readings of one tick and let it publish the difference as a day of births.
   m.seedDigest({
-    ...newDigestRecord(0, await buildPayload({ ...STATS, day: 0 }, 1)),
+    ...newDigestRecord(0, await buildPayload({ ...STATS, day: 0 }, ECON, 1)),
     status: 'pending',
     txHash: null,
     attempts: 1,
@@ -5061,14 +5111,20 @@ test('a day book that outgrows its share of the ledger says so once, and reddens
 
 test('a row takes its rule from the payload it was built with, not from the build', async () => {
   const heads = { APE: STATS.population };
-  const payload = await buildPayload(STATS, 1_800_000_000_000);
+  const payload = await buildPayload(STATS, ECON, 1_800_000_000_000);
   const row = censusRow(STATS, heads, payload);
   assert.equal(row.v, payload.v, 'one payload, one version: the row cannot name a rule its hash was not made under');
-  // The sentence above is only worth anything if the two numbers can disagree.
-  assert.equal(DIGEST_V, 1, 'this build ships exactly one rule');
-  const borrowed = censusRow(STATS, heads, { v: 2, hash: payload.hash, ts: payload.ts });
-  assert.equal(borrowed.v, 2, 'a row built from a payload naming 2 says 2 — `v: DIGEST_V` here would pass every test in this file and still be a lie');
-  await assert.rejects(() => digestHash(borrowed), /no published rule for v=2/,
+  // The sentence above is only worth anything if the two numbers can disagree, and
+  // with two published rules they now genuinely can: this build commits under rule 2,
+  // so a row naming rule 1 is a real legacy day rather than a made-up version.
+  assert.equal(DIGEST_V, 2, 'this build ships and commits under rule 2');
+  const legacy = censusRow(STATS, heads, { v: 1, hash: payload.hash, ts: payload.ts });
+  assert.equal(legacy.v, 1, 'a row built from a payload naming 1 says 1 — `v: DIGEST_V` here would pass every test in this file and still be a lie');
+  assert.notEqual(legacy.v, DIGEST_V, 'and that number is not this build\'s current rule, so the two disagree on purpose');
+  // A version the table has no row for is still refused out loud: a rule number is not
+  // a lookup key this build gets to round to the nearest published one.
+  const borrowed = censusRow(STATS, heads, { v: 3, hash: payload.hash, ts: payload.ts });
+  await assert.rejects(() => digestHash(borrowed), /no published rule for v=3/,
     'and a rule this build has no table for is refused out loud rather than hashed under the nearest one');
 });
 
@@ -5084,9 +5140,20 @@ test('the pre-image names the rule it was built under, and the hash follows it',
     preImage: 'abyssal-day-digest|1|7|12345|44|8123|500|480|311|ghast:12',
   });
   assert.equal(await digestHash({ ...STATS, v: 1 }), await digestHash(STATS), 'the same day under the same name');
-  assert.deepEqual(digestPreImage({ ...STATS, v: 2 }), { problem: 'no published rule for v=2' },
-    'a version with no rule is a question this build can only refuse — the lookup is by the argument, never by the build');
-  await assert.rejects(() => digestHash({ ...STATS, v: 99 }), /no published rule for v=99/,
+  // Rule 2 is now published, so a payload carrying its money reads as a pre-image that
+  // extends rule 1's character for character — the ecology verbatim, then the day's
+  // settled economics appended. This is the shape every new day commits under.
+  assert.deepEqual(digestPreImage({ ...STATS, ...ECON, v: 2 }), {
+    preImage: 'abyssal-day-digest|2|7|12345|44|8123|500|480|311|ghast:12|0|0',
+  }, 'rule 2 hashes rule 1\'s fields plus the two the ledger carries');
+  // A rule-1-shaped object naming rule 2 is not a refusal of an unknown version — rule
+  // 2 exists — but a payload that lacks a field its own published rule hashes.
+  assert.deepEqual(digestPreImage({ ...STATS, v: 2 }), {
+    problem: 'rule v=2 hashes `sales`, which this payload does not carry',
+  }, 'a version that exists is still refused when the payload lacks a field it hashes');
+  // A version with no row in the table at all remains a fact about the build, not a
+  // verdict about the day — the lookup is by the argument, never by the build.
+  await assert.rejects(() => digestHash({ ...STATS, ...ECON, v: 3 }), /no published rule for v=3/,
     'and refusing is said out loud instead of hashing a hole into a public chain');
 });
 
@@ -5126,15 +5193,14 @@ test('a stored book from before rows carried a version comes back named and unch
   const health = createHealth(1);
   try {
     await withDigestKey(async () => {
-      const app = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
-      shortenDay(app);
-      await tickTimes(app, 4);
-      await untilDigest(m.digest, (r) => r.status === 'pending', 'pending');
-      const written = m.dayBook()![0];
-      assert.equal(written.v, DIGEST_V, 'what this build writes names its own rule');
-      // Turn the storage back into the storage this batch replaces: the same
-      // bytes, minus the label that was not written then.
-      const { v: _dropped, ...legacy } = written;
+      // Storage from *before* a row carried a version was hashed under the only rule
+      // that existed then — rule 1 — and carries no money, because rule 2 had not been
+      // written. A row this build produces now names rule 2 and hashes the day's
+      // economics too, so it is no longer a faithful stand-in for that history; the
+      // legacy fixture is built to the rule it was actually written under.
+      const legacyRow = { ...censusFixture(0), v: 1 };
+      legacyRow.hash = await digestHash(legacyRow);
+      const { v: _dropped, ...legacy } = legacyRow;
       m.seedDayBook([legacy as StoredRow]);
 
       const second = createApp({ seed: 1, store: m.store, rpc: rpc.url, health, ...offlineFeeds });
@@ -5144,7 +5210,7 @@ test('a stored book from before rows carried a version comes back named and unch
       assert.equal(await digestHash(body.rows[0]), body.rows[0].hash,
         'labelling a row cannot change its hash, because the version was already inside the pre-image');
       assert.equal(verifiesOrNull(await verifyPayload(body.rows[0] as unknown as DigestPayload)), true,
-        'a day on chain under rule 1 still verifies under rule 1: the label names the rule, it does not replace it');
+        'a day on chain under rule 1 still verifies under rule 1, while this build now commits rule 2: the label names the rule, it does not replace it');
       const h = await readHealth(second);
       assert.equal(h.signals?.counts.census_row_rejected, undefined, 'nothing was refused on the way in');
       assert.equal(h.signals?.counts.census_rule_backfilled, 1, 'the repair is a claim about real records, so it is counted');
@@ -5352,7 +5418,7 @@ test('the durable object forwards the signing key it was handed', async () => {
   // day got anchored is beside the point; that the key travelled from the
   // binding into the code that signs is the entire claim.
   const stored = new Map<string, unknown>();
-  stored.set('ledger', { digest: newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, 1)) });
+  stored.set('ledger', { digest: newDigestRecord(3, await buildPayload({ ...STATS, day: 3 }, ECON, 1)) });
   const { obj } = worldDO(stored, { ARC_DIGEST_KEY: BINDING_KEY });
   const value = await withoutDigestEnv(() => readHealth(obj));
   assert.equal(value.digest?.status, 'queued', 'the stored record came back, so there is one to sign');
@@ -6117,7 +6183,7 @@ const feeHex = (units: bigint): string => `0x${units.toString(16)}`;
  * and noise in all the others.
  */
 async function seedPendingDay(m: ReturnType<typeof memStore>, day: number): Promise<void> {
-  const queued = newDigestRecord(day, await buildPayload({ ...STATS, day, tick: day * 4 }, 1));
+  const queued = newDigestRecord(day, await buildPayload({ ...STATS, day, tick: day * 4 }, ECON, 1));
   m.seedDigest(markPending(markSubmitted(queued, 1), DIGEST_TX, 0));
   m.seedDayBook([{ ...censusFixture(day), hash: queued.payload.hash }]);
 }
@@ -6979,8 +7045,12 @@ const VERIFY_SIGNER = '0x' + 'cd'.repeat(20);
  */
 async function anchoredPair(day: number, txHash = DIGEST_TX) {
   const base = censusFixture(day);
-  const payload = await buildPayload(base, base.ts);
-  const row = { ...base, hash: payload.hash, txHash };
+  const payload = await buildPayload(base, ECON, base.ts);
+  // The row names the rule its hash was made under — rule 2 now — and, by design, carries
+  // the ecology but not the money the hash also covers. `v: payload.v` keeps row and
+  // payload on the same rule, which is what `censusRow` guarantees and what a field-by-
+  // field compare in `/verify` depends on.
+  const row = { ...base, v: payload.v, hash: payload.hash, txHash };
   return { row, calldata: encodeDigest(payload), payload };
 }
 
@@ -7036,7 +7106,9 @@ test('decodeCalldataPayload is the exact inverse of encodeDigest', async () => {
     assert.equal(d.magic, '0x41425953');
     assert.equal(d.fields.hash, payload.hash);
     assert.equal(d.fields.day, 5);
-    assert.equal(d.fields.v, 1, 'the record names its own rule');
+    assert.equal(d.fields.v, DIGEST_V, 'the record names its own rule');
+    assert.equal(d.fields.sales, 0, 'rule 2 carries the day\'s machine-sale count onto the chain');
+    assert.equal(d.fields.revenueUnits, '0', 'and the USDC those sales brought in, as a decimal integer string');
   }
 });
 
@@ -7119,6 +7191,7 @@ test('a matching chain record, row and recomputed hash verify', async () => {
   assert.equal(c.rowAgreement, 'same');
   assert.equal(c.problem, null, 'verified carries no problem');
   assert.ok(c.preImage && c.preImage.startsWith('abyssal-day-digest|'), 'the exact bytes for a stranger with sha256');
+  assert.deepEqual(c.disagreements, [], 'the v2 row carries no money, and the two economics fields are not compared against it');
 });
 
 test('a record whose fields do not hash to its own hash is a mismatch', async () => {
@@ -7128,6 +7201,20 @@ test('a record whose fields do not hash to its own hash is a mismatch', async ()
   assert.equal(c.hashOutcome, 'mismatch');
   assert.equal(c.verdict, 'mismatch');
   assert.match(c.problem ?? '', /hash/);
+});
+
+test('a chain record whose committed money was edited is a mismatch, because money is inside the hash', async () => {
+  const { payload } = await anchoredPair(4);
+  // A stranger who bumps the sale count in the calldata without re-hashing breaks the
+  // commitment: under rule 2 the economics are hashed, so `/verify` must say so rather
+  // than nodding at a record whose numbers quietly changed.
+  const forged = { ...payload, sales: payload.sales + 1 };
+  const c = await checkTransaction(DIGEST_TX, { input: encodeDigest(forged as DigestPayload) }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(c.hashOutcome, 'mismatch', 'the fields no longer hash to the digest the record carries');
+  assert.equal(c.verdict, 'mismatch');
+  // And the money is what did it: the same record with the count restored verifies.
+  const honest = await checkTransaction(DIGEST_TX, { input: encodeDigest(payload) }, { status: '0x1' }, null, { chainAnswered: true });
+  assert.equal(honest.hashOutcome, 'verified', 'so it is the edited economics, not the shape, that broke it');
 });
 
 test('a valid record that disagrees with our stored row is a mismatch naming the field', async () => {
