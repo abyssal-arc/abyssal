@@ -1072,7 +1072,9 @@ Live in production: both views, all ten paid actions against the deployed ABYS
 contract — an unpaid `POST /intervene` and an unpaid `POST /flare` each answer
 with a burn offer naming the same asset, `0x347ef48695eb437cf9e7e3df8637866f9baf1767`,
 probed 2026-09-25 — the paid historical-data route settled in USDC, the free
-social layer, six languages, and the Durable Object tank ticking on a one-minute
+social layer, the share posters (`/s/day/<n>`, `/s/creature/<id>`, `/s/story`)
+whose link previews carry the day book's own figures, six languages, and the
+Durable Object tank ticking on a one-minute
 Cron Trigger with zero viewers.
 
 What earns the words *live in production* here: every client file the edge serves is
@@ -1083,6 +1085,20 @@ commit is from 16:35Z the same day. Five commits and seven hours and 27 minutes 
 pushed work, one of them a file the browser had never received, sat in that gap, and
 no line anywhere said so. Pushed is not deployed, and a status section that cannot
 tell the two apart is a list of intentions.
+
+The share posters went out the same way, and the first reading is the service's
+not the suite's. `GET /s/day/96` on `www.abyssal-arc.com` answered `200` with
+`text/html` and `cache-control: public, s-maxage=60`, its `og:description` reading
+"Day 96 on Arc: 140 creatures, 359,249 predations, top predator WHALE (78378).
+Committed to the chain — verifiable." — every figure lifted off the day-book row
+the route was pointed at, the thousands separator grouped for reading, and the
+`verify=1` link present only because that day really mined. `GET /s/day/999999`
+answered `404` with `no-store`, and its own sentence escaped its apostrophe to
+`&#39;` — the one route here that writes HTML doing the escaping a paid creature
+name would otherwise defeat. `/s/story` named the week (`Day 90–96`) and counted
+`7 of 7 days anchored on chain`; `/s/creature/24457` gave the living resident's own
+name and `s-maxage=30`. The four client files the feature touched came back
+byte-for-byte `same` against the working tree after the upload.
 
 Deploying a changed *derivation* is the case where that distinction has teeth, so the
 first reading after a deploy is taken from the service rather than from the local
