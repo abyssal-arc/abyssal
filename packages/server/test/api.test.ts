@@ -14,6 +14,7 @@ import {
   usdcUnits,
   type FacilitatorConfig,
 } from '../src/facilitator.js';
+import { buildPaymentHeader, buyFlows, chainIdFromNetwork } from '../src/x402-client.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createServer } from 'node:http';
 import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
@@ -5912,6 +5913,135 @@ test('a paid call settles first and answers with the depth the free stream withh
   } finally {
     await close();
   }
+});
+
+/* ---------- the buyer client: packages/server/src/x402-client.ts ---------- */
+
+/**
+ * A `fetch` that is really the app's own `fetch`, counting each call.
+ *
+ * The client under test reaches the route the way a buyer's would — through a
+ * `fetch` that returns a real `Response` — but pointed at the in-process app so
+ * no socket, no Circle, and no chain is involved. The count is the load-bearing
+ * part: it lets a test prove the client asked unpaid first and paid only on the
+ * 402, which is the entire ordering the recipe depends on.
+ */
+function bridgeFetch(app: ReturnType<typeof createApp>): { fetch: typeof fetch; calls: () => number } {
+  let n = 0;
+  const f = ((input: string, init?: RequestInit) => {
+    n += 1;
+    return app.fetch(new Request(input, init));
+  }) as unknown as typeof fetch;
+  return { fetch: f, calls: () => n };
+}
+
+test('the buyer client pays a live quote and reads data through the served route', async () => {
+  const { app, stub, close } = await dataTierApp({});
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await buyFlows({ baseUrl: 'http://localhost', privateKey: BUYER_KEY, fetchImpl: bridge.fetch });
+
+    assert.equal(result.status, 200, `a settled quote must be answered, got ${JSON.stringify(result.json)}`);
+    assert.ok(result.ok);
+    assert.equal(result.paid, true);
+    // Two requests, in order: the unpaid ask that drew the quote, then the paid
+    // one. A client that sent the header on the first call never read the price.
+    assert.equal(bridge.calls(), 2, 'ask unpaid, then ask paid');
+    assert.equal(stub.hits(), 1, 'Circle is asked exactly once, on the settlement');
+
+    // The amount came off the seller's own 402, not a constant in the client:
+    // change what is quoted and this is the line that would catch a hardcoded one.
+    assert.equal(result.requirement?.amount, '1000');
+    const body = result.json as { matched: number; retained: number; settlement: { tx: string; amount: string } };
+    assert.equal(body.matched, 4, 'the paid depth, not the free stream');
+    assert.equal(body.retained, 4);
+    assert.equal(body.settlement.tx, '0x' + 'fe'.repeat(32));
+    assert.equal(body.settlement.amount, '1000');
+  } finally {
+    await close();
+  }
+});
+
+test('with no key the buyer stops at the quote and signs nothing', async () => {
+  const { app, stub, close } = await dataTierApp({});
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await buyFlows({ baseUrl: 'http://localhost', fetchImpl: bridge.fetch });
+
+    assert.equal(result.status, 402);
+    assert.equal(result.ok, false);
+    assert.equal(result.paid, false, 'no wallet means no payment was ever attempted');
+    assert.equal(bridge.calls(), 1, 'it asked once and did not retry');
+    assert.equal(stub.hits(), 0, 'Circle never hears of a buyer who cannot pay');
+    assert.equal(result.requirement?.amount, '1000', 'the quote is still returned to show');
+    assert.match(result.error ?? '', /no buyer key/);
+  } finally {
+    await close();
+  }
+});
+
+test('a tier that is not for sale is a 503 the client does not paper over with money', async () => {
+  const { app, stub, close } = await dataTierApp({ sellerKey: null });
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await buyFlows({ baseUrl: 'http://localhost', privateKey: BUYER_KEY, fetchImpl: bridge.fetch });
+
+    assert.equal(result.status, 503);
+    assert.equal(result.ok, false);
+    assert.equal(result.paid, false, 'a 503 is not a quote, so there is nothing to sign');
+    assert.equal(bridge.calls(), 1, 'it returned the seller\u2019s refusal instead of charging ahead');
+    assert.equal(stub.hits(), 0);
+    assert.equal(result.requirement, null);
+    assert.equal((result.json as { available: boolean }).available, false);
+  } finally {
+    await close();
+  }
+});
+
+test('the header the client builds signs the seller\u2019s quote, not a remembered price', async () => {
+  const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+  assert.ok(cfg);
+  const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+  // A price that is neither the constant the route happens to charge nor one the
+  // client could have baked in: whatever is quoted here is what must be signed.
+  const requirement = exactRequirement(cfg, '0.05');
+  const nonce = `0x${'22'.repeat(32)}`;
+  const header = await buildPaymentHeader({ requirement, account: buyer, nonce });
+  const envelope = JSON.parse(Buffer.from(header, 'base64url').toString('utf8'));
+
+  assert.equal(envelope.x402Version, 2);
+  assert.deepEqual(envelope.accepted, requirement, 'the buyer echoes the offer back whole');
+  assert.equal(envelope.payload.authorization.to, requirement.payTo);
+  assert.equal(envelope.payload.authorization.value, '50000', '0.05 USDC in base units, from the quote');
+  assert.equal(envelope.payload.authorization.nonce, nonce);
+  assert.equal(envelope.payload.authorization.from, buyer.address);
+  assert.match(envelope.payload.signature, /^0x[0-9a-f]{130}$/);
+
+  // And the settlement that a correct envelope buys, checked at our own pre-checks
+  // (a stub facilitator that accepts anything), proves the signature recovers.
+  const stub = await serveFacilitator([{ json: { success: true, transaction: '0xabc', payer: buyer.address } }]);
+  try {
+    const settled = await settleFromRequest(
+      new Request('http://localhost/data/flows', { headers: { 'x-payment': header } }),
+      { ...cfg, baseUrl: stub.url },
+      requirement,
+    );
+    assert.equal(settled.ok, true, `a self-built header must settle, got ${settled.reason}`);
+  } finally {
+    await stub.close();
+  }
+});
+
+test('the client reads the chain out of the quote and refuses to guess it', () => {
+  assert.equal(chainIdFromNetwork('eip155:5042'), 5042);
+  assert.equal(chainIdFromNetwork('eip155:5042002'), 5042002);
+  // Signing for the wrong chain is a silent failure, so a network that is not
+  // `eip155:<n>` has to stop here rather than produce an authoritative-looking
+  // signature over a chain nobody asked for.
+  for (const bad of ['ethereum', '', 'eip155:', 'eip155:abc', 'chain:5042']) {
+    assert.throws(() => chainIdFromNetwork(bad), TypeError, `${JSON.stringify(bad)} is not an eip155 network`);
+  }
+  assert.throws(() => chainIdFromNetwork(undefined as unknown as string), TypeError);
 });
 
 test('the refusal a buyer sees before paying is uncacheable too', async () => {
