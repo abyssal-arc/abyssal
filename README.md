@@ -908,7 +908,7 @@ Unlike the buyer's half, this card *is* served bytes — `app.js`, `i18n.js` and
 all live under the Worker's `[assets]` directory and reach the browser unchanged — so the
 feature needs a `wrangler deploy` before it is live, and its first reading is taken from the
 deployed page (the served HTML carrying the card's markup, and `/data/history` still
-answering a real `402`), not from the local boot. What the six web tests prove offline is the
+answering a real `402`), not from the local boot. What the five web tests prove offline is the
 behaviour; whether the button a visitor sees is wired to the same live offer is a fact about
 the deployed artifact, read after the upload.
 
@@ -1381,11 +1381,16 @@ offer's own amount and network (a deliberately different quote is served to show
 the wire rather than a baked number), and a `503` or a never-resolving fetch is named as no-quote
 with no figure invented; the full battery is 452 of 452 at 2026-09-29T08:14:11Z to 08:59:29Z, 0
 missed. The price the card shows is read from the same live `402` an unpaid `curl` gets — it is a
-read-only proof, not a checkout: the browser signs nothing and spends nothing. What is *not*
-claimed here yet is that the card is live: a card correct in jsdom is only on the served page once
-the assets are uploaded, so the deployed reading — the served HTML carrying the card's markup and
-`/data/history` still answering a real `402` — is taken after the upload and recorded below, not
-asserted from the local boot.
+read-only proof, not a checkout: the browser signs nothing and spends nothing. That upload has
+now happened, so the first reading is the service's own. The deployed `www.abyssal-arc.com/`
+serves HTML carrying `id="census-data"`, its `app.js` carries the `renderData` / `fetch('/data/history')`
+lines, and `i18n.js` carries the card's strings in all six locales — each read off the served
+bytes on 2026-09-29, not inferred from the local boot. And an unpaid `GET /data/history` on the
+deployed host still answers a live `402` (`no-store`) whose `accepts[0]` is, field for field, the
+offer the card is written to render: `exact`, `1000` base units, `eip155:5042`, the `USDC` / `2` /
+`eip3009` extra. What is *not* claimed is that anyone has clicked it into a payment or that a day
+book has been bought — the card proves the price is readable from the served page, not that the
+tier has earned.
 
 Deploying a changed *derivation* is the case where that distinction has teeth, so the
 first reading after a deploy is taken from the service rather than from the local
