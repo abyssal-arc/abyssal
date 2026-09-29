@@ -1,5 +1,5 @@
 /**
- * The buyer's half of `GET /data/flows`.
+ * The buyer's half of the paid data tier: `GET /data/flows` and `GET /data/history`.
  *
  * `facilitator.ts` is the seller: it quotes a price and settles whatever a
  * wallet signed. This file is the code a *customer* runs, and nothing in it is
@@ -10,9 +10,9 @@
  * inside the test that helped the seller check itself, for one reason: the
  * README prints a "how to pay" recipe, and a recipe whose only executable copy is
  * an in-test helper is how documentation and reality drift apart. Here the
- * documented steps, the runnable example in `tools/`, and the round-trip test all
- * call this one implementation, so a change that breaks a buyer breaks a test
- * instead of quietly breaking whoever trusted the document.
+ * documented steps, the runnable examples in `tools/` and `examples/`, and the
+ * round-trip test all call this one implementation, so a change that breaks a
+ * buyer breaks a test instead of quietly breaking whoever trusted the document.
  */
 import { privateKeyToAccount } from 'viem/accounts';
 import type { ExactRequirement } from './facilitator.js';
@@ -139,7 +139,7 @@ export interface BuyOptions {
   baseUrl: string;
   /** Hex private key for the buyer wallet. Without it the call stops at the quote. */
   privateKey?: string;
-  /** Route to buy; `/data/flows` is the only paid tier today. */
+  /** Route to buy; defaults to the tier each helper is named for (`/data/flows`, `/data/history`). */
   path?: string;
   /** Query filters passed straight through to the route (addr, venue, blockFrom, limit, ...). */
   query?: Record<string, string | number>;
@@ -161,45 +161,61 @@ export interface BuyResult {
   paid: boolean;
   /** The offer the seller made in `accepts[0]`, kept so a caller can see what it paid. */
   requirement: ExactRequirement | null;
-  /** Parsed JSON body of the final response, or `null` when it was not JSON. */
+  /**
+   * Parsed body of the final response: an object for a JSON answer, an array of
+   * lines for an NDJSON one (`/data/history`, manifest last), or `null` when the
+   * body was neither.
+   */
   json: unknown;
   /** A buyer-side reason the flow stopped before data, distinct from a server error. */
   error?: string;
 }
 
 /**
- * Buy one paid read of the data tier: ask, and if the seller answers 402 with an
- * offer, sign that offer and ask again with the payment attached.
- *
- * The order is the whole of the client. A first request carries no payment, so
- * the price is always read from the server's live quote rather than assumed;
- * only a `402` moves to signing. Every other status is returned as-is — a `503`
- * (the tier is not for sale), a `400` (a filter no payment can fix), or a `200`
- * (nothing to pay) are all correct endings that must not be papered over with a
- * signature. And no second request is made without a wallet: the honest outcome
- * of "I want this data but have no key" is the quote plus a stated reason, not a
- * crash. This never throws on a server status; it throws only if the seller's 402
- * carried no parseable offer, which is a broken seller, not a buyer mistake.
+ * Turn a response body into the shape `BuyResult.json` reports, by content type:
+ * newline-delimited JSON (the history download) becomes an array of parsed lines,
+ * anything else is read as one JSON value. A non-JSON history line throws rather
+ * than being skipped, because a silently dropped row is a download that quietly
+ * stops being a complete record of the days it claims to cover.
  */
-export async function buyFlows(options: BuyOptions): Promise<BuyResult> {
+async function readBody(res: Response): Promise<unknown> {
+  if (!(res.headers.get('content-type') ?? '').includes('ndjson')) {
+    try {
+      return await res.json();
+    } catch {
+      return null;
+    }
+  }
+  const text = await res.text();
+  return text.split('\n').filter((l) => l.trim() !== '').map((l) => JSON.parse(l) as unknown);
+}
+
+/**
+ * The one quote→sign→retry loop both paid reads share.
+ *
+ * Ask without a payment; if the seller answers 402 with an offer, sign that offer
+ * and ask again with the header attached. The order is the whole of the client: a
+ * first request carries no payment, so the price is always read from the server's
+ * live quote rather than assumed; only a `402` moves to signing. Every other status
+ * is returned as-is — a `503` (the tier is not for sale), a `400` (a range no
+ * payment can fix), or a `200` (nothing to pay) are all correct endings that must
+ * not be papered over with a signature. And no second request is made without a
+ * wallet: the honest outcome of "I want this but have no key" is the quote plus a
+ * stated reason, not a crash. This never throws on a server status; it throws only
+ * if the seller's 402 carried no parseable offer, which is a broken seller, not a
+ * buyer mistake.
+ */
+async function runBuy(options: BuyOptions, defaultPath: string): Promise<BuyResult> {
   const base = options.baseUrl.replace(/\/+$/, '');
-  const path = options.path ?? '/data/flows';
+  const path = options.path ?? defaultPath;
   const qs = new URLSearchParams(
     Object.entries(options.query ?? {}).map(([k, v]) => [k, String(v)] as [string, string]),
   ).toString();
   const url = `${base}${path}${qs ? `?${qs}` : ''}`;
   const doFetch = options.fetchImpl ?? fetch;
 
-  const asJson = async (res: Response): Promise<unknown> => {
-    try {
-      return await res.json();
-    } catch {
-      return null;
-    }
-  };
-
   const first = await doFetch(url);
-  const firstBody = await asJson(first);
+  const firstBody = await readBody(first);
   if (first.status !== 402) {
     return {
       status: first.status,
@@ -236,7 +252,7 @@ export async function buyFlows(options: BuyOptions): Promise<BuyResult> {
     resource: { url, description: 'Abyssal paid data tier', mimeType: 'application/json' },
   });
   const paid = await doFetch(url, { headers: { 'x-payment': header } });
-  const paidBody = await asJson(paid);
+  const paidBody = await readBody(paid);
   return {
     status: paid.status,
     ok: paid.status >= 200 && paid.status < 300,
@@ -244,4 +260,26 @@ export async function buyFlows(options: BuyOptions): Promise<BuyResult> {
     requirement,
     json: paidBody,
   };
+}
+
+/**
+ * Buy one paid read of the flow ring (`GET /data/flows`). See `runBuy` for the
+ * quote→sign→retry order, which is the whole of the client, and `buildPaymentHeader`
+ * for the one place a signature is made.
+ */
+export async function buyFlows(options: BuyOptions): Promise<BuyResult> {
+  return runBuy(options, '/data/flows');
+}
+
+/**
+ * Buy one paid read of the day book (`GET /data/history`).
+ *
+ * Deliberately thin: it shares `runBuy`'s single quote→sign→retry loop and
+ * `buildPaymentHeader`'s single signing core with `buyFlows`, so there is no second
+ * copy of either to drift from the documented recipe. The one thing that differs is
+ * the body, and `readBody` settles that by content type — the answer arrives as
+ * newline-delimited JSON, so `json` is an array of day rows followed by a manifest.
+ */
+export async function buyHistory(options: BuyOptions): Promise<BuyResult> {
+  return runBuy(options, '/data/history');
 }

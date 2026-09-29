@@ -14,11 +14,13 @@
  * rather than trusted:
  *   - the envelope it builds is compared field-for-field against the real
  *     `x402-client.ts` the server test settles with, so the two cannot drift; and
- *   - it is run through the actual `/data/flows` handler against a stub facilitator
- *     and must reach 200, so the copy is proven to buy, not merely to look right.
+ *   - it is run through the actual `/data/flows` and `/data/history` handlers
+ *     against a stub facilitator and must reach 200, so the copy is proven to buy,
+ *     not merely to look right.
  *
  * Run it directly against a live server:
  *   node examples/buy-flows.mjs --url https://www.abyssal-arc.com --limit 5
+ *   node examples/buy-flows.mjs --url https://www.abyssal-arc.com --history --from 1 --to 30
  * With no key it only asks the unpaid question and prints the seller's offer. To
  * actually receive rows you need BUYER_PRIVATE_KEY for an Arc mainnet wallet
  * (chainId 5042) holding USDC — the tier settles that to the seller through the
@@ -107,29 +109,41 @@ export async function buildPaymentHeader(input) {
 }
 
 /**
- * Ask for `path`, and if the seller answers 402 with an offer, sign that offer and
- * ask again with the payment attached. Any other status is returned untouched — a
- * 503 (not for sale) or a 400 (a bad filter) is not something you sign your way
- * out of, and no second request is made without a wallet.
+ * Parse a response body by content type: the NDJSON history download becomes an
+ * array of parsed lines (manifest last), anything else is read as one JSON value.
+ * A non-JSON line throws rather than being skipped, because a silently dropped row
+ * is a download that quietly stops being a complete record of its days.
  */
-export async function buyFlows(options) {
-  const base = options.baseUrl.replace(/\/+$/, '');
-  const path = options.path ?? '/data/flows';
-  const qs = new URLSearchParams(
-    Object.entries(options.query ?? {}).map(([k, v]) => [k, String(v)]),
-  ).toString();
-  const url = `${base}${path}${qs ? `?${qs}` : ''}`;
-  const doFetch = options.fetchImpl ?? fetch;
-  const asJson = async (res) => {
+async function readBody(res) {
+  if (!(res.headers.get('content-type') ?? '').includes('ndjson')) {
     try {
       return await res.json();
     } catch {
       return null;
     }
-  };
+  }
+  const text = await res.text();
+  return text.split('\n').filter((l) => l.trim() !== '').map((l) => JSON.parse(l));
+}
+
+/**
+ * The one quote→sign→retry loop both paid reads share: ask for `path`, and if the
+ * seller answers 402 with an offer, sign that offer and ask again with the payment
+ * attached. Any other status is returned untouched — a 503 (not for sale) or a 400
+ * (a bad range) is not something you sign your way out of, and no second request is
+ * made without a wallet.
+ */
+async function runBuy(options, defaultPath) {
+  const base = options.baseUrl.replace(/\/+$/, '');
+  const path = options.path ?? defaultPath;
+  const qs = new URLSearchParams(
+    Object.entries(options.query ?? {}).map(([k, v]) => [k, String(v)]),
+  ).toString();
+  const url = `${base}${path}${qs ? `?${qs}` : ''}`;
+  const doFetch = options.fetchImpl ?? fetch;
 
   const first = await doFetch(url);
-  const firstBody = await asJson(first);
+  const firstBody = await readBody(first);
   if (first.status !== 402) {
     return {
       status: first.status,
@@ -166,7 +180,7 @@ export async function buyFlows(options) {
     resource: { url, description: 'Abyssal paid data tier', mimeType: 'application/json' },
   });
   const paid = await doFetch(url, { headers: { 'x-payment': header } });
-  const paidBody = await asJson(paid);
+  const paidBody = await readBody(paid);
   return {
     status: paid.status,
     ok: paid.status >= 200 && paid.status < 300,
@@ -174,6 +188,16 @@ export async function buyFlows(options) {
     requirement,
     json: paidBody,
   };
+}
+
+/** Buy one paid read of the flow ring (`/data/flows`). */
+export async function buyFlows(options) {
+  return runBuy(options, '/data/flows');
+}
+
+/** Buy one paid read of the day book (`/data/history`); shares the loop and the signing core. */
+export async function buyHistory(options) {
+  return runBuy(options, '/data/history');
 }
 
 // --- CLI: runs only when this file is invoked directly, never on import. ---
@@ -190,6 +214,8 @@ const invokedDirectly =
 if (invokedDirectly) {
   const baseUrl = arg('url', process.env.ABYSSAL_URL ?? 'https://www.abyssal-arc.com');
   const privateKey = process.env.BUYER_PRIVATE_KEY ?? arg('key', undefined);
+  const route = process.argv.includes('--history') ? '/data/history' : arg('path', '/data/flows');
+  const buy = route === '/data/history' ? buyHistory : buyFlows;
   const query = {};
   for (const k of ['addr', 'venue', 'blockFrom', 'blockTo', 'from', 'to', 'limit']) {
     const v = arg(k, undefined);
@@ -197,10 +223,10 @@ if (invokedDirectly) {
   }
 
   console.log(
-    `GET ${baseUrl}/data/flows ${JSON.stringify(query)} — ` +
+    `GET ${baseUrl}${route} ${JSON.stringify(query)} — ` +
       (privateKey ? 'with a buyer key, so it will try to pay' : 'with no key, so it stops at the quote'),
   );
-  const result = await buyFlows({ baseUrl, privateKey, query });
+  const result = await buy({ baseUrl, privateKey, query });
 
   if (result.status === 503) {
     console.log(`\nNot for sale right now (503): ${JSON.stringify(result.json)}`);
@@ -209,6 +235,16 @@ if (invokedDirectly) {
     console.log('\nQuote received, nothing paid. This is the offer a buyer would sign:');
     console.log(JSON.stringify(result.requirement, null, 2));
     console.log('\nSet BUYER_PRIVATE_KEY (an Arc wallet holding USDC) and rerun to settle and read.');
+  } else if (result.ok && route === '/data/history') {
+    const lines = result.json ?? [];
+    const manifest = lines[lines.length - 1] ?? {};
+    console.log(`\n200 — ${manifest.count} day rows (days ${manifest.first}..${manifest.last})`);
+    console.log(`root over row hashes: ${manifest.root}`);
+    console.log(`settlement tx: ${manifest.settlement?.tx} (payer ${manifest.settlement?.payer})`);
+    for (const r of lines.slice(0, 5)) {
+      if (r.manifest) continue;
+      console.log(`  day ${r.day}  rule v${r.v}  population=${r.population}  hash ${String(r.hash).slice(0, 16)}…`);
+    }
   } else if (result.ok) {
     const b = result.json;
     console.log(`\n200 — data received. matched=${b?.matched} retained=${b?.retained}`);

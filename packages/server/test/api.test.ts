@@ -14,7 +14,7 @@ import {
   usdcUnits,
   type FacilitatorConfig,
 } from '../src/facilitator.js';
-import { buildPaymentHeader, buyFlows, chainIdFromNetwork } from '../src/x402-client.js';
+import { buildPaymentHeader, buyFlows, buyHistory, chainIdFromNetwork } from '../src/x402-client.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createServer } from 'node:http';
 import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
@@ -22,7 +22,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import {
-  buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestPreImage, digestStats, encodeDigest, newDigestRecord,
+  buildPayload, censusChanges, censusProblem, censusReset, digestHash, digestPreImage, digestStats, encodeDigest, newDigestRecord, sha256Hex,
   markFailed, markPending, markSubmitted, markConfirmed, markUnconfigured,
   nextDigestAction, coherenceProblem, verifyPayload, verifiesOrNull, isSettled,
   CENSUS_CAP, CENSUS_BUDGET_BYTES, CENSUS_ROW_BYTES, censusFootprint,
@@ -5664,6 +5664,8 @@ async function dataTierApp(env: {
   /** `false` runs the synthetic feed: a seller with nothing recorded. */
   arc?: boolean;
   health?: ReturnType<typeof createHealth>;
+  /** Rows to hydrate the day book with before the app boots, for `/data/history`. */
+  book?: StoredRow[];
 }): Promise<{
   app: ReturnType<typeof createApp>;
   stub: StubFacilitator;
@@ -5677,6 +5679,7 @@ async function dataTierApp(env: {
   const feed = new ArcUsdcFeed(UNUSED_RPC, ARC_USDC_ADDRESS, { pollEveryMs: 0 });
   (feed as unknown as { flows: unknown[] }).flows = arc ? RING.map((r) => ({ ...r })) : [];
   const m = memStore();
+  if (env.book) m.seedDayBook(env.book);
   const app = createApp({
     seed: 1,
     store: m.store,
@@ -6054,13 +6057,17 @@ test('the client reads the chain out of the quote and refuses to guess it', () =
  * compiles it; the path is resolved from the built test at runtime, which is also
  * why a mutation of the example is caught without a rebuild.
  */
+/** The copy-paste buyer's shape: the same helpers the library client exports. */
+type ExampleBuy = (o: {
+  baseUrl: string;
+  privateKey?: string;
+  query?: Record<string, string | number>;
+  fetchImpl?: typeof fetch;
+}) => Promise<{ status: number; ok: boolean; paid: boolean; requirement: { amount: string } | null; json: unknown }>;
+
 async function loadExample(): Promise<{
-  buyFlows: (o: {
-    baseUrl: string;
-    privateKey?: string;
-    query?: Record<string, string | number>;
-    fetchImpl?: typeof fetch;
-  }) => Promise<{ status: number; ok: boolean; paid: boolean; requirement: { amount: string } | null; json: unknown }>;
+  buyFlows: ExampleBuy;
+  buyHistory: ExampleBuy;
   buildPaymentHeader: (i: unknown) => Promise<string>;
 }> {
   return import(new URL('../../../../examples/buy-flows.mjs', import.meta.url).href) as never;
@@ -6301,11 +6308,251 @@ test('a browser is allowed to send the payment header the paid route reads', asy
   }
 });
 
+/* ---------- the paid day-book download: GET /data/history ---------- */
+
+/**
+ * A day-book row whose `hash` is the real commitment under the rule it names, not
+ * the fixture's placeholder. A v1 row hashes from its own fields alone (rule 1 is a
+ * subset of the row); a v2 row needs the committed economics beside it — the exact
+ * asymmetry the day book has always had and `/data/history` inherits rather than
+ * hides. `ECON` is the fresh ledger's zeros, so a day with no sales still hashes.
+ */
+async function historyRow(day: number, v: number): Promise<CensusDay> {
+  const base = censusFixture(day);
+  const stats = { ...base, v };
+  const hash = await digestHash(v >= 2 ? { ...stats, ...ECON } : stats);
+  return { ...base, v, hash };
+}
+
+/** Parse a `/data/history` NDJSON body into one array of parsed lines. */
+function parseNdjson(text: string): unknown[] {
+  return text.trim().split('\n').map((l) => JSON.parse(l) as unknown);
+}
+
+/** Split the parsed lines into the day rows and their trailing manifest. */
+function splitHistory(lines: unknown[]): { rows: CensusDay[]; manifest: Record<string, any> } {
+  const manifest = lines[lines.length - 1] as Record<string, any>;
+  assert.equal(manifest.manifest, true, 'the last line is the manifest');
+  return { rows: lines.slice(0, -1) as CensusDay[], manifest };
+}
+
+test('/data/history sells the day book, and each v1 row reproduces its own hash', async () => {
+  const health = createHealth();
+  const book = [await historyRow(1, 1), await historyRow(2, 1), await historyRow(3, 1)];
+  const { app, m, stub, close } = await dataTierApp({ health, book });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const header = await payHeader(cfg, exactRequirement(cfg, DATA_PRICE_USDC), privateKeyToAccount(BUYER_KEY as `0x${string}`), `0x${'71'.repeat(32)}`);
+    const res = await app.fetch(get('/data/history', { 'x-payment': header }));
+    const text = await res.text();
+    assert.equal(res.status, 200, `a settled history must be answered, got ${text}`);
+    assert.equal(res.headers.get('content-type'), 'application/x-ndjson; charset=utf-8', 'the download is newline-delimited, not one JSON body');
+    assert.equal(res.headers.get('cache-control'), 'no-store', 'an answer somebody paid for may not be served to the next reader for free');
+
+    const { rows, manifest } = splitHistory(parseNdjson(text));
+    assert.equal(rows.length, 3);
+    assert.deepEqual(rows.map((r) => r.day), [1, 2, 3], 'oldest first');
+    // Every row re-hashes to the hash the book published, under the rule the row names.
+    for (const r of rows) assert.equal(await digestHash(r), r.hash, `day ${r.day} reproduces its commitment`);
+
+    assert.equal(manifest.count, rows.length, 'the manifest counts exactly what it sent');
+    assert.deepEqual([manifest.first, manifest.last], [1, 3]);
+    assert.equal(manifest.root, await sha256Hex(rows.map((r) => r.hash).join('\n')), 'the root is recomputable from the rows alone');
+    assert.equal(manifest.settlement.tx, '0x' + 'fe'.repeat(32));
+    assert.equal(manifest.settlement.network, 'eip155:5042');
+    assert.equal(manifest.settlement.amount, '1000');
+    assert.equal(manifest.sold, 1, 'one sale, counted');
+    assert.equal(stub.hits(), 1, 'Circle was asked once');
+
+    // The sale is durable, not per-isolate, exactly as the flow tier's is.
+    const after = await readHealth(app);
+    assert.equal(after.data.sales, 1);
+    assert.equal(after.anchor.revenue.sales, 1);
+    assert.equal(after.anchor.revenue.quotedUnits, '1000');
+    const cold = createApp({ seed: 1, store: m.store, health, ...offlineFeeds });
+    assert.equal((await readHealth(cold)).data.sales, 1, 'the history sale outlives the isolate that settled it');
+  } finally {
+    await close();
+  }
+});
+
+test('the buyer client pays the history quote before it reads a single row', async () => {
+  const book = [await historyRow(1, 1), await historyRow(2, 1)];
+  const { app, stub, close } = await dataTierApp({ book });
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await buyHistory({ baseUrl: 'http://localhost', privateKey: BUYER_KEY, fetchImpl: bridge.fetch });
+    assert.equal(result.status, 200, `a settled quote must be answered, got ${JSON.stringify(result.json)}`);
+    assert.ok(result.ok);
+    assert.equal(result.paid, true);
+    assert.equal(bridge.calls(), 2, 'ask unpaid, then ask paid');
+    assert.equal(stub.hits(), 1, 'Circle is asked exactly once, on the settlement');
+    assert.equal(result.requirement?.amount, '1000', 'the price came off the seller\u2019s live 402, not a constant');
+    const { rows, manifest } = splitHistory(result.json as unknown[]);
+    assert.equal(rows.length, 2);
+    assert.equal(manifest.count, 2);
+  } finally {
+    await close();
+  }
+});
+
+test('the copy-paste example buys the day book through the served route too', async () => {
+  // The example is a second copy of the buyer; the flows round trip already pins it,
+  // so history gets the same treatment: run the copy through the real route and
+  // prove it can buy the download, NDJSON body and all, not merely the flow ring.
+  const example = await loadExample();
+  const book = [await historyRow(1, 1), await historyRow(2, 1)];
+  const { app, stub, close } = await dataTierApp({ book });
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await example.buyHistory({ baseUrl: 'http://localhost', privateKey: BUYER_KEY, fetchImpl: bridge.fetch });
+    assert.equal(result.status, 200, `the example must be able to buy history, got ${JSON.stringify(result.json)}`);
+    assert.equal(result.paid, true);
+    assert.equal(bridge.calls(), 2, 'it asks unpaid, then pays');
+    assert.equal(stub.hits(), 1, 'Circle is asked once on the settlement the example built');
+    const { rows, manifest } = splitHistory(result.json as unknown[]);
+    assert.equal(rows.length, 2);
+    assert.equal(manifest.count, 2, 'the example reads NDJSON the same way the client does');
+  } finally {
+    await close();
+  }
+});
+
+test('an edited row does not reproduce its published hash, and the root moves with it', async () => {
+  // The whole point of selling a history you can check: an export that quietly
+  // re-hashed a tampered day would launder it. It must not, and the manifest root
+  // that stands in for the file has to change the moment any row stops being what
+  // the book committed.
+  const book = [await historyRow(1, 1), await historyRow(2, 1), await historyRow(3, 1)];
+  const { app, close } = await dataTierApp({ book });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const header = await payHeader(cfg, exactRequirement(cfg, DATA_PRICE_USDC), privateKeyToAccount(BUYER_KEY as `0x${string}`), `0x${'74'.repeat(32)}`);
+    const { rows, manifest } = splitHistory(parseNdjson(await (await app.fetch(get('/data/history', { 'x-payment': header }))).text()));
+    const published = rows.map((r) => r.hash);
+    assert.equal(manifest.root, await sha256Hex(published.join('\n')), 'as served, the rows and the root agree');
+
+    const tampered = { ...rows[1], population: rows[1].population + 1 };
+    assert.notEqual(await digestHash(tampered), rows[1].hash, 'an edited row cannot silently keep its commitment');
+    const tamperedHash = await digestHash(tampered);
+    const tamperedRoot = await sha256Hex([published[0], tamperedHash, published[2]].join('\n'));
+    assert.notEqual(tamperedRoot, manifest.root, 'and the root over the whole download is no longer the published one');
+  } finally {
+    await close();
+  }
+});
+
+test('/data/history refuses a range no payment can fix, before anything is quoted', async () => {
+  const book = [await historyRow(1, 1)];
+  const { app, stub, close } = await dataTierApp({ book });
+  try {
+    for (const [path, needle] of [
+      ['/data/history?from=9&to=1', /from is after to/],
+      ['/data/history?limit=many', /limit/],
+      ['/data/history?from=1&to=two', /to/],
+      ['/data/history?from=-3', /from/],
+    ] as const) {
+      const res = await app.fetch(get(path));
+      assert.equal(res.status, 400, `${path} should be a bad request, not a bill`);
+      assert.equal(res.headers.get('cache-control'), 'no-store');
+      const body = (await res.json()) as { error: string };
+      assert.match(body.error, needle, `the refusal names the parameter: ${body.error}`);
+    }
+    assert.equal(stub.hits(), 0, 'Circle never hears about a request that was never going to be answered');
+  } finally {
+    await close();
+  }
+});
+
+test('the history tier is closed without a seller key — a 503, not a bill', async () => {
+  const book = [await historyRow(1, 1)];
+  const { app, stub, close } = await dataTierApp({ sellerKey: null, book });
+  try {
+    const res = await app.fetch(get('/data/history'));
+    assert.equal(res.status, 503, 'not for sale, and not pretending to be');
+    const body = (await res.json()) as { available: boolean; hint: string; price: { usdc: string } };
+    assert.equal(body.available, false);
+    assert.match(body.hint, /SELLER_PRIVATE_KEY/);
+    assert.equal(body.price.usdc, DATA_PRICE_USDC);
+
+    // And a buyer with money to spend is not charged their way past a closed door.
+    const bridge = bridgeFetch(app);
+    const result = await buyHistory({ baseUrl: 'http://localhost', privateKey: BUYER_KEY, fetchImpl: bridge.fetch });
+    assert.equal(result.status, 503);
+    assert.equal(result.paid, false, 'a 503 is not a quote, so there is nothing to sign');
+    assert.equal(stub.hits(), 0);
+  } finally {
+    await close();
+  }
+});
+
+test('one authorization buys one history download, not two', async () => {
+  const book = [await historyRow(1, 1), await historyRow(2, 1)];
+  const { app, stub, close } = await dataTierApp({ book });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+    const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+    const nonce = `0x${'77'.repeat(32)}`;
+    const first = await app.fetch(get('/data/history', { 'x-payment': await payHeader(cfg, requirement, buyer, nonce) }));
+    assert.equal(first.status, 200);
+    const again = await app.fetch(get('/data/history', { 'x-payment': await payHeader(cfg, requirement, buyer, nonce) }));
+    assert.equal(again.status, 402, 'the ring of spent nonces refuses before Circle is asked again');
+    assert.match(((await again.json()) as { error: string }).error, /already been spent/);
+    assert.equal(stub.hits(), 1, 'the facilitator was told about the sale exactly once');
+    assert.equal((await readHealth(app)).data.sales, 1, 'the replay did not sell a second download');
+  } finally {
+    await close();
+  }
+});
+
+test('a v2 day is verified against the chain, not recomputed from the row alone', async () => {
+  // A book that mixes the two rules the day book actually holds: one day committed
+  // under rule 1, one under rule 2. The download hands each row with the rule it
+  // names and a manifest listing every rule, so a reader checks a v1 day with rule
+  // 1 and never with whatever this build happens to commit under today.
+  const book = [await historyRow(1, 1), await historyRow(2, 2)];
+  const { app, close } = await dataTierApp({ book });
+  try {
+    const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+    assert.ok(cfg);
+    const header = await payHeader(cfg, exactRequirement(cfg, DATA_PRICE_USDC), privateKeyToAccount(BUYER_KEY as `0x${string}`), `0x${'78'.repeat(32)}`);
+    const { rows, manifest } = splitHistory(parseNdjson(await (await app.fetch(get('/data/history', { 'x-payment': header }))).text()));
+    const [v1, v2] = rows;
+    assert.equal(v1.v, 1);
+    assert.equal(v2.v, 2);
+
+    // The v1 row is self-contained: its fields are exactly rule 1's list.
+    assert.equal(await digestHash(v1), v1.hash, 'a v1 day re-hashes from the row alone');
+
+    // The v2 row is not: it hashed the day's settled economics too, and those live
+    // on the chain, not in the row. Recomputing it from the row must fail rather
+    // than hash a hole — this is the honest boundary of the export.
+    await assert.rejects(() => digestHash(v2), /rule v=2 hashes .sales./, 'a v2 row is not a self-contained pre-image');
+    assert.equal(await digestHash({ ...v2, ...ECON }), v2.hash, 'the row beside the committed economics reproduces it');
+
+    // And the wrong rule is caught, not silent: re-hashing the v1 day with this
+    // build's current `DIGEST_V` is refused — the exact mistake the whole
+    // "verify with the row\u2019s own v" invariant exists to prevent.
+    await assert.rejects(() => digestHash({ ...v1, v: DIGEST_V }), /hashes .sales/, 'the current rule is the wrong tool for an older day');
+
+    // The manifest is what tells a reader which rule to use, without assuming it.
+    assert.deepEqual(manifest.rules, DIGEST_RULE_TABLE, 'every rule this build can check, keyed by the v a row names');
+    assert.deepEqual(manifest.hashed, [...DIGEST_HASH_FIELDS], 'and which fields the current commitment covers');
+  } finally {
+    await close();
+  }
+});
+
 test('the endpoint index advertises the price and the knob that opens it', async () => {
   const app = createApp({ seed: 1, ...offlineFeeds });
   const index = (await (await app.fetch(get('/api'))).json()) as { endpoints?: Record<string, string> } & Record<string, any>;
   const listing = JSON.stringify(index);
   assert.match(listing, /GET \/data\/flows|\/data\/flows/);
+  assert.match(listing, /GET \/data\/history|\/data\/history/, 'the paid day-book download is advertised where a buyer can find it');
   assert.ok(listing.includes(DATA_PRICE_USDC), 'the price is published where a buyer can read it before signing');
   assert.ok(listing.includes('SELLER_PRIVATE_KEY'), 'and so is the fact that it is closed until the secret arrives');
 });

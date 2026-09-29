@@ -37,7 +37,7 @@ import {
   buildPayload, censusChanges, censusProblem, censusReading, censusRow, coherenceProblem,
   digestHash, digestStats, encodeDigest, headcountByArchetype, isSettled,
   markConfirmed, markFailed, markPending, markSubmitted, markUnconfigured,
-  nameRowRule, newDigestRecord, nextDigestAction, stampAnchor, verifyPayload, verifiesOrNull,
+  nameRowRule, newDigestRecord, nextDigestAction, sha256Hex, stampAnchor, verifyPayload, verifiesOrNull,
   CENSUS_BUDGET_BYTES, CENSUS_CAP, CENSUS_ROW_BYTES, DIGEST_HASH_FIELDS, DIGEST_MAX_ATTEMPTS, DIGEST_RULE_TABLE, DIGEST_V, LEGACY_RULE_VERSION,
   censusFootprint,
   type CensusDay, type DigestEcon, type DigestRecord, type StoredRow,
@@ -440,6 +440,47 @@ export function flowQueryFromUrl(url: URL): { query: FlowQuery } | { error: stri
   }
   if (query.from !== null && query.to !== null && query.from > query.to) errors.push('from is after to');
   return errors.length ? { error: errors.join('; ') } : { query };
+}
+
+/**
+ * A day-window request against the day book, for `GET /data/history`.
+ *
+ * `from` and `to` bound the day number, inclusive, and either may be absent;
+ * `limit` caps how many of the newest matching days come back, defaulting to the
+ * whole book's cap rather than silently to nothing. Like `flowQueryFromUrl`, this
+ * is exported only so the refusal is testable: on a route that charges before it
+ * answers, a range that quietly degrades — `from` after `to`, a non-numeric day —
+ * is a buyer paying for a window they never asked for. So every parameter parses
+ * or the request fails, and nothing defaults out of silence except `limit`, which
+ * has a documented default.
+ */
+export interface HistoryQuery {
+  /** Lower day bound, inclusive; null when unset. */
+  from: number | null;
+  /** Upper day bound, inclusive; null when unset. */
+  to: number | null;
+  /** How many of the newest matching days to return; already clamped to `CENSUS_CAP`. */
+  limit: number;
+}
+
+export function historyQueryFromUrl(url: URL): { query: HistoryQuery } | { error: string } {
+  const sp = url.searchParams;
+  const errors: string[] = [];
+  const uint = (name: string): number | null => {
+    const raw = sp.get(name);
+    if (raw === null || raw === '') return null;
+    if (!/^\d+$/.test(raw)) {
+      errors.push(`${name} must be a non-negative integer`);
+      return null;
+    }
+    return Number(raw);
+  };
+  const from = uint('from');
+  const to = uint('to');
+  const limitRaw = uint('limit');
+  const limit = limitRaw === null || limitRaw === 0 ? CENSUS_CAP : Math.min(limitRaw, CENSUS_CAP);
+  if (from !== null && to !== null && from > to) errors.push('from is after to');
+  return errors.length ? { error: errors.join('; ') } : { query: { from, to, limit } };
 }
 
 /** A creature id from a request body: a positive integer, or null. */
@@ -2248,6 +2289,7 @@ export function createApp(options: AppOptions = {}) {
         'GET /history/census': `the day book: one row per anchored day — the numbers that went on chain plus headcount per species — with extinctions and emergences derived from consecutive rows, and the confirming transaction on the days that have one; ?days=<n> for the newest n; see .hashed for what the commitment covers`,
         'GET /verify': `read one anchored day off the chain: ?tx=<0x…> fetches the transaction and its receipt, decodes the commitment out of the calldata, re-hashes it under the rule the record itself names, and compares against the day book — verdicts are verified, mismatch, uncheckable (a rule this build has no field list for), pending, not-found, unreadable and unknown, which are not interchangeable`,
         'GET /data/flows': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the Arc USDC flow ring this isolate has polled so far, filtered by ?addr=&venue=&blockFrom=&blockTo=&from=&to=&limit=; the answer carries retained/oldest/newest so the coverage bought is visible rather than implied; 503 until the SELLER_PRIVATE_KEY binding is set`,
+        'GET /data/history': `paid tier (x402, ${DATA_PRICE_USDC} USDC per call through Circle): the day book as newline-delimited JSON — one committed day per line, oldest first, bounded by ?from=&to= (day numbers, inclusive) and ?limit=<n> of the newest matching days — with a manifest line carrying the count, the day range, and a root hash over the rows' hashes; each row keeps its own rule version so a reader re-hashes it under the rule that day names, never this build's current one; 503 until the SELLER_PRIVATE_KEY binding is set, 400 when the range is malformed`,
         'GET /judgments': 'cull records (harvest + judgment), filter with ?type=harvest|judgment',
         'GET /events': 'positioned event stream for visualization, poll with ?since=<seq>',
         'GET /reports': 'battle reports for paid interventions, scored 400 ticks after the burn',
@@ -2616,6 +2658,105 @@ export function createApp(options: AppOptions = {}) {
         settlement: { tx: verdict.tx ?? null, payer: verdict.payer ?? null, network: cfg.network, amount: requirement.amount },
         sold: anchorEcon.sales,
       }, 200, 0);
+    }
+
+    if (req.method === 'GET' && path === '/data/history') {
+      // The paid history: the day book, whole, for the same thousandth a flow window
+      // costs. Same x402 exact-offer skeleton as `/data/flows` — quote, verify,
+      // settle, and only then answer — and the same order: the range is validated
+      // before anything is quoted, because a window the book cannot honour should not
+      // cost a signature, and no row leaves this handler before the settlement came
+      // back ok. Unlike the flow ring, the day book is not Arc-gated — it is this
+      // world's own committed days — so there is no "no feed being recorded" 503
+      // here, only the "not for sale until the key is set" one.
+      const cfg = dataTier();
+      const price = { usdc: DATA_PRICE_USDC, network: `eip155:${cfg?.chainId ?? ARC_MAINNET_CHAIN_ID}` };
+      if (!cfg) {
+        return json({
+          available: false,
+          error: 'the data tier is not for sale yet',
+          hint: 'it opens when the SELLER_PRIVATE_KEY binding is set',
+          price,
+        }, 503, 0);
+      }
+      const parsed = historyQueryFromUrl(url);
+      if ('error' in parsed) return json({ error: parsed.error, price }, 400, 0);
+      const requirement = exactRequirement(cfg, DATA_PRICE_USDC);
+      const read = readPayment(req);
+      if (!read.ok) return json({ x402Version: 2, error: read.reason, accepts: [requirement] }, 402, 0);
+      const nonce = String(read.auth.nonce ?? '');
+      if (nonce && settledNonces.has(nonce.toLowerCase())) {
+        return json({ x402Version: 2, error: 'this payment has already been spent', accepts: [requirement] }, 402, 0);
+      }
+      const verdict = await settleFromRequest(req, cfg, requirement).catch((err) => {
+        // Circle unreachable, DNS dead, TLS broken: `fetch` rejects and that
+        // rejection is not a verdict, so without this the buyer's request becomes
+        // a 500 with no trace anywhere. Same facilitator-stage failure as `/data/flows`.
+        console.error('[history] settleFromRequest threw:', err);
+        return { ok: false, reason: 'settlement unavailable', stage: 'facilitator' } as const;
+      });
+      if (!verdict.ok) {
+        // Only the failures that cost the seller something are counted; a precheck
+        // refusal is free to attempt, so it is not noted — see `data_settle_failed`.
+        if (verdict.stage !== 'precheck') options.health?.note('data_settle_failed', verdict.reason);
+        return json({ x402Version: 2, error: verdict.reason ?? 'settlement failed', accepts: [requirement] }, 402, 0);
+      }
+      noteSettled(nonce);
+      dataSales += 1;
+      // The sale is filed durably exactly as `/data/flows` does it: `dataSales` is
+      // this isolate's count and resets on a move, while "what the tank has earned by
+      // selling data" is a claim about the world, so it rides the anchored econ and
+      // the day's commitment. The two numbers are reported side by side, not merged.
+      const earned = addDecimalUnits(anchorEcon.revenueUnits, requirement.amount);
+      anchorEcon = {
+        ...anchorEcon,
+        sales: anchorEcon.sales + 1,
+        revenueUnits: earned ?? anchorEcon.revenueUnits,
+      };
+      saveStore();
+      const { from, to, limit } = parsed.query;
+      const matched = dayBook.filter((r) => (from === null || r.day >= from) && (to === null || r.day <= to));
+      // The newest `limit` days of the window, still oldest first: a buyer asking for
+      // the last ten days of a hundred-day book gets the ten most recent, not the ten
+      // that happened to sit at the front of the array.
+      const rows = matched.length > limit ? matched.slice(matched.length - limit) : matched;
+      // A convenience root over the published hashes — not a second chain commitment.
+      // It lets one number stand in for the whole download when checking it was not
+      // edited in transit, and a buyer recomputes it from the rows alone. The honest
+      // boundary is that the root is not itself anchored: what is on chain is each
+      // day's own hash, which every row names with its rule version `v` and, when it
+      // has one, the `txHash` that carried it. A reader verifies a row against the
+      // rule the row names — never this build's current `DIGEST_V`.
+      const root = await sha256Hex(rows.map((r) => r.hash).join('\n'));
+      const settlement = { tx: verdict.tx ?? null, payer: verdict.payer ?? null, network: cfg.network, amount: requirement.amount };
+      const lines = rows.map((r) => JSON.stringify(r));
+      lines.push(JSON.stringify({
+        manifest: true,
+        count: rows.length,
+        first: rows.length ? rows[0].day : null,
+        last: rows.length ? rows[rows.length - 1].day : null,
+        from,
+        to,
+        root,
+        // Which fields the *current* rule hashes, and every rule this build can check
+        // keyed by the `v` a row names — the same disclosure `/history/census` makes,
+        // because `hashed` alone is the wrong thing to hand a day written under v=1.
+        hashed: [...DIGEST_HASH_FIELDS],
+        rules: DIGEST_RULE_TABLE,
+        settlement,
+        sold: anchorEcon.sales,
+      }));
+      // Newline-delimited JSON, not one JSON body: a buyer streams and checks it line
+      // by line, and `no-store` because this is a settled purchase, never a cacheable
+      // snapshot — the same discipline `json(..., 0)` gives a paid answer on `/data/flows`.
+      return new Response(lines.join('\n') + '\n', {
+        status: 200,
+        headers: {
+          'content-type': 'application/x-ndjson; charset=utf-8',
+          'access-control-allow-origin': '*',
+          'cache-control': 'no-store',
+        },
+      });
     }
 
     if (req.method === 'GET' && path === '/judgments') {
