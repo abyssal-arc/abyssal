@@ -6044,6 +6044,69 @@ test('the client reads the chain out of the quote and refuses to guess it', () =
   assert.throws(() => chainIdFromNetwork(undefined as unknown as string), TypeError);
 });
 
+/**
+ * `examples/buy-flows.mjs` is the copy-paste buyer a customer drops into their
+ * own project without building Abyssal — so it is, on purpose, a second copy of
+ * the signing logic. Two things make that honest rather than a lie waiting to
+ * rot: it is run through the real route to show it can buy, and its envelope is
+ * compared against `x402-client.ts` to show the two copies have not drifted. The
+ * example lives at repo-root `examples/`, outside `src`/`test`, so tsc never
+ * compiles it; the path is resolved from the built test at runtime, which is also
+ * why a mutation of the example is caught without a rebuild.
+ */
+async function loadExample(): Promise<{
+  buyFlows: (o: {
+    baseUrl: string;
+    privateKey?: string;
+    query?: Record<string, string | number>;
+    fetchImpl?: typeof fetch;
+  }) => Promise<{ status: number; ok: boolean; paid: boolean; requirement: { amount: string } | null; json: unknown }>;
+  buildPaymentHeader: (i: unknown) => Promise<string>;
+}> {
+  return import(new URL('../../../../examples/buy-flows.mjs', import.meta.url).href) as never;
+}
+
+test('the copy-paste example buys through the served route, not just the client', async () => {
+  const example = await loadExample();
+  const { app, stub, close } = await dataTierApp({});
+  try {
+    const bridge = bridgeFetch(app);
+    const result = await example.buyFlows({
+      baseUrl: 'http://localhost',
+      privateKey: BUYER_KEY,
+      fetchImpl: bridge.fetch,
+    });
+    assert.equal(result.status, 200, `the example must be able to buy, got ${JSON.stringify(result.json)}`);
+    assert.equal(result.paid, true);
+    assert.equal(bridge.calls(), 2, 'it asks unpaid, then pays, in that order');
+    assert.equal(stub.hits(), 1, 'Circle is asked once, on the settlement the example built');
+    assert.equal(result.requirement?.amount, '1000', 'the price it signed came off the live 402');
+    assert.equal((result.json as { matched: number }).matched, 4, 'the paid depth, not the free stream');
+  } finally {
+    await close();
+  }
+});
+
+test('the example and the client sign the identical offer, field for field', async () => {
+  const example = await loadExample();
+  const cfg = buildFacilitatorConfig({ sellerKey: SELLER_KEY });
+  assert.ok(cfg);
+  const buyer = privateKeyToAccount(BUYER_KEY as `0x${string}`);
+  const requirement = exactRequirement(cfg, '0.05');
+  // Fixed nonce and expiry so the only variable left is the logic itself: if the
+  // example bakes in a price, drops `accepted`, changes the domain, or signs to a
+  // remembered destination, its envelope diverges here rather than on a live
+  // server nobody is permitted to spend real USDC on.
+  const input = { requirement, account: buyer, nonce: `0x${'22'.repeat(32)}`, validBefore: '1780000000' };
+  const fromClient = JSON.parse(Buffer.from(await buildPaymentHeader(input), 'base64url').toString('utf8'));
+  const fromExample = JSON.parse(Buffer.from(await example.buildPaymentHeader(input), 'base64url').toString('utf8'));
+  assert.deepEqual(
+    fromExample,
+    fromClient,
+    'the pasted copy must sign the same authorization, envelope, and EIP-712 domain as the library it mirrors',
+  );
+});
+
 test('the refusal a buyer sees before paying is uncacheable too', async () => {
   // The 402 carries the offer: which chain, which asset, what amount, to whom.
   // A cached copy of it would outlive the seller key that produced it, so a
