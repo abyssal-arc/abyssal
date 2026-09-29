@@ -872,12 +872,16 @@ itself a second chain commitment; what is anchored is each day's own hash. A tam
 fails to reproduce its published hash and moves the root with it, so the export cannot
 launder an edit.
 
-One thing this route is not yet, said plainly: it ships in the current build, and the
-bytes that serve it change the Worker, so it reaches `www.abyssal-arc.com` only once that
-build is deployed. Every test here runs it against a stub facilitator offline — nothing is
-spent, and no live `402` for `/data/history` has been captured from the deployed site the
-way the `/data/flows` quote above was. The recipe, the price, and the offer are the ones
-in the code, not one copied from a production response.
+This route now ships live. The bytes that serve it changed the Worker, so it took a
+`wrangler deploy` to reach `www.abyssal-arc.com`, and that deploy has happened: an unpaid
+`GET /data/history` on the deployed site answers a live **`402`** — read there on
+2026-09-29, not transcribed from the code. Its offer is the same one `/data/flows` quotes
+above, field for field — same `exact` scheme, same `1000` base units (`0.001` USDC), same
+`asset`, same `payTo`, same `eip155:5042`, same `maxTimeoutSeconds`, same `extra` — which is
+the point of selling both routes off one `exactRequirement`, now checked against a
+production response rather than only a source constant. The deployed `GET /api` index
+advertises `/data/history` beside `/data/flows`. What has not been bought is a `200`: that
+would move real USDC, so the round trip stays proven offline against a stub facilitator.
 
 What is deliberately *not* claimed here: that anyone has bought a read. Whether
 the tier earns is a fact about the world this repository cannot assert. What is
@@ -1312,15 +1316,17 @@ that anyone pasted it, and not that anything was bought.
 The paid day-book download this batch adds is the case those paragraphs keep setting
 apart, said plainly and up front: `GET /data/history` is a new route in `handler.ts`, which
 the Worker serves, so it is the first batch on the data tier that changes served bytes
-rather than only documenting them — it takes a `wrangler deploy` to reach
-`www.abyssal-arc.com`, and the honest first reading of it comes from the service after that
-deploy, not from the local run. Offline the suite exercises the route against a stub
-facilitator — the full battery 446 of 446 at 2026-09-29T05:17:04Z to 06:07:59Z, nothing
-spent, and no live `402` yet read from the deployed host the way `/data/flows` above was.
-So what is claimed here is narrower and true of the build rather than of the world: that a
-second paid route now exists in the served code and is verified end-to-end offline; the
-production figures are a later reading. That the tier is for sale is a fact a deployment
-can settle; that anyone has bought a day book is not asserted here.
+rather than only documenting them — it took a `wrangler deploy` to reach
+`www.abyssal-arc.com`, and that deploy has happened. The honest first reading is therefore
+the service's, not the local run's: an unpaid `GET /data/history` on the deployed host
+answers a live `402` carrying, field for field, the same offer `/data/flows` quotes (same
+`1000` base units, `asset`, `payTo`, `eip155:5042`, `exact`), read there on 2026-09-29.
+Offline the suite exercises the route against a stub facilitator — the full battery 446 of
+446 at 2026-09-29T05:17:04Z to 06:07:59Z — so the `402`→`200` round trip and the NDJSON
+manifest are proven without spending anything. What is claimed is that a second paid route
+now lives in the served bytes and answers a real `402` in production; what is not asserted
+is that anyone has bought a day book — that is a fact about the world the repository cannot
+settle.
 
 Deploying a changed *derivation* is the case where that distinction has teeth, so the
 first reading after a deploy is taken from the service rather than from the local
