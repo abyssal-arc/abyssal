@@ -3781,6 +3781,20 @@ censusCanvas.addEventListener('click', () => {
   });
 }
 
+// The paid-download card, delegated the same way as the two above: `renderData`
+// rewrites the container's innerHTML on every repaint and swaps the button for a
+// price the moment it is clicked, so a listener bound to the button would not
+// survive the very repaint it caused. Binding to the container and matching
+// `data-quote` is the line that does.
+{
+  const el = document.getElementById('census-data');
+  el?.addEventListener('click', (ev) => {
+    const btn = typeof ev.target?.closest === 'function' ? ev.target.closest('button[data-quote]') : null;
+    if (!btn) return;
+    showQuote();
+  });
+}
+
 /**
  * The same book in words, because a stacked area cannot answer "is anything
  * dying?" — it shows total height, and a species going extinct inside a growing
@@ -4146,6 +4160,84 @@ function renderSweep() {
 }
 
 /**
+ * The paid, self-verifiable day-book download, surfaced beside the rows it sells.
+ *
+ * `quoteState` is the only source of anything this card says about price, and it
+ * holds what the route answered — never a number this file typed. `null` means
+ * "nobody asked yet", which is why the idle card states that an offer exists and
+ * shows no figure until the reader makes the request and the service answers one.
+ */
+let quoteState = null;
+
+function renderData() {
+  const el = document.getElementById('census-data');
+  if (!el) return;
+  // A book with no rows has nothing to buy: the empty panel must not advertise a
+  // download the census has no days to fill.
+  if (!censusData || censusRows.length === 0) {
+    el.hidden = true;
+    el.className = '';
+    el.innerHTML = '';
+    return;
+  }
+  el.hidden = false;
+  el.className = 'census-data';
+  const parts = [
+    `<div class="cd-head">${esc(t('dataOwnTitle'))}</div>`,
+    `<div class="cd-line">${esc(t('dataOwnLine'))}</div>`,
+  ];
+  if (quoteState && quoteState.phase === 'loading') {
+    parts.push(`<div class="cd-quote cd-loading">${esc(t('dataQuoteLoading'))}</div>`);
+  } else if (quoteState && quoteState.phase === 'closed') {
+    parts.push(`<div class="cd-quote cd-closed">${esc(t('dataQuoteClosed'))}</div>`);
+  } else if (quoteState && quoteState.phase === 'error') {
+    parts.push(`<div class="cd-quote cd-error">${esc(t('dataQuoteError'))}</div>`);
+  } else if (quoteState && quoteState.phase === 'quote') {
+    const a = quoteState.offer;
+    const base = Number(a.amount);
+    const usdc = Number.isFinite(base) ? base / 1e6 : a.amount;
+    parts.push(`<div class="cd-quote cd-price">${esc(t('dataQuotePrice', { usdc, network: a.network, amount: a.amount }))}</div>`);
+    parts.push(`<div class="cd-hint">${esc(t('dataQuoteHint'))}</div>`);
+  } else {
+    // Idle: no figure until the service has answered one.
+    parts.push(`<button type="button" class="cd-quote-btn" data-quote="1">${esc(t('dataQuoteBtn'))}</button>`);
+  }
+  el.innerHTML = parts.join('');
+}
+
+/**
+ * Ask the site's own `/data/history` route for its price and let whatever it
+ * answers be the only number the card shows. The request carries no `X-Payment`, so
+ * a live offer comes back as a `402`; a `503` means the tier is closed and any other
+ * answer is not a quote at all. Three of those four say something true without a
+ * price, and the card has to keep them apart rather than fall through to a figure it
+ * invented — the whole discipline of this data tier is that the number belongs to the
+ * server's answer, not to the page.
+ *
+ * Called from a click handler, so the promise is intentionally dropped, exactly as
+ * `runVerify` drops its own.
+ */
+function showQuote() {
+  quoteState = { phase: 'loading' };
+  renderData();
+  fetch('/data/history')
+    .then(async (r) => {
+      let body = null;
+      try { body = await r.json(); } catch { body = null; }
+      const offer = Array.isArray(body?.accepts) ? body.accepts[0] : null;
+      if (r.status === 402 && offer && offer.amount != null) {
+        quoteState = { phase: 'quote', offer };
+      } else if (r.status === 503) {
+        quoteState = { phase: 'closed' };
+      } else {
+        quoteState = { phase: 'error' };
+      }
+    })
+    .catch(() => { quoteState = { phase: 'error' }; })
+    .finally(() => renderData());
+}
+
+/**
  * The world's own "what happened while you were away".
  *
  * `abyssal-standing:` answers that for one address. This answers it for the tank,
@@ -4485,6 +4577,11 @@ function paintCensus() {
   // again — and a book that gained or lost a stamped row drops the sweep back to
   // the button, because `stampedHashes` is recomputed here, not remembered.
   renderSweep();
+  // Sixth: the paid-download card is a view of the same rows too, so a repaint after
+  // a fresh book keeps a price already read from the route on screen (and drops the
+  // card entirely when the book emptied), without re-asking the route behind the
+  // reader's back — `showQuote` is only ever a click.
+  renderData();
 }
 
 // The boot fetch sits here rather than beside `pollAux()` where the other pollers

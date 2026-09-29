@@ -298,6 +298,11 @@
                tally, then the finished four-tier count — never a grey "0 unchecked"
                that would read as "checked, nothing wrong" for a book nobody verified. -->
           <div id="census-sweep" hidden></div>
+          <!-- The paid, self-verifiable download. Hidden until the book actually has
+               rows to sell: an empty panel must not advertise a day book the census has
+               no days to fill. The price is read from the route's own live 402 when the
+               reader asks — never a number written into this markup. -->
+          <div id="census-data" hidden></div>
           <div id="census-trends" class="census-rows"></div>
           <div id="census-events" class="census-rows"></div>
           <!-- What closed since this browser last looked. Absent until there is a

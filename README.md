@@ -244,7 +244,7 @@ the endpoint index.
 Other scripts:
 
 ```bash
-npm test           # sim + server + web tests (461 total)
+npm test           # sim + server + web tests (466 total)
 npm run typecheck  # repo-wide TypeScript type check
 npm run build      # compile sim + server
 ```
@@ -883,6 +883,35 @@ production response rather than only a source constant. The deployed `GET /api` 
 advertises `/data/history` beside `/data/flows`. What has not been bought is a `200`: that
 would move real USDC, so the round trip stays proven offline against a stub facilitator.
 
+### Showing the offer to a visitor (the day-book panel)
+
+A paid, self-verifiable download that only a `curl` can find is a feature nobody sees. The
+census panel now carries a card that puts this one in front of a visitor: a sentence saying
+the numbers above were committed to the chain day by day and the whole book is a download
+you can check line by line, and a single button that asks for the price. Clicking it makes
+the page `fetch('/data/history')` from its *own* origin with no `X-Payment` header, so the
+answer is the same live `402` an unpaid `curl` gets, and the card prints what that offer
+actually says — the served `amount` in base units, the `network` the seller named, and a
+`0.001`-style USDC reading derived from `amount / 1e6` at the token's six decimals. The
+discipline carried over from the buyer client is kept whole: the number belongs to the
+route's answer, never to the page. The card is only revealed beside a book that has closed
+days to sell — an empty census does not advertise a download it cannot fill — and booting
+the page never asks the paid route, only a click does. The two ways there is no quote are
+kept apart rather than allowed to fall through to a figure: a `503` (no seller key, tier
+closed) is named as "not for sale right now", and a request that never resolves is named as
+"could not read a quote" — in neither case does a price appear. This is a read-only proof: it
+shows what a download costs, it does not connect a wallet, sign a transfer, or spend
+anything in the browser; buying still goes through `examples/buy-flows.mjs --history` with a
+`BUYER_PRIVATE_KEY`.
+
+Unlike the buyer's half, this card *is* served bytes — `app.js`, `i18n.js` and `index.html`
+all live under the Worker's `[assets]` directory and reach the browser unchanged — so the
+feature needs a `wrangler deploy` before it is live, and its first reading is taken from the
+deployed page (the served HTML carrying the card's markup, and `/data/history` still
+answering a real `402`), not from the local boot. What the six web tests prove offline is the
+behaviour; whether the button a visitor sees is wired to the same live offer is a fact about
+the deployed artifact, read after the upload.
+
 What is deliberately *not* claimed here: that anyone has bought a read. Whether
 the tier earns is a fact about the world this repository cannot assert. What is
 asserted — and covered by a round-trip test that follows a real `402` into a real
@@ -974,8 +1003,8 @@ that a wrong, expired, or twice-spent payment is refused rather than answered.
 
 ## Tests and CI
 
-461 tests on `node:test`, no test framework dependency, counted as the three
-workspaces report them in a working copy at 2026-09-29T06:24:43Z: 59 + 237 + 165,
+466 tests on `node:test`, no test framework dependency, counted as the three
+workspaces report them in a working copy at 2026-09-29T09:03:30Z: 59 + 237 + 170,
 0 fail, 0 skip. CI holds one of them back from being green and prints the reason
 in the test's own name — `the price in the code is the price written in the plan
 # SKIP TOKEN_PLAN.md is gitignored, so this lock only exists in a working copy` —
@@ -988,7 +1017,7 @@ and the one row CI never runs is named in the log rather than missing in silence
 | --- | --- | --- |
 | `@abyssal/sim` | 59 | determinism, serialization round-trip, predation, culls, biodiversity guards, meteors, wishes, paid names, gene edits, ark tickets, save/load of older snapshots |
 | `@abyssal/server` | 237 | routes, pricing and the 402 quote, burn-receipt verification against an offline RPC stub, refund paths, replay of a spent receipt, payload shape, the durable wall clock behind `catchUp()`, the digest state machine (what is hashed, what a failed broadcast leaves behind, what a cold isolate inherits, that a stored record is judged by the rule it names rather than by the rule currently in force, that a rule this build never published is called by its own name and refused the broadcast like any other refusal, and that a payload missing one of its rule's fields keeps the alarm it used to raise rather than being filed under "cannot say", that the day's settled economics ride inside the rule-2 commitment but never into the served day-book row so neither the cap nor the widest row moves when `v` ticks to 2, that a day written under rule 1 still verifies while this build commits under rule 2, and that money edited under a chain record is a mismatch because it is inside the hash), the day book and its derived extinctions, the transaction pointer a confirmed day earns and the pairs a stamp refuses, the bytes each of those fields costs against its own row and the footprint of a book filled to the cap it derives, the size published at every point the stored array changes and the watermark that fires once when the book outgrows its share, a legacy row that is named once because the name is saved with it, a day filed from one reading of a tank that keeps living while its hash is computed, the health counters, the alarm kinds that must be emitted somewhere to stay declared, the reason each refusal carries and their budget watermarks, the economics of the anchor (what the receipt says a day cost, what the account holds, the two readings and the one tally that must name a single money, a tally field an older build never wrote loading as an unknown term rather than as zero, the alarm that fires once rather than once per process, and the figures an unreadable balance ages rather than erases), the height the feed is willing to count up to (that it stops at the block the node calls final rather than whatever it last offered, that an answer repeating the word `finalized` is not a number, how far behind the head the published figures were computed from, that both heights outlive the isolate that read them, and that the economics beside a confirmed day is waited for rather than raced), and the two hex shapes a node answers in — a minimal quantity and a zero-padded word, which are not interchangeable in either direction — the count that says which of those answers arrived in the shape that was refused, naming the call and the bytes, and the stub that has to keep sending them the way the chain does; all of it against a stubbed JSON-RPC, plus the chain feed's heartbeat, the feed state that lets an evicted object resume instead of re-backfilling, and the venue classification: that a swap is not a machine payment however it was submitted, that only an EIP-3009 authorization counts as one, that an uncatalogued venue stays an address while a catalogued one is named, that a contract admitted to the registry on its receipts does not turn its method name into a rule, that a backfilled window reports no share rather than a share of zero, and that the rails leaderboard is ordered by use rather than by one large transaction, that the rails table says *which* part of the window it covers whenever the ring it reads is smaller than the pulse count beside it, and that a backfill prices every transfer it read rather than the handful its ring kept; and the seven-verdict `/verify` recomputation — that a chain which did not answer is `unknown` and never the evidence-bearing `not-found`, that any transaction is not assumed to be ours, that a reverted receipt still verifies the record it carries, that the row comparison checks the fields and not only the hash, that an unpublished rule is called `uncheckable` rather than corrupt and a real mismatch never softened into it, that a mismatch is a 409 and a pending is never cached, and that the outage `unknown` reports is counted once per failure and cleared on the first answer; and the server-side share posters (`GET /s/day/<n>`, `/s/creature/<id>`, `/s/story`, and the 404 that is neither an empty 200 nor a cached-away wrong answer) — the render of `share.ts` behind the one route here that writes HTML, so a bought `customName` cannot break its own document or its own `og:` attribute, that a figure a large population shows is grouped for reading, that a day which never anchored is never dressed up as one that did nor offered a link to a transaction that was never made, that a week whose tank was reseeded mid-flight reports its flow figures as unknown rather than a confident sum it cannot stand behind, that the poster reads its subject from the path segment it is named in, and that the endpoint index advertises the posters; and the x402 buyer client (`x402-client.ts`) that reads a live quote rather than assuming one — that it follows a `402` by paying and a `503` by not, that the amount, destination, network and EIP-712 domain it signs all come off the seller's own offer so a moved price is adapted for free, that a signature it builds actually settles against the route's own pre-checks while one that pays the wrong place or drops the offer is refused, that it stops and says why when a buyer has no key, and that it reads the chain out of the quote and refuses to guess it, and that the copy-paste example (`examples/buy-flows.mjs`) buys through the served route to a `200` and signs the identical offer `x402-client.ts` signs, field for field; and the paid day-book download `GET /data/history`, sold on the same offer — that a settled buy answers as newline-delimited JSON with a manifest root recomputable from the rows and a count that matches them, that a v1 day re-hashes from its own row while a v2 day is checked against the chain rather than recomputed from the row alone and a re-stamp under the current rule version is refused, that a tampered row fails to reproduce its published hash and moves the root with it, that a malformed range is a `400` before anything is quoted and a closed tier a `503` rather than a bill, that one authorization buys one download and not two, and that a settled download is never cacheable |
-| `@abyssal/web` | 165 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the ten-state `/verify` widget on a stamped row and a page whose pin moves off the row mid-flight (the panel is cleared by the pair, not the calendar: a fresh paint keeps the last verdict on a newly pinned row only when the hash still matches), the one localised note a rule-2 `/verify` answer paints beneath the verdict — the committed economics read back off `payload.fields` with the server's own figures, on both a clicked row and a page booted straight into the panel from a forwarded link, and nothing at all on a rule-1 record that committed none —, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, the extinction and emergence events anchored to the on-chain reading that bounds each — a loss to the day the species was last counted, a gain to the day that first counted it, and an unstamped claim stated as not yet on chain rather than linked to nothing, the public anchor runway read from `/health` and normalised into one honest state before it is painted — a comfortable day count grouped for reading with its threshold and its age beside it, an alarm that follows the server's own flag rather than a re-derived comparison, a ceiling-clamped reading that refuses to print the number it clamped, an uncomputable one that surfaces the reason verbatim and escaped so a stray `<img>` stays text, and a page with no anchor economics that says nothing at all rather than inventing a zero — and the offline replay player, which reads a downloaded `/export kind=replay` file with the browser's own `FileReader` and never asks the server for a frame: two independently-ordered arrays merged into one deterministic timeline, a row with no usable timestamp dropped and *counted* rather than pinned to the start of the window, an empty file given its own state instead of a scrubber parked at zero, a corrupt file answered in words with its name kept out of the markup, and the skipped-row count surfaced beside a partly-readable one so a file with holes cannot replay as a file that was simply short — the share link's own pure rule, that it names the most specific subject on screen (an animal over a day over the standing week) as an absolute same-origin path, and the top button in a booted page carrying that exact target on its `data-share-url` — and a canvas render smoke test |
+| `@abyssal/web` | 170 | format/geometry helpers, dictionary completeness across all six languages, markup prices against the server's price list, the census curves, the deep-link rules and a page booted *from* a link, a pinned day's explorer link and the unstamped day that must not grow one, the whole state table of the anchor chip and the one state a boot can put on the wire — a record this build cannot certify, which is neither of the colours it could be confused with — and the page with no anchor record at all, which says nothing about anchoring, the ten-state `/verify` widget on a stamped row and a page whose pin moves off the row mid-flight (the panel is cleared by the pair, not the calendar: a fresh paint keeps the last verdict on a newly pinned row only when the hash still matches), the one localised note a rule-2 `/verify` answer paints beneath the verdict — the committed economics read back off `payload.fields` with the server's own figures, on both a clicked row and a page booted straight into the panel from a forwarded link, and nothing at all on a rule-1 record that committed none —, the standing diff behind "while you were away", the world-level diff over the day book and the two pages that draw it — one by a click, one by a forwarded link, since only the second is still open when the book arrives, the fixture's own cap arithmetic against the server's, the preview card against the file it names, the run list against the test files on disk, the client source list against the syntax gate CI runs, the `hidden` blocks against the author-level `display` that outranks it, the two shortages the rails table can name and the page booted into rendering both of them, the extinction and emergence events anchored to the on-chain reading that bounds each — a loss to the day the species was last counted, a gain to the day that first counted it, and an unstamped claim stated as not yet on chain rather than linked to nothing, the public anchor runway read from `/health` and normalised into one honest state before it is painted — a comfortable day count grouped for reading with its threshold and its age beside it, an alarm that follows the server's own flag rather than a re-derived comparison, a ceiling-clamped reading that refuses to print the number it clamped, an uncomputable one that surfaces the reason verbatim and escaped so a stray `<img>` stays text, and a page with no anchor economics that says nothing at all rather than inventing a zero — and the offline replay player, which reads a downloaded `/export kind=replay` file with the browser's own `FileReader` and never asks the server for a frame: two independently-ordered arrays merged into one deterministic timeline, a row with no usable timestamp dropped and *counted* rather than pinned to the start of the window, an empty file given its own state instead of a scrubber parked at zero, a corrupt file answered in words with its name kept out of the markup, and the skipped-row count surfaced beside a partly-readable one so a file with holes cannot replay as a file that was simply short — the share link's own pure rule, that it names the most specific subject on screen (an animal over a day over the standing week) as an absolute same-origin path, and the top button in a booted page carrying that exact target on its `data-share-url` — and the paid day-book card that surfaces `GET /data/history` beside the rows it sells: a book with closed days offers the download and an empty book stays hidden rather than advertising one it cannot fill, booting the page never asks the paid route (only a click does), a click reaches the served route once and the price it prints tracks the served offer's own `amount` and `network` and the USDC reading derived from them rather than a number baked into the page (proven by serving a deliberately different offer and insisting the card follow the wire), and the two ways there is no quote — a `503` closed tier and a fetch that never resolved — are each named as no-quote with no figure invented — and a canvas render smoke test |
 
 The server tests stub the chain with a local `node:http` RPC, so the suite runs
 offline and never touches Arc. The web tests boot the real `app.js` inside jsdom
@@ -1004,15 +1033,28 @@ parses, and a gate that parses a file the browser never loads, are both a gate t
 is quietly smaller than it looks.
 
 A green suite is a claim about tests, not about the code, so every batch here also
-runs negative verification: a battery of 446 hand-written single-line mutations of
+runs negative verification: a battery of 452 hand-written single-line mutations of
 these files, each paired with the name of the test that has to go red for it, and
 each classified caught / missed / no-verdict rather than merely "failing". A
 mutant that leaves the suite green is not a pass — it is an equivalent mutant, and
 it gets deleted with the reason recorded in the battery instead of kept as a green
 row that flatters the count. The last full run on the tree described here caught
-446 of 446 in one pass (2026-09-29T05:17:04Z to 06:07:59Z, 446 rows on the battery's own
+452 of 452 in one pass (2026-09-29T08:14:11Z to 08:59:29Z, 452 rows on the battery's own
 stamps), 0 missed and none without a verdict — no verdict here is inherited from
-a state a later edit had already changed. This batch grew the battery from 436 to 446
+a state a later edit had already changed. This batch grew the battery from 446 to 452
+with six mutants on the web card that puts the paid day-book download in front of a visitor
+(M446–M451): a price baked into the page instead of read from the served offer (M446, caught
+by the test that serves a deliberately different quote and insists the card follow the wire),
+the card pointed at the flow ring instead of the day book (M447), a closed `503` tier rendered
+as an invented price rather than named as not-for-sale (M448), an empty book advertising a
+download it cannot fill (M449), a button that fakes a local offer instead of reaching the
+served route (M450, caught by the assertion that a click really hit `/data/history`), and a
+printed price that drops the served `network` (M451). This one re-pinned an existing anchor
+too: the new `renderData()` call joined `paintCensus` beside the sweep's, which turned the
+sweep-painting anchor (M345) into one that had to be re-pointed at its own unique context, and
+the re-run confirms M345 still goes red on the sweep test it names; the preflight `--check`
+read 452/452 anchors pointing at exactly one line each before the pass. The batch before it —
+the paid day-book download — grew the battery from 436 to 446
 with ten mutants on the paid day-book download — `/data/history`, its `buyHistory`
 wrapper, and the example's `--history` path (M436–M445): a day window the book cannot
 honour sold rather than refused as a `400` (M436), a manifest that counts one day fewer
@@ -1022,8 +1064,8 @@ re-stamps every day with this build's current `DIGEST_V`, so an old v=1 day sile
 fails to verify (M439), a manifest that stops naming the rule an older day hashes under
 (M440), a settled download marked cacheable (M441), a client and the example copy each
 reading an NDJSON body as one JSON value (M442, M445), and each buyer's `buyHistory`
-pointed at the flow ring instead of the day book (M443, M444). This is the one batch here
-that did not only add a file: `/data/history` reuses the `/data/flows` x402 skeleton line
+pointed at the flow ring instead of the day book (M443, M444). That batch did not only add
+a file either: `/data/history` reuses the `/data/flows` x402 skeleton line
 for line, which turned five existing flow anchors (M53, M59, M60, M62, M163) into
 two-line matches, and each was re-pinned onto the flow route's own unique context so it
 still mutates `/data/flows` alone — the re-run confirms all five still go red on the flow
@@ -1313,7 +1355,7 @@ are caught by a named test, the full battery 436 of 436 at 2026-09-29T01:53:49Z 
 02:38:35Z. The claim is that the pasted code speaks the live protocol correctly — not
 that anyone pasted it, and not that anything was bought.
 
-The paid day-book download this batch adds is the case those paragraphs keep setting
+The paid day-book download the previous batch added is the case those paragraphs keep setting
 apart, said plainly and up front: `GET /data/history` is a new route in `handler.ts`, which
 the Worker serves, so it is the first batch on the data tier that changes served bytes
 rather than only documenting them — it took a `wrangler deploy` to reach
@@ -1327,6 +1369,23 @@ manifest are proven without spending anything. What is claimed is that a second 
 now lives in the served bytes and answers a real `402` in production; what is not asserted
 is that anyone has bought a day book — that is a fact about the world the repository cannot
 settle.
+
+The day-book card this batch adds is served bytes in a different sense, and it is said the
+same way. `app.js`, `i18n.js` and `index.html` live under the Worker's `[assets]` directory and
+reach the browser unchanged, so surfacing `GET /data/history` as a visible card changes what the
+edge serves even though not one worker handler moved — it needs a `wrangler deploy` to reach
+`www.abyssal-arc.com`. What is proven offline first: five web tests drive the card against a
+served stub — a book with rows offers it and an empty book stays hidden, booting never asks the
+paid route while a click reaches `/data/history` exactly once, the price printed tracks the served
+offer's own amount and network (a deliberately different quote is served to show the card follows
+the wire rather than a baked number), and a `503` or a never-resolving fetch is named as no-quote
+with no figure invented; the full battery is 452 of 452 at 2026-09-29T08:14:11Z to 08:59:29Z, 0
+missed. The price the card shows is read from the same live `402` an unpaid `curl` gets — it is a
+read-only proof, not a checkout: the browser signs nothing and spends nothing. What is *not*
+claimed here yet is that the card is live: a card correct in jsdom is only on the served page once
+the assets are uploaded, so the deployed reading — the served HTML carrying the card's markup and
+`/data/history` still answering a real `402` — is taken after the upload and recorded below, not
+asserted from the local boot.
 
 Deploying a changed *derivation* is the case where that distinction has teeth, so the
 first reading after a deploy is taken from the service rather than from the local

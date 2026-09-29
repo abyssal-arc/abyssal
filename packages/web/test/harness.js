@@ -304,6 +304,30 @@ export const verifiedResponse = (txHash) => ({
 });
 
 /**
+ * The unpaid `GET /data/history` answer, shaped the way the route answers it.
+ * Measured off `https://www.abyssal-arc.com/data/history` on 2026-09-29: a `402`
+ * with one `exact` offer — 1000 base units of USDC (six decimals, `0.001`) on
+ * `eip155:5042`, settled to the seller key. Written out rather than imported from
+ * the client because the card under test reads the *wire*, and a fixture assembled
+ * by the module it is checking would agree with a wrong module no matter how wrong
+ * both were. Exported so a test can assert the rendered figure against these bytes
+ * instead of a literal it shares with the code.
+ */
+export const HISTORY_QUOTE = {
+  x402Version: 2,
+  error: 'missing X-Payment',
+  accepts: [{
+    scheme: 'exact',
+    network: 'eip155:5042',
+    amount: '1000',
+    asset: '0x3600000000000000000000000000000000000000',
+    payTo: '0x42e60b67b525dd029d5d5c4e747fe27595023c15',
+    maxTimeoutSeconds: 30,
+    extra: { name: 'USDC', version: '2', assetTransferMethod: 'eip3009' },
+  }],
+};
+
+/**
  * Boot one page against one in-process server.
  *
  * @param {object} [opts]
@@ -323,12 +347,20 @@ export const verifiedResponse = (txHash) => ({
  *   carrying payload for the runway wiring to read, or `null`/absent for `{}` (no
  *   anchor block), which is what every other boot sees and what keeps `#day-runway`
  *   hidden. Counted in `reqs.health` like the other watched routes.
+ * @param {object|'closed'|'fail'} [opts.dataQuote] what the unpaid
+ *   `GET /data/history` should answer, for the paid-download card: a payload to
+ *   serve as the `402` offer verbatim, `'closed'` for the `503` the tier gives
+ *   without a seller key, or `'fail'` to destroy the socket so the fetch rejects —
+ *   the three ways the card must say something true *without* inventing a price.
+ *   Absent serves the canonical `HISTORY_QUOTE`, and the route is served in every
+ *   boot, counted in `reqs.history`, so a test that never clicks still sees
+ *   `reqs.history === 0` rather than an unmatched path answering `{}`.
  * @returns the page, its canvases, what it asked the server for, what the visitor
  *   copied, and a `close()` that has to be called or the process never exits
  */
 let stageTaken = false;
 
-export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain, verify, health } = {}) {
+export async function boot({ focusSearch = '', observeLive = false, who = null, wallet = null, standing = null, book = null, worldSince = null, digestChain, verify, health, dataQuote } = {}) {
   // One page per process, and the reason is measured rather than suspected:
   // `app.js` is evaluated once and the ESM cache never evaluates it again, so a
   // second `boot()` hands back a DOM nothing is driving. Checked on this harness —
@@ -347,7 +379,7 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
   const servedSnapshot = digestChain === undefined
     ? snapshot
     : { ...snapshot, state: { ...snapshot.state, digestChain } };
-  const reqs = { census: 0, observe: 0, verify: 0, health: 0 };
+  const reqs = { census: 0, observe: 0, verify: 0, health: 0, history: 0 };
   const server = createServer((req, res) => {
     const path = req.url?.split('?')[0] ?? '/';
     res.setHeader('content-type', 'application/json');
@@ -375,6 +407,16 @@ export async function boot({ focusSearch = '', observeLive = false, who = null, 
       const addr = new URLSearchParams(req.url?.split('?')[1] ?? '').get('addr');
       if (!observeLive) res.end(JSON.stringify({ available: false }));
       else res.end(JSON.stringify(addr ? addressPayload(addr) : observe));
+    } else if (path === '/data/history') {
+      // Counted before the branch decides, exactly like `/verify`: a test asserts
+      // not just what the card shows but that the click reached the wire, so a
+      // mutation that short-circuits the fetch to a local "verified" still leaves
+      // the DOM plausible while `reqs.history` drops to 0 and names the lie.
+      reqs.history++;
+      if (dataQuote === 'fail') { req.socket.destroy(); return; }
+      if (dataQuote === 'closed') { res.statusCode = 503; res.end(JSON.stringify({ error: 'history tier closed' })); return; }
+      res.statusCode = 402;
+      res.end(JSON.stringify(dataQuote ?? HISTORY_QUOTE));
     } else if (path === '/health') {
       reqs.health++;
       res.end(JSON.stringify(health ?? {}));
